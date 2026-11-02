@@ -407,5 +407,42 @@ async def version_identity_context(request, call_next):
         request_identity_mode.reset(marker)
 
 
+@app.on_event("startup")
+async def start_work_tasks():
+    """显式启用 V2 时才启动持久任务消费者。"""
+    import os
+
+    if os.environ.get("FORUM_V2_ENABLED", "").lower() == "true":
+        from work.work_task_worker import WorkTaskWorker
+
+        app.state.work_tasks = WorkTaskWorker()
+        await app.state.work_tasks.start()
+        from work.work_event_consumer import WorkEventConsumer
+
+        app.state.work_events = WorkEventConsumer()
+        await app.state.work_events.start()
+        from work.work_tag_maintenance import WorkTagMaintenance
+        from api.v2.config import get_work_config
+
+        app.state.work_tag_maintenance = WorkTagMaintenance(
+            AsyncSessionFactory, get_work_config()
+        )
+        await app.state.work_tag_maintenance.start()
 
 
+@app.on_event("shutdown")
+async def stop_work_tasks():
+    """关闭任务消费者，不丢弃 PG 待办。"""
+    from api.v2.dependencies import _permission_service
+
+    if _permission_service:
+        await _permission_service.close()
+    maintenance = getattr(app.state, "work_tag_maintenance", None)
+    if maintenance:
+        await maintenance.close()
+    consumer = getattr(app.state, "work_events", None)
+    if consumer:
+        await consumer.close()
+    worker = getattr(app.state, "work_tasks", None)
+    if worker:
+        await worker.close()
