@@ -376,8 +376,8 @@ async def test_local_binding_or_main_change_during_authority_blocks_marker(isola
         assert task.dispatched_at is None and task.payload["channel_id"] == "20"
 
 
-async def test_restore_serializes_with_independent_lock_writer(isolated_review_factory):
-    """恢复持行锁时独立加锁等待，恢复只撤删除来源而不发布普通锁快照。"""
+async def test_edit_soft_deleted_child_is_404_until_restore_commits(isolated_review_factory):
+    """已提交软删行不满足编辑查询，恢复未提交时应404，恢复提交后才允许编辑。"""
     from types import SimpleNamespace
     from sqlalchemy.ext.asyncio import AsyncSession
     from work.work_thread_service import WorkThreadService
@@ -395,25 +395,90 @@ async def test_restore_serializes_with_independent_lock_writer(isolated_review_f
             result = await super().get(model, identifier, **kwargs)
             if model is Thread:
                 assert kwargs.get("with_for_update") is True
+                assert result.deleted_at is not None
                 entered.set()
                 await asyncio.wait_for(release.wait(), 5)
             return result
     gated = async_sessionmaker(factory.kw["bind"], expire_on_commit=False, class_=RestoreSession)
     actor = {"id": "100", "discord_user_id": "200", "is_admin": True, "show_nsfw": True, "can_view_abyss": True, "can_speak": True, "config": {}}
     restore = asyncio.create_task(WorkThreadService(gated).restore_child(work_id, child_id, SimpleNamespace(actor=actor)))
-    edit = None
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        edit = asyncio.create_task(WorkThreadService(factory).edit_child(work_id, child_id, SimpleNamespace(actor=actor, values={"locked": True})))
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(edit), 0.05)
+        # READ COMMITTED先按已提交deleted_at过滤，不应等待一个未来可能恢复的行。
+        with pytest.raises(HTTPException) as caught:
+            await asyncio.wait_for(WorkThreadService(factory).edit_child(work_id, child_id, SimpleNamespace(actor=actor, values={"locked": True})), 5)
+        assert caught.value.status_code == 404
+        async with factory() as session:
+            assert (await session.get(Thread, child_id)).deleted_at is not None
     finally:
         release.set()
         await asyncio.wait_for(restore, 5)
-        if edit:
-            await asyncio.wait_for(edit, 5)
+    # 新语句在恢复提交后才看到可编辑行，普通锁独立提交。
+    await WorkThreadService(factory).edit_child(work_id, child_id, SimpleNamespace(actor=actor, values={"locked": True}))
     async with factory() as session:
         child = await session.get(Thread, child_id)
         assert child.deleted_at is None and child.lock_owner_ids == ["100"]
         tasks = (await session.execute(select(WorkTask).where(WorkTask.work_id == work_id).order_by(WorkTask.id))).scalars().all()
         assert [(task.payload["source"], task.payload["active"]) for task in tasks] == [("forum_soft_delete", False), ("forum_work_lock", True)]
+
+
+async def test_restore_and_redelete_serialize_without_replaying_ordinary_lock(isolated_review_factory):
+    """删除与恢复均可命中已删行，真实行锁使后到删除在恢复提交后生效。"""
+    from types import SimpleNamespace
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from work.work_thread_service import WorkThreadService
+
+    factory = isolated_review_factory
+    work_id = await seed_work(factory)
+    async with factory() as session:
+        child = Thread(platform="fluxer", thread_id=802, guild_id=9, channel_id=20, work_id=work_id, role="child", title="deleted child", body="body", fluxer_author_id="100", deleted_at=utc_now(), deletion_reason="moderation", lock_owner_ids=["300"])
+        session.add(child)
+        await session.commit()
+        child_id = child.id
+    entered, release, delete_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    delete_backend = {}
+    class RestoreSession(AsyncSession):
+        async def get(self, model, identifier, **kwargs):
+            result = await super().get(model, identifier, **kwargs)
+            if model is Thread:
+                assert kwargs.get("with_for_update") is True
+                entered.set()
+                await asyncio.wait_for(release.wait(), 5)
+            return result
+    class DeleteSession(AsyncSession):
+        async def get(self, model, identifier, **kwargs):
+            if model is Thread:
+                assert kwargs.get("with_for_update") is True
+                delete_backend["pid"] = (await self.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                delete_entered.set()
+            return await super().get(model, identifier, **kwargs)
+    gated = async_sessionmaker(factory.kw["bind"], expire_on_commit=False, class_=RestoreSession)
+    deleting = async_sessionmaker(factory.kw["bind"], expire_on_commit=False, class_=DeleteSession)
+    actor = {"id": "100", "discord_user_id": "200", "is_admin": True, "show_nsfw": True, "can_view_abyss": True, "can_speak": True, "config": {}}
+    restore = asyncio.create_task(WorkThreadService(gated).restore_child(work_id, child_id, SimpleNamespace(actor=actor)))
+    redelete = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        redelete = asyncio.create_task(WorkThreadService(deleting).delete_child(work_id, child_id, SimpleNamespace(actor=actor)))
+        # 先确认同用户的第二backend已进入按主键取行，再直接观察其数据库锁等待。
+        await asyncio.wait_for(delete_entered.wait(), 5)
+        deadline = asyncio.get_running_loop().time() + 5
+        observed_lock_wait = False
+        while asyncio.get_running_loop().time() < deadline and not redelete.done():
+            async with factory() as observer:
+                wait_type = (await observer.execute(text("SELECT wait_event_type FROM pg_stat_activity WHERE pid=:pid"), {"pid": delete_backend["pid"]})).scalar_one_or_none()
+            if wait_type == "Lock":
+                observed_lock_wait = True
+                break
+            await asyncio.sleep(0.01)
+        assert observed_lock_wait and not redelete.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(restore, 5)
+        if redelete:
+            await asyncio.wait_for(redelete, 5)
+    async with factory() as session:
+        child = await session.get(Thread, child_id)
+        assert child.deleted_at is not None and child.lock_owner_ids == ["300"]
+        tasks = (await session.execute(select(WorkTask).where(WorkTask.work_id == work_id).order_by(WorkTask.id))).scalars().all()
+        assert [(task.payload["source"], task.payload["active"]) for task in tasks] == [("forum_soft_delete", False), ("forum_soft_delete", True)]
