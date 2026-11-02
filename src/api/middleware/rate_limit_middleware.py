@@ -5,6 +5,10 @@
 """
 
 import logging
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+from identity.runtime import is_fluxer_mode
+from identity.auth_runtime import resolve_principal
 from typing import Any, Dict, Optional
 
 from api.v1.dependencies.security import VERIFIED_JWT_PAYLOAD_STATE_KEY
@@ -24,7 +28,7 @@ from shared.redis_client import RedisManager
 logger = logging.getLogger(__name__)
 
 # 不限流的路径前缀
-_SKIP_PREFIXES = ("/v1/health", "/v1/auth", "/v1/debug")
+_SKIP_PREFIXES = ("/v1/health", "/v1/auth", "/v1/debug", "/v2/auth")
 
 
 class RateLimitMiddleware:
@@ -54,13 +58,33 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        payload = await self._extract_user_payload(scope)
+        try:
+            payload = await self._extract_user_payload(scope)
+        except HTTPException as exc:
+            await JSONResponse({"detail": exc.detail}, status_code=exc.status_code)(
+                scope, receive, send
+            )
+            return
         scope.setdefault("state", {})[VERIFIED_JWT_PAYLOAD_STATE_KEY] = payload
         user_id = payload.get("id") if payload else None
         if not user_id:
             await self.app(scope, receive, send)
             return
 
+        import os
+
+        if (
+            not is_fluxer_mode()
+            and os.environ.get("FORUM_V2_ENABLED", "").lower() == "true"
+        ):
+            from identity.identity_repository import IdentityRepository
+            from shared.database import AsyncSessionFactory
+
+            async with AsyncSessionFactory() as session:
+                mappings = await IdentityRepository(session).discord_to_fluxer(
+                    [user_id]
+                )
+                user_id = mappings.get(str(user_id), user_id)
         try:
             redis = RedisManager.get_client()
             result = await check_global_rate_limit(
@@ -153,11 +177,11 @@ class RateLimitMiddleware:
     @staticmethod
     def _is_v1_path(path: str) -> bool:
         """判断路径是否属于 v1 API。"""
-        return path == "/v1" or path.startswith("/v1/")
+        return path in ("/v1", "/v2") or path.startswith(("/v1/", "/v2/"))
 
     async def _extract_user_payload(self, scope) -> Optional[Dict[str, Any]]:
         """从请求中解析并验证 JWT，失败时返回 None。"""
-        if not self._jwt_secret:
+        if not self._jwt_secret and not is_fluxer_mode():
             return None
 
         token = None
@@ -170,6 +194,10 @@ class RateLimitMiddleware:
                 if val.startswith("Bearer "):
                     token = val[7:]
                     break
+
+        # Fluxer 仅使用 Bearer，避免 Cookie 写请求的 CSRF 风险。
+        if is_fluxer_mode():
+            return await resolve_principal(token) if token else None
 
         # 回退到 Cookie 会话
         if not token:

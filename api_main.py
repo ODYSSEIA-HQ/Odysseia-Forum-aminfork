@@ -253,6 +253,11 @@ async def main():
         config=config,
     )
 
+    from identity.runtime import is_fluxer_mode
+    from identity.auth_runtime import get_auth_service
+    if is_fluxer_mode():
+        await get_auth_service().start()
+
     # 启动 uvicorn API 服务器
     api_config = config.get("api", {})
     uvicorn_config = uvicorn.Config(
@@ -274,6 +279,8 @@ async def main():
         await server.serve()
     finally:
         # 清理
+        if is_fluxer_mode():
+            await get_auth_service().close()
         await similar_threads_cache_service.close()
         await impression_cache_service.stop()
         await cache_service.stop()

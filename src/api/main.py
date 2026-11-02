@@ -30,6 +30,7 @@ from api.v1.routers import (
 from shared.database import AsyncSessionFactory
 from shared.redis_client import RedisManager
 
+
 logger = logging.getLogger(__name__)
 
 # 读取配置
@@ -164,7 +165,9 @@ async def health_check(request: Request):
         checks["channel_metadata"] = "not_ready"
         healthy = False
     else:
-        checks["channel_metadata"] = "ready" if cache.last_refresh_succeeded else "stale"
+        checks["channel_metadata"] = (
+            "ready" if cache.last_refresh_succeeded else "stale"
+        )
 
     status_code = 200 if healthy else 503
     return JSONResponse(
@@ -377,3 +380,30 @@ async def debug_pools():
             "total_connections": pool.checkedin() + pool.checkedout(),
         },
     }
+
+
+app.include_router(auth.router, prefix="/v2")
+
+
+@app.middleware("http")
+async def version_identity_context(request, call_next):
+    """V1 保持 Discord ID 协议，V2 使用 Fluxer 主体，并行提供服务。"""
+    from identity.runtime import request_identity_mode
+    import os
+    from fastapi.responses import JSONResponse
+
+    if (
+        request.url.path == "/v2" or request.url.path.startswith("/v2/")
+    ) and os.environ.get("FORUM_V2_ENABLED", "").lower() != "true":
+        return JSONResponse(status_code=404, content={"detail": "接口未启用"})
+
+    mode = "legacy" if request.url.path.startswith("/v1/") else "fluxer"
+    marker = request_identity_mode.set(mode)
+    try:
+        return await call_next(request)
+    finally:
+        request_identity_mode.reset(marker)
+
+
+
+

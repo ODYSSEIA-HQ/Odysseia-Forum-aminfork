@@ -210,5 +210,17 @@
     "_comment": "广场推荐配置",
     "ignore_channel_ids": [],
     "_comment_ignore_channel_ids": "探索屏蔽频道ID列表，频道帖子不会出现在推荐轨道和随机推荐中，也不会新增写入Redis趋势榜单；修改后需重启Bot和API"
+  },
+
+  "work_forums": {
+    "_comment": "V2 Fluxer四个作品论坛，填写真实原生ID。",
+    "guild_id": "",
+    "normal": "",
+    "normal_nsfw": "",
+    "abyss": "",
+    "abyss_nsfw": ""
+  },
+  "work_permissions": {
+    "role_cache_ttl_seconds": 30
   }
 }

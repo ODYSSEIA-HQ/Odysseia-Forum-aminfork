@@ -7,6 +7,8 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from api.v1.utils.jwt_utils import verify_jwt
+from identity.runtime import is_fluxer_mode
+from identity.auth_runtime import resolve_principal
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,14 @@ async def get_current_user(
     从请求中提取并验证 JWT token，返回用户信息
     优先从 Authorization Bearer 中读取，回退到 Cookie
     """
+    if is_fluxer_mode():
+        request_state = request.scope.get("state", {})
+        if VERIFIED_JWT_PAYLOAD_STATE_KEY in request_state:
+            return request_state[VERIFIED_JWT_PAYLOAD_STATE_KEY]
+        header = request.headers.get("Authorization", "")
+        token = header[7:].strip() if header.startswith("Bearer ") else None
+        return await resolve_principal(token) if token else None
+
     if not _JWT_SECRET:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -64,7 +74,8 @@ async def get_current_user(
     # 复用全局限频中间件已经验证过的 JWT 结果
     request_state = request.scope.get("state", {})
     if VERIFIED_JWT_PAYLOAD_STATE_KEY in request_state:
-        return request_state[VERIFIED_JWT_PAYLOAD_STATE_KEY]
+        cached_payload = request_state[VERIFIED_JWT_PAYLOAD_STATE_KEY]
+        return await validate_legacy_binding(cached_payload)
 
     # 优先从 Authorization Bearer 中读取
     token = credentials.credentials if credentials else None
@@ -78,6 +89,31 @@ async def get_current_user(
 
     # 验证 JWT
     payload = await verify_jwt(token, _JWT_SECRET)
+    return await validate_legacy_binding(payload)
+
+
+async def validate_legacy_binding(payload):
+    """迁移后旧 JWT 只允许当前 Discord 绑定使用。"""
+    import os
+
+    if not payload or os.environ.get("FORUM_V2_ENABLED", "").lower() != "true":
+        return payload
+    from sqlalchemy import select
+    from models.discord_identity import DiscordIdentity
+    from shared.database import AsyncSessionFactory
+
+    async with AsyncSessionFactory() as session:
+        current = (
+            await session.execute(
+                select(DiscordIdentity.user_id).where(
+                    DiscordIdentity.discord_user_id == str(payload.get("id")),
+                    DiscordIdentity.is_current.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return None
+        payload = {**payload, "canonical_user_id": current}
     return payload
 
 

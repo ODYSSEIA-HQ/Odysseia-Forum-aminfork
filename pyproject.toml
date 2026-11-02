@@ -25,14 +25,16 @@ dependencies = [
     "cryptography>=45.0.0",
     "redis>=5.0.0",
     "orjson>=3.11.2",
+    "nats-py>=2.9.0",
     "aioboto3>=13.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "fakeredis[lua]>=2.34.0",
     "pytest",
     "pytest-asyncio",
-    "ruff"
+    "ruff",
 ]
 
 [tool.setuptools.packages.find]

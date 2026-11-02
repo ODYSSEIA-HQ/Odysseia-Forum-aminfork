@@ -13,10 +13,13 @@ import os
 import secrets
 import time
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
+from datetime import datetime, timezone
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, Query, status
+from identity.runtime import is_fluxer_mode
+from identity.auth_runtime import get_auth_service, resolve_principal
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from api.v1.utils.jwt_utils import sign_jwt, verify_jwt
@@ -245,9 +248,116 @@ def _log_oauth_failure(
     )
 
 
-async def _create_login_response(auth_state: dict) -> RedirectResponse:
+async def _create_login_response(
+    auth_state: dict, request: Request = None
+) -> RedirectResponse:
     """根据已验证的 OAuth 状态签发登录 JWT。"""
     user = auth_state["user"]
+    if is_fluxer_mode():
+        if request is None or not request.cookies.get("forum_login_binding"):
+            raise HTTPException(400, "登录浏览器绑定已过期")
+        verified_at = datetime.now(timezone.utc).isoformat()
+        avatar = user.get("avatar")
+        avatar_url = (
+            f"https://cdn.discordapp.com/avatars/{user['id']}/{avatar}.png"
+            if avatar
+            else None
+        )
+        service = get_auth_service()
+        exchange_id = hashlib.sha256(
+            (request.cookies["forum_login_binding"] + ":" + str(user["id"])).encode()
+        ).hexdigest()
+        exchanged = await service.rpc(
+            "rpc.auth.v1.external.exchange",
+            exchange_id=exchange_id,
+            discord_user_id=str(user["id"]),
+            verified_at=verified_at,
+            profile={
+                "username": user["username"],
+                "display_name": user.get("global_name"),
+                "avatar_url": avatar_url,
+            },
+            origin={
+                "ip": request.client.host if request.client else "",
+                "user_agent": request.headers.get("user-agent", "")[:512],
+                "client_os": "Forum Browser",
+            },
+        )
+        # 资料与绑定由 Fluxer 权威返回的 ID 建立，客户端没有提交 ID 的入口。
+        from sqlalchemy.dialects.postgresql import insert
+        from sqlalchemy import select
+        from models.user import User
+        from models.discord_identity import DiscordIdentity
+        from shared.database import AsyncSessionFactory
+
+        async with AsyncSessionFactory() as session:
+            existing = (
+                await session.execute(
+                    select(DiscordIdentity).where(
+                        DiscordIdentity.discord_user_id == str(user["id"])
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing and existing.user_id != exchanged["user_id"]:
+                raise HTTPException(503, "身份绑定需要重新同步")
+            values = {
+                "id": exchanged["user_id"],
+                "username": user["username"],
+                "display_name": user.get("global_name"),
+                "avatar_url": avatar_url,
+            }
+            statement = insert(User).values(**values)
+            await session.execute(
+                statement.on_conflict_do_update(index_elements=[User.id], set_=values)
+            )
+            binding = insert(DiscordIdentity).values(
+                discord_user_id=str(user["id"]), user_id=exchanged["user_id"], version=1
+            )
+            await session.execute(binding.on_conflict_do_nothing())
+            await session.commit()
+        proof = None
+        try:
+            proof = await service.rpc(
+                "rpc.auth.v1.external.prove",
+                purpose="set_initial_password",
+                token=exchanged["token"],
+                discord_user_id=str(user["id"]),
+                verified_at=verified_at,
+                operation_id=exchange_id,
+            )
+        except HTTPException:
+            # 密码设置能力不可用不影响已完成的普通登录。
+            proof = None
+        login_code = secrets.token_urlsafe(32)
+        claim = {
+            "binding": hashlib.sha256(
+                request.cookies["forum_login_binding"].encode()
+            ).hexdigest(),
+            "token": exchanged["token"],
+            "user": {
+                "id": exchanged["user_id"],
+                "discord_user_id": str(user["id"]),
+                "username": user["username"],
+                "display_name": user.get("global_name"),
+                "global_name": user.get("global_name"),
+                "avatar_url": avatar_url,
+            },
+        }
+        if proof:
+            claim.update(
+                password_setup_proof=proof["proof"],
+                proof_expires_in=proof["expires_in"],
+            )
+        await RedisManager.get_client().set(
+            "forum:login:claim:" + hashlib.sha256(login_code.encode()).hexdigest(),
+            json.dumps(claim),
+            ex=60,
+            nx=True,
+        )
+        return RedirectResponse(
+            url=f"{_AUTH_CONFIG['frontend_url'].rstrip('/')}/login#login_code={login_code}",
+            status_code=302,
+        )
     token = await sign_jwt(
         {
             "id": user["id"],
@@ -276,8 +386,20 @@ async def _create_login_response(auth_state: dict) -> RedirectResponse:
 router = APIRouter(prefix="/auth", tags=["认证"])
 
 
+def _oauth_redirect_uri():
+    """双版本 OAuth 使用独立回调，不扩大绑定 Cookie 的路径范围。"""
+    if is_fluxer_mode():
+        uri = os.environ.get("FORUM_V2_DISCORD_REDIRECT_URI") or (
+            _AUTH_CONFIG or {}
+        ).get("redirect_uri_v2")
+        if not uri or urlsplit(uri).path != "/v2/auth/callback":
+            raise HTTPException(503, "请配置已在 Discord 注册的 V2 OAuth 回调地址")
+        return uri
+    return _AUTH_CONFIG["redirect_uri"]
+
+
 @router.get("/login", summary="Discord OAuth2 登录入口")
-async def login():
+async def login(request: Request):
     """重定向到 Discord OAuth2 授权页面"""
     if not _AUTH_CONFIG:
         raise HTTPException(
@@ -286,17 +408,40 @@ async def login():
 
     params = {
         "client_id": _AUTH_CONFIG["client_id"],
-        "redirect_uri": _AUTH_CONFIG["redirect_uri"],
+        "redirect_uri": _oauth_redirect_uri(),
         "response_type": "code",
         "scope": "identify",
     }
 
+    oauth_state = secrets.token_urlsafe(32)
+    binding = secrets.token_urlsafe(32)
+    await RedisManager.get_client().set(
+        "forum:oauth:state:" + hashlib.sha256(oauth_state.encode()).hexdigest(),
+        hashlib.sha256(binding.encode()).hexdigest(),
+        ex=600,
+        nx=True,
+    )
+    params["state"] = oauth_state
     auth_url = f"https://discord.com/api/oauth2/authorize?{urlencode(params)}"
-    return RedirectResponse(url=auth_url, status_code=302)
+    response = RedirectResponse(url=auth_url, status_code=302)
+    response.set_cookie(
+        "forum_login_binding",
+        binding,
+        max_age=600,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/v2/auth" if is_fluxer_mode() else "/v1/auth",
+    )
+    return response
 
 
 @router.get("/callback", summary="Discord OAuth2 回调")
-async def callback(code: Optional[str] = None):
+async def callback(
+    code: Optional[str] = None,
+    request: Request = None,
+    oauth_state: Optional[str] = Query(None, alias="state"),
+):
     """处理 Discord OAuth2 回调"""
     # 每次 HTTP 回调生成独立编号，code 仅以不可逆短指纹出现在日志和 Redis
     started_at = time.monotonic()
@@ -306,13 +451,27 @@ async def callback(code: Optional[str] = None):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="认证服务未初始化"
         )
 
+    if request is not None:
+        binding = request.cookies.get("forum_login_binding")
+        if not isinstance(oauth_state, str) or not binding:
+            return _oauth_error_redirect("登录状态无效，请重新登录。", 400)
+        accepted = await RedisManager.get_client().eval(
+            """if redis.call('GET',KEYS[1]) ~= ARGV[1] then return 0 end
+            redis.call('DEL',KEYS[1]); return 1""",
+            1,
+            "forum:oauth:state:" + hashlib.sha256(oauth_state.encode()).hexdigest(),
+            hashlib.sha256(binding.encode()).hexdigest(),
+        )
+        if not accepted:
+            return _oauth_error_redirect("登录状态无效或已使用，请重新登录。", 400)
+
     if not code:
         _log_oauth_failure(
             attempt_id, "missing", "missing_code", started_at, status_code=400
         )
         return _oauth_error_redirect("缺少 Discord 授权代码，请重新登录。", 400)
 
-    code_fingerprint = hashlib.sha256(code.encode()).hexdigest()[:12]
+    code_fingerprint = hashlib.sha256(code.encode()).hexdigest()
     # 已完成的同 code 回调可以直接重新签发本站 JWT，不再访问 Discord token 接口
     state = (
         await _OAUTH_CALLBACK_CACHE.get_state(code_fingerprint)
@@ -320,7 +479,7 @@ async def callback(code: Optional[str] = None):
         else None
     )
     if state and state.get("stage") == "authenticated":
-        return await _create_login_response(state)
+        return await _create_login_response(state, request)
 
     # 首个回调持有短锁，重复回调等待或复用已写入的安全中间状态
     lock_acquired = True
@@ -342,7 +501,7 @@ async def callback(code: Optional[str] = None):
                     "同一次授权仍在处理中，请稍后返回登录页面重试。", 503
                 )
             if state.get("stage") == "authenticated":
-                return await _create_login_response(state)
+                return await _create_login_response(state, request)
 
     try:
         if lock_acquired and _OAUTH_CALLBACK_CACHE:
@@ -350,7 +509,7 @@ async def callback(code: Optional[str] = None):
             if latest_state:
                 state = latest_state
             if state and state.get("stage") == "authenticated":
-                return await _create_login_response(state)
+                return await _create_login_response(state, request)
 
         # 同一个 HTTP 客户端承载 OAuth 用户查询和成员查询，统一超时边界
         async with httpx.AsyncClient(
@@ -364,7 +523,7 @@ async def callback(code: Optional[str] = None):
                     "client_secret": _AUTH_CONFIG["client_secret"],
                     "grant_type": "authorization_code",
                     "code": code,
-                    "redirect_uri": _AUTH_CONFIG["redirect_uri"],
+                    "redirect_uri": _oauth_redirect_uri(),
                 }
                 token_response = await client.post(
                     "https://discord.com/api/oauth2/token",
@@ -551,7 +710,7 @@ async def callback(code: Optional[str] = None):
                     code_fingerprint, authenticated_state
                 )
 
-            return await _create_login_response(authenticated_state)
+            return await _create_login_response(authenticated_state, request)
     except Exception as exc:
         logger.exception(
             "OAuth回调处理异常 attempt_id=%s code_fingerprint=%s exception=%s",
@@ -583,6 +742,8 @@ def _get_dev_redirect_uri() -> str:
 @router.get("/login-dev", summary="Discord OAuth2 登录入口 (开发用)")
 async def login_dev():
     """重定向到 Discord OAuth2 授权页面，回调指向 callback-dev"""
+    if is_fluxer_mode():
+        raise HTTPException(404, "开发登录不支持 Fluxer 模式")
     if not _AUTH_CONFIG:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="认证服务未初始化"
@@ -595,13 +756,51 @@ async def login_dev():
         "scope": "identify",
     }
 
+    oauth_state = secrets.token_urlsafe(32)
+    binding = secrets.token_urlsafe(32)
+    await RedisManager.get_client().set(
+        "forum:oauth:state:" + hashlib.sha256(oauth_state.encode()).hexdigest(),
+        hashlib.sha256(binding.encode()).hexdigest(),
+        ex=600,
+        nx=True,
+    )
+    params["state"] = oauth_state
     auth_url = f"https://discord.com/api/oauth2/authorize?{urlencode(params)}"
-    return RedirectResponse(url=auth_url, status_code=302)
+    response = RedirectResponse(url=auth_url, status_code=302)
+    response.set_cookie(
+        "forum_login_binding",
+        binding,
+        max_age=600,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/v2/auth" if is_fluxer_mode() else "/v1/auth",
+    )
+    return response
 
 
 @router.get("/callback-dev", summary="Discord OAuth2 回调 (开发用)")
-async def callback_dev(code: Optional[str] = None):
+async def callback_dev(
+    code: Optional[str] = None,
+    request: Request = None,
+    oauth_state: Optional[str] = Query(None, alias="state"),
+):
     """处理 Discord OAuth2 回调，直接返回 token HTML 页面而非重定向"""
+    if is_fluxer_mode():
+        raise HTTPException(404, "开发登录不支持 Fluxer 模式")
+    if request is not None:
+        binding = request.cookies.get("forum_login_binding")
+        if not isinstance(oauth_state, str) or not binding:
+            raise HTTPException(400, "登录状态无效")
+        accepted = await RedisManager.get_client().eval(
+            """if redis.call('GET',KEYS[1]) ~= ARGV[1] then return 0 end
+            redis.call('DEL',KEYS[1]); return 1""",
+            1,
+            "forum:oauth:state:" + hashlib.sha256(oauth_state.encode()).hexdigest(),
+            hashlib.sha256(binding.encode()).hexdigest(),
+        )
+        if not accepted:
+            raise HTTPException(400, "登录状态无效或已使用")
     attempt_id = f"dev-{secrets.token_hex(6)}"
     if not _AUTH_CONFIG:
         raise HTTPException(
@@ -789,6 +988,9 @@ async def logout(response: Response):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="认证服务未初始化"
         )
 
+    if is_fluxer_mode():
+        raise HTTPException(405, "请使用 POST 退出 Fluxer 会话")
+
     # 清除 cookie 并重定向到前端
     redirect_response = RedirectResponse(
         url=_AUTH_CONFIG["frontend_url"], status_code=302
@@ -802,7 +1004,34 @@ async def logout(response: Response):
 
 @router.get("/checkauth", summary="检查认证状态")
 async def check_auth(request: Request):
-    """检查用户认证状态并刷新 token"""
+    """检查用户认证状态，Fluxer 会话不续期。"""
+    if is_fluxer_mode():
+        header = request.headers.get("Authorization", "")
+        principal = (
+            await resolve_principal(header[7:].strip())
+            if header.startswith("Bearer ")
+            else None
+        )
+        unread_count = 0
+        if principal:
+            from core.notification_repository import NotificationRepository
+            from shared.database import AsyncSessionFactory
+
+            try:
+                async with AsyncSessionFactory() as session:
+                    unread_count = await NotificationRepository(session).unread_count(
+                        str(principal["id"])
+                    )
+            except Exception:
+                logger.warning("读取统一用户未读数量暂不可用")
+        return JSONResponse(
+            {
+                "loggedIn": principal is not None,
+                "user": principal,
+                "unread_count": unread_count,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
     if not _AUTH_CONFIG:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="认证服务未初始化"
@@ -1001,3 +1230,79 @@ async def check_auth(request: Request):
     )
 
     return response
+
+
+@router.get("/config")
+async def auth_config():
+    """向前端公开显式身份模式，不泄露服务凭证。"""
+    return JSONResponse(
+        {
+            "mode": "fluxer" if is_fluxer_mode() else "legacy",
+            "fluxer_api_url": os.environ.get("FLUXER_API_URL", ""),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/session/claim")
+async def claim_session(request: Request, body: dict):
+    """一次性交付浏览器绑定的登录码，原始 token 不放 URL。"""
+    if not is_fluxer_mode():
+        raise HTTPException(404, "未启用 Fluxer 登录")
+    frontend_origin = urlsplit((_AUTH_CONFIG or {}).get("frontend_url", ""))
+    allowed_origin = f"{frontend_origin.scheme}://{frontend_origin.netloc}"
+    if request.headers.get("origin") != allowed_origin:
+        raise HTTPException(403, "登录来源无效")
+    code = body.get("login_code")
+    binding = request.cookies.get("forum_login_binding")
+    if not isinstance(code, str) or len(code) > 256 or not binding:
+        raise HTTPException(400, "登录码无效")
+    value = await RedisManager.get_client().eval(
+        """local raw=redis.call('GET',KEYS[1]); if not raw then return nil end
+        local claim=cjson.decode(raw); if claim.binding ~= ARGV[1] then return nil end
+        redis.call('DEL',KEYS[1]); return raw""",
+        1,
+        "forum:login:claim:" + hashlib.sha256(code.encode()).hexdigest(),
+        hashlib.sha256(binding.encode()).hexdigest(),
+    )
+    if not value:
+        raise HTTPException(400, "登录码失效或已使用")
+    claim = json.loads(value)
+    claim.pop("binding", None)
+    response = JSONResponse(
+        claim, headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
+    )
+    response.delete_cookie(
+        "forum_login_binding",
+        path="/v2/auth" if is_fluxer_mode() else "/v1/auth",
+        secure=True,
+        samesite="none",
+    )
+    return response
+
+
+@router.post("/logout")
+async def revoke_session(request: Request):
+    """撤销当前权威会话并仅失效该会话缓存。"""
+    if not is_fluxer_mode():
+        raise HTTPException(404, "未启用 Fluxer 登录")
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer flx_"):
+        raise HTTPException(401, "需要当前会话")
+    service = get_auth_service()
+    identity = await service.resolve(header[7:].strip())
+    result = await service.rpc(
+        "rpc.auth.v1.session.revoke_current", token=header[7:].strip()
+    )
+    from types import SimpleNamespace
+
+    if identity:
+        await service.invalidated(
+            SimpleNamespace(
+                subject="events.auth.v1.session_invalidated",
+                data=json.dumps(
+                    {"session_id_hash": identity["session_id_hash"]}
+                ).encode(),
+            )
+        )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})

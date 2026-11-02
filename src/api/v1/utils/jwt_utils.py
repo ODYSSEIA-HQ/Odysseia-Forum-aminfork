@@ -88,7 +88,9 @@ async def verify_jwt(token: str, secret: str) -> Optional[Dict[str, Any]]:
         if payload.get("exp", 0) < time.time():
             return None
 
-        return payload
+        from api.v1.dependencies.security import validate_legacy_binding
+
+        return await validate_legacy_binding(payload)
 
     except Exception:
         return None
