@@ -1,3 +1,4 @@
+from identity.principal import current_identity_id
 import logging
 from typing import Annotated, Any
 
@@ -16,7 +17,9 @@ from api.v1.utils import ThreadDetailBuilder
 from core.notification_repository import NotificationRepository
 from core.thread_presentation_service import ThreadPresentationService
 from core.thread_repository import ThreadRepository
-from models import ThreadUpdate
+from models import ThreadUpdate, Thread
+from models.work_announcement import WorkAnnouncement
+from sqlalchemy import or_
 from shared.database import AsyncSessionFactory
 
 logger = logging.getLogger(__name__)
@@ -36,7 +39,7 @@ async def list_notifications(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> NotificationList:
     """分页返回作品更新与作者新作通知。"""
-    user_id = int(current_user["id"])
+    user_id = current_identity_id(current_user)
     async with AsyncSessionFactory() as session:
         notification_repository = NotificationRepository(session)
         (
@@ -44,10 +47,32 @@ async def list_notifications(
             total,
             unread_count,
         ) = await notification_repository.list_for_user(
-            user_id, unread_only, limit, offset
+            user_id, unread_only, limit, offset, legacy_visible=True
         )
+        work_ids = {item.work_id for item in notifications if item.work_id is not None}
+        discord_by_work = {}
+        if work_ids:
+            for work_id, external_id in await session.execute(
+                select(Thread.work_id, Thread.thread_id)
+                .where(
+                    Thread.work_id.in_(work_ids),
+                    Thread.platform == "discord",
+                    Thread.deleted_at.is_(None),
+                    Thread.show_flag.is_(True),
+                )
+                .order_by(Thread.id)
+            ):
+                discord_by_work.setdefault(work_id, external_id)
+        notice_threads = {
+            item.id: (
+                discord_by_work.get(item.work_id)
+                if item.event_type == "work_announcement"
+                else item.thread_id
+            )
+            for item in notifications
+        }
         thread_ids = list(
-            {item.thread_id for item in notifications if item.thread_id is not None}
+            {value for value in notice_threads.values() if value is not None}
         )
         threads = await ThreadRepository(session).get_threads_by_ids_with_tags(
             thread_ids
@@ -70,6 +95,28 @@ async def list_notifications(
                 if update.id is not None
             }
 
+        announcement_ids = {
+            item.event_source_id
+            for item in notifications
+            if item.event_type == "work_announcement"
+        }
+        announcement_map = {}
+        legacy_announcements = {}
+        if announcement_ids or update_ids:
+            for announcement in (
+                await session.execute(
+                    select(WorkAnnouncement).where(
+                        or_(
+                            WorkAnnouncement.id.in_(announcement_ids),
+                            WorkAnnouncement.legacy_update_id.in_(update_ids),
+                        )
+                    )
+                )
+            ).scalars():
+                announcement_map[announcement.id] = announcement
+                if announcement.legacy_update_id is not None:
+                    legacy_announcements[announcement.legacy_update_id] = announcement
+
         results: list[NotificationItem] = []
         for item in notifications:
             if item.event_type == "tag_review":
@@ -85,10 +132,24 @@ async def list_notifications(
                     )
                 )
                 continue
-            if item.id is None or (thread := thread_map.get(item.thread_id)) is None:
+            if (
+                item.id is None
+                or (thread := thread_map.get(notice_threads.get(item.id))) is None
+            ):
                 continue
             update_response = None
-            update_record = update_map.get(item.event_source_id)
+            update_record = (
+                update_map.get(item.event_source_id)
+                if item.event_type == "thread_update"
+                else None
+            )
+            announcement = (
+                announcement_map.get(item.event_source_id)
+                if item.event_type == "work_announcement"
+                else legacy_announcements.get(item.event_source_id)
+                if item.event_type == "thread_update"
+                else None
+            )
             if update_record is not None:
                 message_link = None
                 if update_record.message_id is not None:
@@ -104,10 +165,27 @@ async def list_notifications(
                     source_message_at=update_record.source_message_at,
                     published_at=update_record.published_at,
                 )
+            if announcement is not None and (
+                item.event_type == "work_announcement" or announcement.withdrawn_at
+            ):
+                update_response = LatestUpdate(
+                    id=announcement.id,
+                    description="公告已撤回"
+                    if announcement.withdrawn_at
+                    else announcement.body[:500],
+                    version=None
+                    if announcement.withdrawn_at
+                    else (announcement.title or "")[:50] or None,
+                    message_link=None,
+                    source_message_at=announcement.created_at,
+                    published_at=announcement.created_at,
+                )
             results.append(
                 NotificationItem(
                     id=item.id,
-                    type=item.event_type,
+                    type="thread_update"
+                    if item.event_type == "work_announcement"
+                    else item.event_type,
                     thread=thread_builder.build(
                         thread,
                         set(),
@@ -138,7 +216,7 @@ async def get_unread_count(
     """返回当前用户全部动态通知的未读数量。"""
     async with AsyncSessionFactory() as session:
         count = await NotificationRepository(session).unread_count(
-            int(current_user["id"])
+            current_identity_id(current_user), legacy_visible=True
         )
     return UnreadCountResponse(unread_count=count)
 
@@ -155,7 +233,7 @@ async def mark_thread_read(
     """幂等标记用户在指定作品下的全部动态通知。"""
     async with AsyncSessionFactory() as session:
         count = await NotificationRepository(session).mark_thread_read(
-            int(current_user["id"]), thread_id
+            current_identity_id(current_user), thread_id, legacy_visible=True
         )
         await session.commit()
     return MarkReadResponse(thread_id=thread_id, marked_read=count)
@@ -172,7 +250,7 @@ async def mark_all_read(
     """幂等标记当前用户的全部动态通知。"""
     async with AsyncSessionFactory() as session:
         count = await NotificationRepository(session).mark_all_read(
-            int(current_user["id"])
+            current_identity_id(current_user), legacy_visible=True
         )
         await session.commit()
     return MarkReadResponse(marked_read=count)
@@ -195,7 +273,7 @@ async def mark_one_read(
     """读取书单审核等不关联作品的通知时可单独标记。"""
     async with AsyncSessionFactory() as session:
         count = await NotificationRepository(session).mark_one_read(
-            int(current_user["id"]), notification_id
+            current_identity_id(current_user), notification_id
         )
         await session.commit()
     return MarkReadResponse(marked_read=count)

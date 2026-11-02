@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import col
 
 from core.notification_fanout_service import NotificationFanoutService
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from core.notification_repository import NotificationRepository
 from core.thread_update_error import ThreadUpdateError
 from core.thread_update_repository import ThreadUpdateRepository
@@ -36,6 +38,9 @@ class ThreadUpdateService:
         clean_description, clean_version = self._normalize_info(description, version)
         async with self.session_factory() as session:
             try:
+                canonical_publisher_id = await resolve_business_id(
+                    session, publisher_id
+                )
                 thread = await self._get_publishable_thread(
                     session, thread_id, publisher_id
                 )
@@ -49,6 +54,9 @@ class ThreadUpdateService:
                         thread_id=thread_id,
                         message_id=message_id,
                         publisher_id=publisher_id,
+                        fluxer_publisher_id=canonical_publisher_id
+                        if is_fluxer_mode()
+                        else None,
                         description=clean_description,
                         version=clean_version,
                         source_message_at=source_message_at,
@@ -99,7 +107,11 @@ class ThreadUpdateService:
             update_record = await repository.get_by_id(update_id)
             if update_record is None:
                 raise ThreadUpdateError("此次发布不存在或已被删除")
-            if update_record.publisher_id != publisher_id:
+            canonical_publisher_id = await resolve_business_id(session, publisher_id)
+            if update_record.publisher_id != publisher_id or (
+                is_fluxer_mode()
+                and update_record.fluxer_publisher_id != canonical_publisher_id
+            ):
                 raise ThreadUpdateError("只有发布者可以修改此次发布")
             update_record.description = clean_description
             update_record.version = clean_version
@@ -116,7 +128,13 @@ class ThreadUpdateService:
                 update_record = await repository.get_by_id(update_id)
                 if update_record is None:
                     raise ThreadUpdateError("此次发布不存在或已被删除")
-                if update_record.publisher_id != publisher_id:
+                canonical_publisher_id = await resolve_business_id(
+                    session, publisher_id
+                )
+                if update_record.publisher_id != publisher_id or (
+                    is_fluxer_mode()
+                    and update_record.fluxer_publisher_id != canonical_publisher_id
+                ):
                     raise ThreadUpdateError("只有发布者可以删除此次发布")
                 deleted_dto = self._to_dto(update_record)
 
@@ -209,7 +227,10 @@ class ThreadUpdateService:
         thread = (await session.execute(statement)).scalar_one_or_none()
         if thread is None or not thread.show_flag or thread.not_found_count > 0:
             raise ThreadUpdateError("当前帖子未索引或已不可见")
-        if thread.author_id != publisher_id:
+        canonical_publisher_id = await resolve_business_id(session, publisher_id)
+        if thread.author_id != publisher_id or (
+            is_fluxer_mode() and thread.fluxer_author_id != canonical_publisher_id
+        ):
             raise ThreadUpdateError("你不是索引记录中的作品作者")
         return thread
 
