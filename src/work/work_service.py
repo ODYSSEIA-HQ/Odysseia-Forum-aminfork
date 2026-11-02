@@ -288,6 +288,28 @@ class WorkService:
             key in changes and changes[key] != getattr(work, key)
             for key in ("is_nsfw", "is_abyss")
         )
+        if classification:
+            # 已发送但结果未知的创建不能重绑目标，也不能让分类先越过旧请求。
+            unresolved = (
+                await self.session.execute(
+                    select(WorkTask.id).where(
+                        WorkTask.work_id == work.id,
+                        WorkTask.kind == "create_child",
+                        WorkTask.dispatched_at.is_not(None),
+                        WorkTask.status != "done",
+                    ).limit(20)
+                )
+            ).scalars().all()
+            if unresolved:
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "CHILD_CREATION_UNRESOLVED",
+                        "message": "子帖创建结果尚未解析，请检查任务并在结果确定后重试分类",
+                        "retryable": True,
+                        "task_ids": [str(value) for value in unresolved],
+                    },
+                )
         if "title" in changes and len(changes["title"]) > 100:
             raise HTTPException(422, "原生作品标题最多100字符")
         if (
