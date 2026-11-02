@@ -125,6 +125,7 @@ class FluxerAuthService:
             subject = message.subject
             user_id = event.get("user_id")
             session_hash = event.get("session_id_hash")
+            generation_barrier = False
             if subject == "events.auth.v1.session_invalidated":
                 if not isinstance(session_hash, str) or not re.fullmatch(
                     r"[A-Za-z0-9_-]{1,128}", session_hash
@@ -151,16 +152,36 @@ class FluxerAuthService:
                     or event["version"] < 1
                 ):
                     raise ValueError("invalid binding event")
+                affected = {user_id}
+                merged = event.get("merged_user_id")
+                if merged is not None:
+                    if not isinstance(merged, str) or not re.fullmatch(r"[1-9][0-9]{0,18}", merged):
+                        raise ValueError("invalid merged identity")
+                    affected.add(merged)
+                declared = event.get("affected_user_ids")
+                if declared is None:
+                    # 旧事件缺少完整影响范围，先隔离全部旧缓存及在途结果。
+                    generation_barrier = True
+                elif (
+                    type(declared) is not list or not 1 <= len(declared) <= 2
+                    or any(type(value) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", value) for value in declared)
+                    or len(set(declared)) != len(declared) or set(declared) != affected
+                ):
+                    raise ValueError("invalid affected identities")
+                keys = [self.PREFIX + ":user_epoch:" + value for value in sorted(affected)]
                 pending = self.pending_bindings.get(discord_id)
                 if not pending or pending["version"] <= event["version"]:
                     self.pending_bindings[discord_id] = event
             # 每个目标保存最后事件序号；无关事件不会让其他主体缓存失效。
             await self.redis.eval(
                 """local sequence=redis.call('INCR',KEYS[1]);
-                for i=2,#KEYS do redis.call('SET',KEYS[i],sequence,'EX',3700) end; return sequence""",
-                1 + len(keys),
+                for i=3,#KEYS do redis.call('SET',KEYS[i],sequence,'EX',3700) end;
+                if ARGV[1]=='1' then redis.call('INCR',KEYS[2]) end; return sequence""",
+                2 + len(keys),
                 self.PREFIX + ":event_sequence",
+                self.PREFIX + ":generation",
                 *keys,
+                "1" if generation_barrier else "0",
             )
             if subject == "events.identity.v1.binding_changed":
                 current_event = self.pending_bindings[discord_id]
@@ -168,6 +189,11 @@ class FluxerAuthService:
                 if self.pending_bindings.get(discord_id) is current_event:
                     self.pending_bindings.pop(discord_id, None)
         except Exception:
+            self.ready = False
+            try:
+                await self.redis.incr(self.PREFIX + ":generation")
+            except Exception:
+                pass
             await self.request_reset()
 
     async def apply_binding(self, event):
@@ -364,6 +390,140 @@ class FluxerAuthService:
         except Exception as exc:
             await self.request_reset()
             raise HTTPException(503, "认证缓存暂不可用") from exc
+
+    async def legacy_eligibility(
+        self, discord_id, user_id, binding_version, *, force_authority=False
+    ):
+        """旧 JWT 只复用短期当前登录准入，不把历史归属或绑定版本当安全状态。"""
+        if (
+            not isinstance(discord_id, str)
+            or not re.fullmatch(r"[1-9][0-9]{0,18}", discord_id)
+            or not isinstance(user_id, str)
+            or not re.fullmatch(r"[1-9][0-9]{0,18}", user_id)
+            or type(binding_version) is not int
+            or binding_version < 1
+        ):
+            raise HTTPException(503, "当前身份投影无效")
+        started = time.monotonic()
+        anchor_key = None
+        await self.start()
+        generation_key = self.PREFIX + ":generation"
+        epoch_key = self.PREFIX + ":user_epoch:" + user_id
+        try:
+            generation, epoch = await self.redis.mget(generation_key, epoch_key)
+            generation, epoch = str(generation or "0"), str(epoch or "0")
+            key = f"{self.PREFIX}:legacy:{generation}:{discord_id}:{user_id}:{binding_version}"
+            cache_read_started = time.monotonic()
+            cached = await self.redis.eval(
+                "if (redis.call('GET',KEYS[1]) or '0')~=ARGV[1] or "
+                "(redis.call('GET',KEYS[2]) or '0')~=ARGV[2] then return nil end; "
+                "local raw=redis.call('GET',KEYS[3]); if not raw then return nil end; "
+                "local snapshot=cjson.decode(raw); local maximum=snapshot.eligible and 30000 or 5000; "
+                "local ttl=redis.call('PTTL',KEYS[3]); if ttl<=0 or ttl>maximum then "
+                "redis.call('DEL',KEYS[3]); return nil end; return {raw,ttl}",
+                3,
+                generation_key,
+                epoch_key,
+                key,
+                generation,
+                epoch,
+            )
+            if cached and not force_authority:
+                if not isinstance(cached, (list, tuple)) or len(cached) != 2 or type(cached[1]) is not int:
+                    raise HTTPException(503, "准入缓存期限无效")
+                snapshot = json.loads(cached[0])
+                read_elapsed = time.monotonic() - cache_read_started
+                if (
+                    self.ready and 0 <= read_elapsed < cached[1] / 1000
+                    and snapshot["epoch"] == epoch
+                    and type(snapshot["eligible"]) is bool
+                ):
+                    return snapshot["eligible"]
+            # 与原生会话解析共用并发边界，敏感写入始终到权威重新判断。
+            try:
+                await asyncio.wait_for(self.misses.acquire(), timeout=0.1)
+            except TimeoutError as exc:
+                raise HTTPException(503, "身份准入核验繁忙") from exc
+            try:
+                # 权威核验前先在Redis建立原始期限，延迟填充不能重新开始计时。
+                anchor_key = self.PREFIX + ":legacy-fill:" + uuid.uuid4().hex
+                if not await self.redis.set(anchor_key, "1", px=30000, nx=True):
+                    raise HTTPException(503, "准入期限建立失败")
+                result = await self.rpc(
+                    "rpc.identity.v1.login_eligibility", discord_user_id=discord_id
+                )
+            finally:
+                self.misses.release()
+            if (
+                not isinstance(result, dict)
+                or set(result) != {
+                    "discord_user_id", "user_id", "identity_version", "current", "eligible"
+                }
+                or result["discord_user_id"] != discord_id
+                or type(result["current"]) is not bool
+                or type(result["eligible"]) is not bool
+                or (result["eligible"] and not result["current"])
+                or (
+                    result["user_id"] is not None
+                    and (
+                        not isinstance(result["user_id"], str)
+                        or not re.fullmatch(r"[1-9][0-9]{0,18}", result["user_id"])
+                    )
+                )
+                or (
+                    result["identity_version"] is not None
+                    and (type(result["identity_version"]) is not int or result["identity_version"] < 1)
+                )
+            ):
+                raise HTTPException(503, "权威准入回复无效")
+            eligible = result["eligible"]
+            if result["current"] and (
+                result["user_id"] != user_id or result["identity_version"] != binding_version
+            ):
+                raise HTTPException(503, "权威绑定投影正在同步，请稍后重试")
+            # 普通读取最多三十秒且不续期；失效事件在写回前后均形成屏障。
+            maximum = 30 if eligible else 5
+            elapsed = time.monotonic() - started
+            ttl = min(maximum, math.floor(maximum - elapsed))
+            if not self.ready or elapsed < 0 or ttl < 1:
+                raise HTTPException(503, "准入核验结果已过期")
+            accepted = await self.redis.eval(
+                "if (redis.call('GET',KEYS[1]) or '0')~=ARGV[1] or "
+                "(redis.call('GET',KEYS[2]) or '0')~=ARGV[2] then return 0 end; "
+                "local left=redis.call('PTTL',KEYS[4]); if left<=0 or left>30000 then return 0 end; "
+                "local remaining=tonumber(ARGV[5])*1000-(30000-left); "
+                "local allowed=math.floor(math.min(remaining,tonumber(ARGV[4])*1000)); "
+                "if allowed<=0 then return 0 end; "
+                "redis.call('SET',KEYS[3],ARGV[3],'PX',allowed); "
+                "redis.call('DEL',KEYS[4]); return allowed",
+                4,
+                generation_key,
+                epoch_key,
+                key,
+                anchor_key,
+                generation,
+                epoch,
+                json.dumps({"eligible": eligible, "epoch": epoch}),
+                ttl,
+                maximum,
+            )
+            if type(accepted) is not int or not 0 < accepted <= maximum * 1000:
+                raise HTTPException(503, "准入状态已变化，请重试")
+            anchor_key = None  # 成功Lua已删除锚点，接受结果后不得再等待清理网络。
+            if not self.ready or time.monotonic() - started >= maximum:
+                raise HTTPException(503, "准入核验结果已过期")
+            return eligible
+        except HTTPException:
+            raise
+        except Exception as exc:
+            await self.request_reset()
+            raise HTTPException(503, "身份准入核验暂不可用") from exc
+        finally:
+            if anchor_key is not None:
+                try:
+                    await self.redis.delete(anchor_key)
+                except Exception:
+                    pass
 
     async def close(self):
         """退出时结束恢复任务和持久连接，不留下后台订阅。"""

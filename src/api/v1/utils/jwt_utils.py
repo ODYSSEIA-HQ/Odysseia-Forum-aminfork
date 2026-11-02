@@ -88,9 +88,10 @@ async def verify_jwt(token: str, secret: str) -> Optional[Dict[str, Any]]:
         if payload.get("exp", 0) < time.time():
             return None
 
-        from api.v1.dependencies.security import validate_legacy_binding
-
-        return await validate_legacy_binding(payload)
-
     except Exception:
         return None
+
+    # 依赖故障不是无效凭证，准入核验的 503 必须交给请求层处理。
+    from api.v1.dependencies.security import validate_legacy_binding
+
+    return await validate_legacy_binding(payload)

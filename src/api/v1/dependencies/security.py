@@ -57,6 +57,11 @@ async def get_current_user(
     从请求中提取并验证 JWT token，返回用户信息
     优先从 Authorization Bearer 中读取，回退到 Cookie
     """
+    force_authority = (
+        request.method not in ("GET", "HEAD", "OPTIONS")
+        or request.url.path.startswith("/v1/admin/")
+        or request.url.path.endswith("/modlog")
+    )
     if is_fluxer_mode():
         request_state = request.scope.get("state", {})
         if VERIFIED_JWT_PAYLOAD_STATE_KEY in request_state:
@@ -75,7 +80,7 @@ async def get_current_user(
     request_state = request.scope.get("state", {})
     if VERIFIED_JWT_PAYLOAD_STATE_KEY in request_state:
         cached_payload = request_state[VERIFIED_JWT_PAYLOAD_STATE_KEY]
-        return await validate_legacy_binding(cached_payload)
+        return await validate_legacy_binding(cached_payload, force_authority=force_authority)
 
     # 优先从 Authorization Bearer 中读取
     token = credentials.credentials if credentials else None
@@ -89,10 +94,10 @@ async def get_current_user(
 
     # 验证 JWT
     payload = await verify_jwt(token, _JWT_SECRET)
-    return await validate_legacy_binding(payload)
+    return await validate_legacy_binding(payload, force_authority=force_authority)
 
 
-async def validate_legacy_binding(payload):
+async def validate_legacy_binding(payload, *, force_authority=False):
     """迁移后旧 JWT 只允许当前 Discord 绑定使用。"""
     import os
 
@@ -105,16 +110,22 @@ async def validate_legacy_binding(payload):
     async with AsyncSessionFactory() as session:
         current = (
             await session.execute(
-                select(DiscordIdentity.user_id).where(
+                select(DiscordIdentity.user_id, DiscordIdentity.version).where(
                     DiscordIdentity.discord_user_id == str(payload.get("id")),
                     DiscordIdentity.is_current.is_(True),
                 )
             )
-        ).scalar_one_or_none()
+        ).one_or_none()
         if current is None:
             return None
-        payload = {**payload, "canonical_user_id": current}
-    return payload
+        user_id, binding_version = current
+    from identity.auth_runtime import get_auth_service
+
+    if not await get_auth_service().legacy_eligibility(
+        str(payload["id"]), user_id, binding_version, force_authority=force_authority
+    ):
+        return None
+    return {**payload, "canonical_user_id": user_id}
 
 
 async def require_auth(
