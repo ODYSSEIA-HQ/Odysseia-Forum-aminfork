@@ -11,6 +11,8 @@ from api.v2.routers.tags import router as tags_router
 from api.v2.routers.threads import router as threads_router
 from api.v2.routers.follows import router as follows_router
 from api.v2.routers.authors import router as authors_router
+from api.v2.routers.moderation import router as moderation_router
+from api.v2.routers.admin import router as admin_router
 
 __all__ = ["router", "AsyncSessionFactory"]
 router = APIRouter()
@@ -23,3 +25,5 @@ router.include_router(tags_router)
 router.include_router(threads_router)
 router.include_router(follows_router)
 router.include_router(authors_router)
+router.include_router(moderation_router)
+router.include_router(admin_router)
