@@ -92,7 +92,7 @@ class Indexer(commands.Cog):
 
         try:
             async with self.session_factory() as session:
-                await ThreadDeletionService(session).delete_channel(channel.id)
+                await ThreadDeletionService(session).remove_channel_index(channel.id)
                 await session.commit()
 
             await self.bot.api_scheduler.submit(

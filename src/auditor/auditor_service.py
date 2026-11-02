@@ -31,7 +31,8 @@ class AuditorService:
         """
         stmt = (
             select(Thread.id, Thread.thread_id)  # type: ignore
-            .where(Thread.id > cursor)  # type: ignore
+            .where(Thread.id > cursor, Thread.platform == "discord")
+            .execution_options(all_platforms=True)
             .order_by(Thread.id)
             .limit(batch_size)
         )
@@ -40,7 +41,7 @@ class AuditorService:
 
     async def delete_stale_threads(self, threshold: int) -> int:
         """
-        物理删除那些 not_found_count 超过阈值的帖子记录。
+        保留连续读取失败的来源，禁止从失败阈值推断删除。
 
         Returns:
             被删除的记录数量。

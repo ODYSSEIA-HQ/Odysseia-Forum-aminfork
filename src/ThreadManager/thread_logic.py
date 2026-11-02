@@ -8,6 +8,7 @@ import discord
 from core.config_repository import ConfigRepository
 from core.thread_repository import ThreadRepository
 from core.thread_deletion_service import ThreadDeletionService
+from dto.events import IndexUpdatedEvent
 from shared.enum import SearchConfigType
 from shared.redis_client import RedisManager
 from shared.similar_threads_cache import invalidate_similar_candidate_pools
@@ -30,46 +31,29 @@ class ThreadLogic:
     # ---------------------------------------------------------
     # 删除处理逻辑
     # ---------------------------------------------------------
-    async def delete_thread_permanently(self, thread_id: int):
-        """处理整个帖子被从 Discord 删除的逻辑：物理删除数据库记录"""
+    async def delete_thread_permanently(
+        self, thread_id: int, guild_id: int | None = None
+    ):
+        """处理权威 Discord 删除，保留作品来源与全部关联。"""
         async with self.session_factory() as session:
-            await ThreadDeletionService(session).delete_thread(thread_id)
+            await ThreadDeletionService(session).mark_source_deleted(
+                [thread_id], guild_id=guild_id
+            )
             await session.commit()
-            logger.info(f"帖子 {thread_id} 已从 Discord 删除，已同步清理数据库索引记录")
         await self._invalidate_similarity_cache(thread_id)
 
-    async def handle_first_message_deletion(self, thread: discord.Thread):
-        """处理首楼被删除但帖子还在的逻辑：隐藏并发送恢复按钮"""
+    async def handle_channel_deletion(self, channel_id: int, guild_id: int):
+        """处理真实频道删除事件，不用于管理员移除索引。"""
         async with self.session_factory() as session:
-            repo = ThreadRepository(session)
-            # 逻辑隐藏 (show_flag=False)
-            success = await repo.update_thread_visibility(thread.id, show_flag=False)
+            await ThreadDeletionService(session).mark_channel_source_deleted(
+                channel_id, guild_id
+            )
+            await session.commit()
+        await self.bot.event_mediator.publish(IndexUpdatedEvent())
 
-        if not success:
-            return
-
-        await self._invalidate_similarity_cache(thread.id)
-
-        logger.info(f"帖子 {thread.id}(频道:{thread.parent_id}) 首楼被删，已将其隐藏")
-
-        # if not thread.owner_id:
-        #     return
-
-        # # 发送恢复按钮视图
-        # view = ThreadVisibilityView(self.bot, self.session_factory)
-        # content = (
-        #     f"<@{thread.owner_id}>\n"
-        #     f"系统检测到您的首楼消息已被删除，为防止死链，**本帖已自动从新搜索系统中隐藏**。\n"
-        #     f"如果您仍希望本帖在搜索中可见（例如您已在楼中补档），请点击下方按钮重新开放可见性。"
-        # )
-
-        # try:
-        #     await self.bot.api_scheduler.submit(
-        #         coro_factory=lambda: thread.send(content=content, view=view),
-        #         priority=3
-        #     )
-        # except Exception as e:
-        #     logger.error(f"向帖子 {thread.id} 发送可见性视图失败", exc_info=True)
+    async def handle_first_message_deletion(self, thread: discord.Thread):
+        """首楼权威删除使来源不可恢复，不清理任何业务关系。"""
+        await self.delete_thread_permanently(thread.id, thread.guild.id)
 
     async def _invalidate_similarity_cache(self, thread_id: int) -> None:
         """尽力失效源帖的相似推荐候选池。"""

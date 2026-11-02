@@ -215,7 +215,7 @@ class ThreadManager(commands.Cog):
     async def on_thread_delete(self, thread: discord.Thread):
         """当整个 Thread 被从 Discord 删除时触发"""
         if self.is_channel_indexed(thread.parent_id):
-            await self.logic.delete_thread_permanently(thread.id)
+            await self.logic.delete_thread_permanently(thread.id, thread.guild.id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -267,6 +267,12 @@ class ThreadManager(commands.Cog):
         if not payload.guild_id:
             return
         try:
+            # 首楼编号等于线程编号，原始事件不依赖本机频道缓存。
+            if payload.message_id == payload.channel_id:
+                await self.logic.delete_thread_permanently(
+                    payload.channel_id, payload.guild_id
+                )
+                return
             channel = self.bot.get_channel(payload.channel_id)
             if isinstance(channel, discord.Thread) and self.is_channel_indexed(
                 channel.parent_id
@@ -371,3 +377,19 @@ class ThreadManager(commands.Cog):
         await interaction.response.send_message(
             "DC 原生标签为只读，不再支持投票。", ephemeral=True
         )
+
+    @commands.Cog.listener()
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent):
+        """未缓存帖子的权威 gateway 删除仍写入来源墓碑。"""
+        if self.is_channel_indexed(payload.parent_id):
+            await self.logic.delete_thread_permanently(
+                payload.thread_id, payload.guild_id
+            )
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        """真实论坛频道删除与管理员移除索引使用不同入口。"""
+        if isinstance(channel, discord.ForumChannel) and self.is_channel_indexed(
+            channel.id
+        ):
+            await self.logic.handle_channel_deletion(channel.id, channel.guild.id)

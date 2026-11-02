@@ -391,7 +391,7 @@ class SyncService:
                         mutation = await repo.add_or_update_thread_with_tags(
                             thread_data=thread_data, tags=tags
                         )
-                        if mutation.created:
+                        if mutation.created and thread_data.get("author_id"):
                             # 来源、绑定与新帖通知仍在同一事务中提交。
                             await NotificationFanoutService(
                                 session

@@ -1,10 +1,12 @@
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from core.tag_binding_repository import TagBindingRepository
 import logging
 from datetime import datetime
 from collections.abc import AsyncIterator
 from typing import List, Optional, Sequence, cast
 
-from sqlalchemy import ColumnElement, case, delete, func, update, text
+from sqlalchemy import ColumnElement, case, func, update, text
 from sqlalchemy import select as sqlalchemy_select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
@@ -22,10 +24,7 @@ from dto.thread_channel_sync_result import ThreadChannelSyncResult
 from dto.thread_message_snapshot import ThreadMessageSnapshot
 from dto.thread_sync_mutation_result import ThreadSyncMutationResult
 from dto.update_data import UpdateData
-from models import Author, Tag, Thread, ThreadFollow
-from models.booklist_item import BooklistItem
-from models.user_collection import UserCollection
-from shared.enum import CollectionType
+from models import Author, User, Tag, Thread
 from shared.fts_utils import build_fts_conditions
 
 logger = logging.getLogger(__name__)
@@ -43,6 +42,10 @@ class ThreadRepository:
         """查询一个可公开分享的帖子及其作者标量信息。"""
         # 外连接作者，作者记录缺失时仍允许帖子以“未命名”作者展示。
         # 用 SQLAlchemy 查询多列，col 明确 SQLModel 字段的列表达式类型。
+        profile_model = User if is_fluxer_mode() else Author
+        profile_author = (
+            Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id
+        )
         statement = (
             sqlalchemy_select(
                 col(Thread.thread_id),
@@ -54,14 +57,15 @@ class ThreadRepository:
                 col(Thread.collection_count),
                 col(Thread.created_at),
                 col(Thread.last_active_at),
-                col(Author.display_name),
-                col(Author.avatar_url),
+                col(profile_model.display_name),
+                col(profile_model.avatar_url),
             )
-            .outerjoin(Author, col(Author.id) == col(Thread.author_id))
+            .outerjoin(profile_model, col(profile_model.id) == col(profile_author))
             .where(
+                Thread.platform == "discord",
                 col(Thread.thread_id) == thread_id,
                 col(Thread.show_flag).is_(True),
-                col(Thread.not_found_count) == 0,
+                col(Thread.deleted_at).is_(None),
             )
         )
         if excluded_channel_ids:
@@ -91,12 +95,15 @@ class ThreadRepository:
         """聚合作者全部可公开作品的数量、反应与回复统计。"""
         statement = sqlalchemy_select(
             func.count(col(Thread.id)).label("thread_count"),
-            func.coalesce(func.sum(col(Thread.reaction_count)), 0).label("reaction_count"),
+            func.coalesce(func.sum(col(Thread.reaction_count)), 0).label(
+                "reaction_count"
+            ),
             func.coalesce(func.sum(col(Thread.reply_count)), 0).label("reply_count"),
         ).where(
-            col(Thread.author_id) == author_id,
+            col(Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id)
+            == (str(author_id) if is_fluxer_mode() else author_id),
             col(Thread.show_flag).is_(True),
-            col(Thread.not_found_count) == 0,
+            col(Thread.deleted_at).is_(None),
         )
         if excluded_channel_ids:
             statement = statement.where(
@@ -116,9 +123,10 @@ class ThreadRepository:
         statement = (
             sqlalchemy_select(col(Thread.title), col(Thread.created_at))
             .where(
-                col(Thread.author_id) == author_id,
+                col(Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id)
+                == (str(author_id) if is_fluxer_mode() else author_id),
                 col(Thread.show_flag).is_(True),
-                col(Thread.not_found_count) == 0,
+                col(Thread.deleted_at).is_(None),
             )
             .order_by(col(Thread.created_at).desc(), col(Thread.id).asc())
             .limit(1)
@@ -145,9 +153,10 @@ class ThreadRepository:
                 col(Thread.created_at),
             )
             .where(
-                col(Thread.author_id) == author_id,
+                col(Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id)
+                == (str(author_id) if is_fluxer_mode() else author_id),
                 col(Thread.show_flag).is_(True),
-                col(Thread.not_found_count) == 0,
+                col(Thread.deleted_at).is_(None),
             )
             .order_by(
                 col(Thread.reaction_count).desc(),
@@ -180,10 +189,12 @@ class ThreadRepository:
         if not unique_thread_ids:
             return True
         statement = sqlalchemy_select(func.count(col(Thread.id))).where(
+            Thread.platform == "discord",
             col(Thread.thread_id).in_(unique_thread_ids),
-            col(Thread.author_id) == author_id,
+            col(Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id)
+            == (str(author_id) if is_fluxer_mode() else author_id),
             col(Thread.show_flag).is_(True),
-            col(Thread.not_found_count) == 0,
+            col(Thread.deleted_at).is_(None),
         )
         if excluded_channel_ids:
             statement = statement.where(
@@ -196,13 +207,24 @@ class ThreadRepository:
         self, thread_data: dict, tags: list[Tag]
     ) -> ThreadSyncMutationResult:
         """添加或更新帖子及标签并返回明确的变更结果。"""
+        if is_fluxer_mode():
+            thread_data = dict(thread_data)
+            source_author = thread_data.get("author_id")
+            thread_data["fluxer_author_id"] = (
+                await resolve_business_id(self.session, source_author)
+                if source_author
+                else None
+            )
         await self.session.execute(
             text("SELECT pg_advisory_xact_lock_shared(73902141)")
         )
         # 查找现有帖子
         statement = (
             select(Thread)
-            .where(Thread.thread_id == thread_data["thread_id"])
+            .where(
+                Thread.platform == "discord",
+                Thread.thread_id == thread_data["thread_id"],
+            )
             .with_for_update()
             .options(selectinload(Thread.tags))  # type: ignore
         )
@@ -243,7 +265,10 @@ class ThreadRepository:
         db_thread = (
             await self.session.execute(
                 select(Thread)
-                .where(Thread.thread_id == thread_data["thread_id"])
+                .where(
+                    Thread.platform == "discord",
+                    Thread.thread_id == thread_data["thread_id"],
+                )
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -280,84 +305,50 @@ class ThreadRepository:
         db_thread = (
             await self.session.execute(
                 select(Thread)
-                .where(Thread.thread_id == snapshot.thread_id)
+                .where(
+                    Thread.platform == "discord", Thread.thread_id == snapshot.thread_id
+                )
                 .with_for_update()
             )
         ).scalar_one_or_none()
         if db_thread is None:
             return False
-        for key, value in snapshot.model_dump(exclude={"thread_id"}).items():
+        snapshot_data = snapshot.model_dump(exclude={"thread_id"})
+        if is_fluxer_mode():
+            source_author = snapshot_data.get("author_id")
+            snapshot_data["fluxer_author_id"] = (
+                await resolve_business_id(self.session, source_author)
+                if source_author
+                else None
+            )
+        for key, value in snapshot_data.items():
             setattr(db_thread, key, value)
         await self.session.flush()
         return True
 
     async def delete_thread_index(self, thread_id: int):
-        """删除帖子记录"""
-        statement = select(Thread).where(Thread.thread_id == thread_id)  # type: ignore
-        result = await self.session.execute(statement)
-        db_thread = result.scalars().first()
-        if db_thread:
-            await TagBindingRepository(self.session).delete_targets(
-                "thread", [db_thread.id]
+        """行政隐藏单个 Discord 索引，保留作品及业务关系。"""
+        from core.thread_deletion_service import ThreadDeletionService
+
+        channel_id = (
+            await self.session.execute(
+                select(Thread.channel_id)
+                .where(Thread.platform == "discord", Thread.thread_id == thread_id)
+                .execution_options(all_platforms=True)
             )
-            await self.session.delete(db_thread)
-            await self.session.commit()
+        ).scalar_one_or_none()
+        if channel_id is not None:
+            await ThreadDeletionService(self.session).remove_channel_index(
+                channel_id, thread_id=thread_id
+            )
+        await self.session.commit()
 
     async def delete_channel_index(self, channel_id: int):
-        """删除指定 Discord 频道下的所有帖子索引及相关关联数据。"""
-        # 查找该频道下所有 Thread 的内部 ID 和 Discord ID
-        statement = select(Thread.id, Thread.thread_id).where(
-            Thread.channel_id == channel_id
-        )
-        result = await self.session.execute(statement)
-        rows = result.all()
+        """复用行政索引隐藏事务，禁止物理清理收藏等关系。"""
+        from core.thread_deletion_service import ThreadDeletionService
 
-        if not rows:
-            logger.info(f"频道 {channel_id} 没有需要删除的索引帖子。")
-            return
-
-        thread_ids = [row[0] for row in rows]  # 内部主键 ID
-        discord_ids = [row[1] for row in rows]  # Discord 帖子 ID
-
-        try:
-            await TagBindingRepository(self.session).delete_targets(
-                "thread", thread_ids
-            )
-
-            # 删除 ThreadFollow 记录（依赖 Discord thread_id）
-            delete_follows = delete(ThreadFollow).where(
-                cast(ColumnElement, ThreadFollow.thread_id).in_(discord_ids)
-            )
-            await self.session.execute(delete_follows)
-
-            # 删除 BooklistItem 记录（依赖 Discord thread_id）
-            delete_items = delete(BooklistItem).where(
-                cast(ColumnElement, BooklistItem.thread_id).in_(discord_ids)
-            )
-            await self.session.execute(delete_items)
-
-            # 删除 UserCollection 记录（target_type=THREAD，依赖 Discord thread_id）
-            delete_collections = delete(UserCollection).where(
-                col(UserCollection.target_type) == CollectionType.THREAD.value,
-                cast(ColumnElement, UserCollection.target_id).in_(discord_ids),
-            )
-            await self.session.execute(delete_collections)
-
-            # 删除 Thread 记录自身
-            delete_threads = delete(Thread).where(
-                cast(ColumnElement, Thread.id).in_(thread_ids)
-            )
-            await self.session.execute(delete_threads)
-
-            await self.session.commit()
-            logger.info(
-                f"已删除频道 {channel_id} 的所有索引，"
-                f"共 {len(thread_ids)} 个帖子及相关关联记录。"
-            )
-        except Exception:
-            await self.session.rollback()
-            logger.exception(f"删除频道 {channel_id} 的索引时发生数据库错误")
-            raise
+        await ThreadDeletionService(self.session).remove_channel_index(channel_id)
+        await self.session.commit()
 
     async def update_thread_activity(
         self, thread_id: int, last_active_at: datetime, reply_count: int
@@ -365,7 +356,7 @@ class ThreadRepository:
         """更新帖子的活跃时间和回复数"""
         stmt = (
             update(Thread)
-            .where(Thread.thread_id == thread_id)  # type: ignore
+            .where(Thread.platform == "discord", Thread.thread_id == thread_id)  # type: ignore
             .values(
                 last_active_at=last_active_at,
                 reply_count=reply_count,
@@ -380,7 +371,7 @@ class ThreadRepository:
         """更新帖子的最后活跃时间"""
         stmt = (
             update(Thread)
-            .where(Thread.thread_id == thread_id)  # type: ignore
+            .where(Thread.platform == "discord", Thread.thread_id == thread_id)  # type: ignore
             .values(last_active_at=last_active_at)
         )
         await self.session.execute(stmt)
@@ -392,7 +383,7 @@ class ThreadRepository:
         """更新帖子的反应数。如果更新成功（至少影响了一行），则返回 True，否则返回 False。"""
         stmt = (
             update(Thread)
-            .where(Thread.thread_id == thread_id)  # type: ignore
+            .where(Thread.platform == "discord", Thread.thread_id == thread_id)  # type: ignore
             .values(reaction_count=reaction_count)
         )
         result = await self.session.execute(stmt)
@@ -442,7 +433,10 @@ class ThreadRepository:
 
         stmt = (
             update(Thread)
-            .where(cast(ColumnElement, Thread.thread_id).in_(thread_ids_to_update))
+            .where(
+                Thread.platform == "discord",
+                cast(ColumnElement, Thread.thread_id).in_(thread_ids_to_update),
+            )
             .values(**values_to_update)
             .execution_options(synchronize_session=False)
         )
@@ -458,18 +452,19 @@ class ThreadRepository:
             return []
 
         stmt = select(Thread.thread_id).where(
-            cast(ColumnElement, Thread.thread_id).in_(thread_ids)
+            Thread.platform == "discord",
+            cast(ColumnElement, Thread.thread_id).in_(thread_ids),
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def increment_not_found_count(self, thread_id: int) -> bool:
-        """当找不到帖子时，将其 not_found_count 计数加一"""
+        """记录 Discord 拉取失败，不改变来源和作品可见性。"""
         stmt = (
             update(Thread)
-            .where(Thread.thread_id == thread_id)  # type: ignore
+            .where(Thread.platform == "discord", Thread.thread_id == thread_id)
             .values(not_found_count=Thread.not_found_count + 1)
-            .execution_options(synchronize_session=False)
+            .execution_options(synchronize_session=False, all_platforms=True)
         )
         result = await self.session.execute(stmt)
         await self.session.commit()
@@ -492,7 +487,7 @@ class ThreadRepository:
 
         stmt = (
             update(Thread)
-            .where(Thread.thread_id == thread_id)  # type: ignore
+            .where(Thread.platform == "discord", Thread.thread_id == thread_id)  # type: ignore
             .values(
                 latest_update_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 latest_update_link=latest_update_link,
@@ -510,7 +505,7 @@ class ThreadRepository:
         try:
             statement = (
                 update(Thread)
-                .where(Thread.thread_id.in_(thread_ids))  # type: ignore
+                .where(Thread.platform == "discord", Thread.thread_id.in_(thread_ids))  # type: ignore
                 .values(collection_count=Thread.collection_count + delta)
                 .execution_options(synchronize_session=False)
             )
@@ -523,13 +518,17 @@ class ThreadRepository:
 
     async def get_thread_guild_id(self, thread_id: int) -> Optional[int]:
         """获取帖子的所属服务器 ID"""
-        stmt = select(Thread.guild_id).where(Thread.thread_id == thread_id)
+        stmt = select(Thread.guild_id).where(
+            Thread.platform == "discord", Thread.thread_id == thread_id
+        )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
     async def get_thread_channel_id(self, thread_id: int) -> Optional[int]:
         """获取帖子所属的频道 ID（parent_id），用于 InactiveFollowBuffer 渠道校验。"""
-        stmt = select(Thread.channel_id).where(Thread.thread_id == thread_id)
+        stmt = select(Thread.channel_id).where(
+            Thread.platform == "discord", Thread.thread_id == thread_id
+        )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -537,7 +536,7 @@ class ThreadRepository:
         """获取帖子及其标签（预加载）。"""
         stmt = (
             select(Thread)
-            .where(Thread.thread_id == thread_id)
+            .where(Thread.platform == "discord", Thread.thread_id == thread_id)
             .options(selectinload(Thread.tags))  # type: ignore[arg-type]
         )
         result = await self.session.execute(stmt)
@@ -549,7 +548,7 @@ class ThreadRepository:
             return []
         stmt = (
             select(Thread)
-            .where(Thread.thread_id.in_(thread_ids))  # type: ignore[arg-type]
+            .where(Thread.platform == "discord", Thread.thread_id.in_(thread_ids))  # type: ignore[arg-type]
             .options(
                 selectinload(Thread.tags),  # type: ignore[arg-type]
                 joinedload(Thread.author),  # type: ignore[arg-type]
@@ -574,13 +573,13 @@ class ThreadRepository:
         # 使用 cast 将 SQLModel 字段转换为 ColumnElement，以便在聚合查询中使用
         channel_id_column = cast(ColumnElement, Thread.channel_id)
         id_column = cast(ColumnElement, Thread.id)
-        not_found_count_column = cast(ColumnElement, Thread.not_found_count)
+        deleted_at_column = cast(ColumnElement, Thread.deleted_at)
 
-        # 构建聚合查询：统计每个频道中 not_found_count 为 0 的有效帖子数
+        # 构建聚合查询：统计每个频道中未明确删除的有效帖子数
         statement = (
             select(channel_id_column, func.count(id_column))
             .where(channel_id_column.in_(channel_ids))
-            .where(not_found_count_column == 0)
+            .where(deleted_at_column.is_(None))
             .group_by(channel_id_column)
         )
         result = await self.session.execute(statement)
@@ -597,12 +596,12 @@ class ThreadRepository:
     ) -> int:
         """获取指定范围内的有效帖子去重总数"""
         thread_id_column = cast(ColumnElement, Thread.id)
-        not_found_count_column = cast(ColumnElement, Thread.not_found_count)
+        deleted_at_column = cast(ColumnElement, Thread.deleted_at)
         guild_id_column = cast(ColumnElement, Thread.guild_id)
         channel_id_column = cast(ColumnElement, Thread.channel_id)
 
         statement = select(func.count(thread_id_column.distinct())).where(
-            not_found_count_column == 0
+            deleted_at_column.is_(None)
         )
 
         if guild_id is not None:
@@ -624,7 +623,7 @@ class ThreadRepository:
     ) -> List[Thread]:
         """随机获取满足条件的帖子"""
         # 构建基础查询条件排除软删除帖子
-        stmt = select(Thread).where(Thread.not_found_count == 0)
+        stmt = select(Thread).where(Thread.deleted_at.is_(None))
 
         # 只搜索 show_flag == True 的帖子，避免显示被隐藏的帖子
         stmt = stmt.where(Thread.show_flag)
@@ -667,11 +666,16 @@ class ThreadRepository:
         return list(result.scalars().all())
 
     async def update_thread_visibility(self, thread_id: int, show_flag: bool) -> bool:
-        """更新帖子的搜索可见性状态"""
+        """更新 Discord 搜索可见性，不允许旧入口恢复权威删除来源。"""
         stmt = (
             update(Thread)
-            .where(Thread.thread_id == thread_id)  # type: ignore
+            .where(
+                Thread.platform == "discord",
+                Thread.thread_id == thread_id,
+                Thread.deletion_reason.is_distinct_from("source_deleted"),
+            )
             .values(show_flag=show_flag)
+            .execution_options(all_platforms=True)
         )
         result = await self.session.execute(stmt)
         await self.session.commit()
@@ -683,7 +687,7 @@ class ThreadRepository:
         """更新帖子的缩略图 URL 列表"""
         stmt = (
             update(Thread)
-            .where(Thread.thread_id == thread_id)  # type: ignore
+            .where(Thread.platform == "discord", Thread.thread_id == thread_id)  # type: ignore
             .values(thumbnail_urls=thumbnail_urls)
         )
         result = await self.session.execute(stmt)
@@ -692,7 +696,9 @@ class ThreadRepository:
 
     async def get_thread_visibility(self, thread_id: int) -> Optional[bool]:
         """获取帖子的可见性状态"""
-        stmt = select(Thread.show_flag).where(Thread.thread_id == thread_id)
+        stmt = select(Thread.show_flag).where(
+            Thread.platform == "discord", Thread.thread_id == thread_id
+        )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -703,8 +709,9 @@ class ThreadRepository:
     ) -> bool:
         """轻量校验帖子是否存在、可见且位于用户可访问的频道。"""
         filters = [
+            Thread.platform == "discord",
             Thread.thread_id == thread_id,
-            Thread.not_found_count == 0,
+            Thread.deleted_at.is_(None),
             Thread.show_flag,
         ]
         if exclude_channel_ids:
