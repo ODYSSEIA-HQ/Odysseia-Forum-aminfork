@@ -29,12 +29,14 @@ class AuthorFollow(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(
-        sa_column=Column(BigInteger, nullable=False),
+    user_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True),
         description="关注者 Discord ID",
     )
-    author_id: int = Field(
-        sa_column=Column(BigInteger, nullable=False),
+    author_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True),
         description="被关注作者 Discord ID",
     )
     followed_at: datetime = Field(
@@ -47,3 +49,17 @@ class AuthorFollow(SQLModel, table=True):
         nullable=False,
         description="是否仍在关注",
     )
+
+    fluxer_user_id: str | None = Field(
+        default=None,
+        index=True,
+        description="发起作者关注的用户 Fluxer ID",
+    )
+    """发起此作者关注关系的用户 Fluxer ID，与被关注作者的身份区分。"""
+
+    fluxer_author_id: str | None = Field(
+        default=None,
+        index=True,
+        description="被关注作者的 Fluxer 用户 ID",
+    )
+    """此关注关系中被关注作者的 Fluxer 用户 ID。"""

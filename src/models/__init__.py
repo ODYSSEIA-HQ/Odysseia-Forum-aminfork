@@ -1,3 +1,5 @@
+from models.user import User
+from models.discord_identity import DiscordIdentity
 from models.discord_tag_source import DiscordTagSource
 from models.discord_tag_sync_state import DiscordTagSyncState
 from models.author import Author
@@ -29,37 +31,42 @@ from models.tag_proposal import TagProposal
 from models.tag_proposal_block import TagProposalBlock
 from models.operation_log import OperationLog
 from models.tag_notification_task import TagNotificationTask
+from identity.metadata import apply_identity_constraints
 
 __all__ = [
-    "DiscordTagSource",
-    "DiscordTagSyncState",
-    "TagAlias",
-    "TagRelation",
-    "TagBinding",
-    "TagVote",
-    "TagProposal",
-    "TagProposalBlock",
-    "OperationLog",
-    "TagNotificationTask",
-    "ThreadTagLink",
-    "Tag",
-    "Thread",
-    "UserSearchPreferences",
-    "UserUpdatePreference",
-    "MutexTagGroup",
-    "MutexTagRule",
-    "BotConfig",
     "Author",
-    "ThreadFollow",
+    "AuthorFollow",
     "BannerApplication",
     "BannerCarousel",
     "BannerWaitlist",
-    "UserCollection",
     "Booklist",
     "BooklistItem",
     "BooklistPublish",
+    "BotConfig",
     "Channel",
-    "AuthorFollow",
+    "DiscordIdentity",
+    "DiscordTagSource",
+    "DiscordTagSyncState",
+    "MutexTagGroup",
+    "MutexTagRule",
     "Notification",
+    "OperationLog",
+    "Tag",
+    "TagAlias",
+    "TagBinding",
+    "TagNotificationTask",
+    "TagProposal",
+    "TagProposalBlock",
+    "TagRelation",
+    "TagVote",
+    "Thread",
+    "ThreadFollow",
+    "ThreadTagLink",
     "ThreadUpdate",
+    "User",
+    "UserCollection",
+    "UserSearchPreferences",
+    "UserUpdatePreference",
 ]
+
+apply_identity_constraints()

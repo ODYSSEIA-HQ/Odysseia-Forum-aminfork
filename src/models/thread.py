@@ -17,10 +17,73 @@ class Thread(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_thread_search_vector", "search_vector", postgresql_using="gin"),
+        Index("uq_thread_platform_external", "platform", "thread_id", unique=True),
+        Index(
+            "uq_work_main_thread",
+            "work_id",
+            unique=True,
+            postgresql_where=text("work_id IS NOT NULL AND role = 'main'"),
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     """数据库主键 ID"""
+
+    initializing: bool = False
+    """新子帖初始化策略未完成，原生guard保持锁定。"""
+
+    source_author_id: str | None = None
+    """原生首帖实际作者，不随统一业务归属合并改写。"""
+
+    platform_locked: bool = False
+    """平台原生锁快照，不被 Forum 自有锁覆盖。"""
+
+    source_version: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
+    """最后应用的平台状态版本，防止乱序事件覆盖。"""
+
+    reaction_emojis: dict[str, dict] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    """稳定表情键对应的原生展示资料。"""
+
+    reactions: dict[str, int] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    """逐表情平台快照，用于作品聚合。"""
+
+    body: str = ""
+    """Forum 创建的子帖正文。"""
+
+    deletion_reason: str | None = None
+    """普通隐藏与权威原生删除分别记录，后者不可恢复。"""
+
+    native_archived: bool = False
+    """原生归档基态，不包含Forum外部策略的有效归档。"""
+
+    deleted_at: datetime | None = None
+    """普通软删除时间。"""
+
+    lock_owner_ids: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON, nullable=False)
+    )
+    """各操作者独立持有的锁。"""
+
+    archive_owner_ids: list[str] = Field(
+        default_factory=list, sa_column=Column(JSON, nullable=False)
+    )
+    """归档来源集合，原有归档使用保留来源标识。"""
+
+    archived: bool = False
+    """是否归档。"""
+
+    platform: str = Field(default="discord", index=True)
+    """来源平台，外部编号仅在平台内唯一。"""
+
+    work_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True))
+    """所属作品逻辑编号。"""
+
+    role: str = Field(default="main")
+    """作品帖子角色 main 或 child。"""
 
     guild_id: int = Field(
         default=0,
@@ -36,7 +99,7 @@ class Thread(SQLModel, table=True):
     """帖子所在频道的 Discord ID"""
 
     thread_id: int = Field(
-        sa_column=Column(BigInteger, index=True, unique=True),
+        sa_column=Column(BigInteger, index=True),
         description="帖子的 Discord ID",
     )
     """帖子的 Discord ID"""
@@ -50,7 +113,8 @@ class Thread(SQLModel, table=True):
     )
     """原生标签变更修订号，用于识别同步导致的并发变更"""
 
-    author_id: int = Field(
+    author_id: int | None = Field(
+        default=None,
         sa_column=Column(BigInteger, index=True),
         description="帖子作者的 Discord ID",
     )
@@ -125,7 +189,7 @@ class Thread(SQLModel, table=True):
     tags: List["Tag"] = Relationship(
         sa_relationship_kwargs={
             "secondary": "tag_binding",
-            "primaryjoin": "and_(Thread.id == foreign(TagBinding.target_id), TagBinding.target_type == 'thread', TagBinding.ended_at.is_(None))",
+            "primaryjoin": "and_(or_(and_(Thread.id == foreign(TagBinding.target_id), TagBinding.target_type == 'thread'), Thread.work_id == foreign(TagBinding.work_id)), TagBinding.ended_at.is_(None))",
             "secondaryjoin": "and_(Tag.id == foreign(TagBinding.tag_id), Tag.deleted_at.is_(None))",
             "viewonly": True,
         },
@@ -141,6 +205,13 @@ class Thread(SQLModel, table=True):
         }
     )
     """帖子作者的关系映射"""
+
+    fluxer_author_id: str | None = Field(
+        default=None,
+        index=True,
+        description="帖子作者的 Fluxer 用户 ID",
+    )
+    """发布此帖子的作者 Fluxer 用户 ID，用于关联统一作者资料及按作者筛选帖子。"""
 
 
 # ── search_vector 自动维护 ────────────────────────────

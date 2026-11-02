@@ -18,6 +18,9 @@ class TagBinding(SQLModel, table=True):
     )
     """本轮挂标记录的内部主键；重新挂标会创建新的轮次 ID"""
 
+    work_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True))
+    """逻辑作品关联，旧帖子和新作品入口共用同一治理轮次。"""
+
     target_type: str = Field(
         index=True, description="绑定目标类型：thread 为帖子，booklist 为书单"
     )
@@ -49,8 +52,8 @@ class TagBinding(SQLModel, table=True):
     """同步绑定对应唯一来源，历史轮次保留来源引用"""
 
     actor_id: int | None = Field(
-        sa_column=Column(BigInteger, nullable=True),
         default=None,
+        sa_column=Column(BigInteger, nullable=True),
         description="执行挂标的 Discord 用户 ID；自动超时挂标时为 0",
     )
     """执行挂标的 Discord 用户 ID；自动超时挂标时为 0"""
@@ -100,7 +103,14 @@ class TagBinding(SQLModel, table=True):
         ),
         Index("ix_tag_binding_history", "target_type", "target_id", "id"),
         CheckConstraint(
-            "target_type IN ('thread', 'booklist') AND binding_source IN ('discord_sync', 'local') AND (binding_source <> 'discord_sync' OR target_type = 'thread') AND (binding_source <> 'discord_sync' OR discord_source_id IS NOT NULL) AND (binding_source <> 'local' OR discord_source_id IS NULL) AND upvotes >= 0 AND downvotes >= 0",
+            "target_type IN ('thread', 'booklist', 'work') AND binding_source IN ('discord_sync', 'local') AND (binding_source <> 'discord_sync' OR target_type = 'thread') AND (binding_source <> 'discord_sync' OR discord_source_id IS NOT NULL) AND (binding_source <> 'local' OR discord_source_id IS NULL) AND upvotes >= 0 AND downvotes >= 0",
             name="ck_tag_binding",
         ),
     )
+
+    fluxer_actor_id: str | None = Field(
+        default=None,
+        index=True,
+        description="执行本轮帖子或书单挂标的用户 Fluxer ID",
+    )
+    """为帖子或书单建立本轮标签绑定的操作者 Fluxer 用户 ID。"""

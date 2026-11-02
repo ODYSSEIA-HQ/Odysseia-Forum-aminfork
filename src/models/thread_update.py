@@ -46,6 +46,9 @@ class ThreadUpdate(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    work_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True))
+    """逻辑作品编号，历史正式更新与作品公告对应。"""
+
     thread_id: int = Field(
         sa_column=Column(BigInteger, nullable=False),
         description="作品 Discord Thread ID",
@@ -55,8 +58,9 @@ class ThreadUpdate(SQLModel, table=True):
         sa_column=Column(BigInteger, nullable=True),
         description="来源 Discord 消息 ID",
     )
-    publisher_id: int = Field(
-        sa_column=Column(BigInteger, nullable=False),
+    publisher_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True),
         description="发布者 Discord ID",
     )
     description: str = Field(
@@ -82,3 +86,10 @@ class ThreadUpdate(SQLModel, table=True):
         sa_column=Column(BigInteger, nullable=True),
         description="自动发布概览消息 ID",
     )
+
+    fluxer_publisher_id: str | None = Field(
+        default=None,
+        index=True,
+        description="此条作品更新发布者的 Fluxer 用户 ID",
+    )
+    """正式发布此条作品更新记录的用户 Fluxer ID，与作品帖子作者身份分别记录。"""

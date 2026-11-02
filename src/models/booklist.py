@@ -25,11 +25,17 @@ class Booklist(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     """主键ID"""
 
-    owner_id: int = Field(
+    owner_id: int | None = Field(
+        default=None,
         sa_column=Column(BigInteger, index=True),
         description="创建该书单的用户Discord ID",
     )
     """创建该书单的用户 Discord ID"""
+
+    merged_into_id: int | None = Field(
+        default=None, sa_column=Column(BigInteger, index=True)
+    )
+    """默认书单合并后的重定向目标，保留旧链接。"""
 
     title: str = Field(index=True, description="书单标题")
     """书单标题"""
@@ -127,6 +133,13 @@ class Booklist(SQLModel, table=True):
         description="预计算的 PostgreSQL 全文搜索向量（rjieba 分词 + to_tsvector('simple')）",
     )
     """全文搜索向量"""
+
+    fluxer_owner_id: str | None = Field(
+        default=None,
+        index=True,
+        description="书单所有者的 Fluxer 用户 ID",
+    )
+    """创建并拥有此书单的用户 Fluxer ID，用于确定书单归属。"""
 
 
 # ── search_vector 自动维护 ────────────────────────────

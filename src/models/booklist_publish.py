@@ -37,8 +37,9 @@ class BooklistPublish(SQLModel, table=True):
     )
     """Discord 讨论帖 ID"""
 
-    discord_user_id: int = Field(
-        sa_column=Column(BigInteger, nullable=False),
+    discord_user_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True),
         description="发布者 Discord 用户 ID",
     )
     """发布者 Discord 用户 ID"""
@@ -64,3 +65,10 @@ class BooklistPublish(SQLModel, table=True):
         description="最后更新时间",
     )
     """最后更新时间"""
+
+    fluxer_user_id: str | None = Field(
+        default=None,
+        index=True,
+        description="将书单发布到 Discord 的用户 Fluxer ID",
+    )
+    """将此书单发布到 Discord 讨论帖的用户 Fluxer ID，用于核对后台同步的发布者身份。"""

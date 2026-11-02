@@ -15,12 +15,13 @@ class BooklistItem(SQLModel, table=True):
     # 联合唯一索引：防止同一个帖子在同一个书单里出现两次
     __table_args__ = (
         UniqueConstraint("booklist_id", "thread_id", name="uq_booklist_thread"),
+        UniqueConstraint("booklist_id", "work_id", name="uq_booklist_work"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     """主键ID"""
 
-    owner_id: int = Field(
+    owner_id: int | None = Field(
         default=0,
         sa_column=Column(BigInteger, index=True),
         description="所属用户的ID",
@@ -32,8 +33,13 @@ class BooklistItem(SQLModel, table=True):
     )
     """所属书单ID"""
 
-    thread_id: int = Field(
-        sa_column=Column(BigInteger, index=True), description="关联的帖子ID"
+    work_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True))
+    """作品内部编号，旧帖子条目由迁移回填。"""
+
+    thread_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, index=True),
+        description="关联的帖子ID",
     )
     """关联的帖子ID"""
 
@@ -65,3 +71,10 @@ class BooklistItem(SQLModel, table=True):
         description="最后更新时间",
     )
     """最后更新时间"""
+
+    fluxer_owner_id: str | None = Field(
+        default=None,
+        index=True,
+        description="条目所属书单所有者的 Fluxer 用户 ID",
+    )
+    """条目所属书单所有者的 Fluxer 用户 ID，在条目中冗余保存书单归属。"""

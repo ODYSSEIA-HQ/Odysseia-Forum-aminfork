@@ -18,6 +18,9 @@ class TagProposal(SQLModel, table=True):
     )
     """标签添加申请的内部主键"""
 
+    work_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True))
+    """逻辑作品关联，旧帖子和新作品入口共用同一治理轮次。"""
+
     target_type: str = Field(
         index=True, description="申请目标类型：thread 为帖子，booklist 为书单"
     )
@@ -35,14 +38,16 @@ class TagProposal(SQLModel, table=True):
     )
     """申请添加的自定义标签内部 ID"""
 
-    applicant_id: int = Field(
-        sa_column=Column(BigInteger, nullable=False, index=True),
+    applicant_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True, index=True),
         description="申请人的 Discord 用户 ID",
     )
     """申请人的 Discord 用户 ID"""
 
-    owner_id: int = Field(
-        sa_column=Column(BigInteger, nullable=False),
+    owner_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True),
         description="提交申请时的帖子作者或书单所有者 Discord ID，用于发送审核通知",
     )
     """提交申请时的帖子作者或书单所有者 Discord ID，用于发送审核通知"""
@@ -88,3 +93,17 @@ class TagProposal(SQLModel, table=True):
             postgresql_where=text("status = 'pending'"),
         ),
     )
+
+    fluxer_applicant_id: str | None = Field(
+        default=None,
+        index=True,
+        description="提交标签添加申请的用户 Fluxer ID",
+    )
+    """为帖子或书单提交此标签添加申请的用户 Fluxer ID，与目标资源所有者区分。"""
+
+    fluxer_owner_id: str | None = Field(
+        default=None,
+        index=True,
+        description="提交申请时目标帖子作者或书单所有者的 Fluxer 用户 ID",
+    )
+    """提交此标签申请时，被申请挂标的帖子作者或书单所有者的 Fluxer 用户 ID，用于向其发送审核通知。"""

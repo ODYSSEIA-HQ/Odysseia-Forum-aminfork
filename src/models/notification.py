@@ -24,10 +24,11 @@ class Notification(SQLModel, table=True):
             "user_id",
             "event_type",
             "event_source_id",
+            "event_source_platform",
             name="uk_notification_user_event_source",
         ),
         CheckConstraint(
-            "event_type IN ('thread_update', 'author_new_thread', 'tag_review')",
+            "event_type IN ('thread_update', 'author_new_thread', 'tag_review', 'work_announcement')",
             name="ck_notification_event_type",
         ),
         Index(
@@ -55,13 +56,17 @@ class Notification(SQLModel, table=True):
         ),
     )
 
+    work_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True))
+    """统一作品编号，与 V1 通知共享已读事实。"""
+
     id: Optional[int] = Field(
         default=None, primary_key=True, description="通知记录的内部主键"
     )
     """通知记录的内部主键"""
 
-    user_id: int = Field(
-        sa_column=Column(BigInteger, nullable=False),
+    user_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True),
         description="通知接收者的 Discord 用户 ID",
     )
     """通知接收者的 Discord 用户 ID"""
@@ -71,6 +76,9 @@ class Notification(SQLModel, table=True):
         description="通知事件类型：thread_update 为作品更新，author_new_thread 为作者新作，tag_review 为标签审核",
     )
     """通知事件类型：thread_update 为作品更新，author_new_thread 为作者新作，tag_review 为标签审核"""
+
+    event_source_platform: str = Field(default="discord")
+    """跨平台事件源命名空间，防止外部雪花编号碰撞。"""
 
     event_source_id: int = Field(
         sa_column=Column(BigInteger, nullable=False),
@@ -111,3 +119,10 @@ class Notification(SQLModel, table=True):
         description="用户阅读时间（UTC）；为空表示未读",
     )
     """用户阅读时间（UTC）；为空表示未读"""
+
+    fluxer_user_id: str | None = Field(
+        default=None,
+        index=True,
+        description="此通知接收者的 Fluxer 用户 ID",
+    )
+    """接收此条动态通知的用户 Fluxer ID，用于按用户读取通知及管理已读状态。"""

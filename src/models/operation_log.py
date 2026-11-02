@@ -64,3 +64,10 @@ class OperationLog(SQLModel, table=True):
         default_factory=utc_now, description="操作记录创建时间（UTC）"
     )
     """操作记录创建时间（UTC）"""
+
+    fluxer_actor_id: str | None = Field(
+        default=None,
+        index=True,
+        description="执行此管理或治理操作的用户 Fluxer ID",
+    )
+    """此条操作日志记录的操作者 Fluxer 用户 ID，用于标识管理或标签治理操作的执行者。"""

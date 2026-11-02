@@ -15,7 +15,9 @@ class UserSearchPreferences(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     """主键ID"""
 
-    user_id: int = Field(sa_column=Column(BigInteger, index=True, nullable=False))
+    user_id: int | None = Field(
+        default=None, sa_column=Column(BigInteger, index=True, nullable=True)
+    )
     """用户ID"""
 
     guild_id: int = Field(
@@ -86,3 +88,20 @@ class UserSearchPreferences(SQLModel, table=True):
 
     custom_base_sort: str = Field(default="comprehensive", nullable=False)
     """自定义排序的基础算法"""
+
+    fluxer_user_id: str | None = Field(
+        default=None,
+        index=True,
+        description="此搜索偏好所属用户的 Fluxer ID",
+    )
+    """拥有此组论坛搜索偏好的用户 Fluxer ID。"""
+
+    fluxer_include_authors: list[str] | None = Field(
+        default=None, sa_column=Column(JSON), description="搜索时只看其帖子的作者 Fluxer ID 列表"
+    )
+    """搜索偏好中指定只看其帖子的作者 Fluxer 用户 ID 列表，与排除作者列表区分。"""
+
+    fluxer_exclude_authors: list[str] | None = Field(
+        default=None, sa_column=Column(JSON), description="搜索时排除其帖子的作者 Fluxer ID 列表"
+    )
+    """搜索偏好中指定屏蔽其帖子的作者 Fluxer 用户 ID 列表，与只看作者列表区分。"""

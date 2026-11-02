@@ -26,8 +26,14 @@ class Tag(SQLModel, table=True):
             unique=True,
             postgresql_where=text("source = 'discord' AND deleted_at IS NULL"),
         ),
+        Index(
+            "uq_live_fluxer_tag_name",
+            "name",
+            unique=True,
+            postgresql_where=text("source = 'fluxer' AND deleted_at IS NULL"),
+        ),
         CheckConstraint(
-            "source IN ('custom', 'discord') AND (category BETWEEN 1 AND 7 OR category IS NULL) AND (source <> 'custom' OR category IS NOT NULL OR originated_from_discord)",
+            "source IN ('custom', 'discord', 'fluxer') AND (category BETWEEN 1 AND 7 OR category IS NULL) AND (source <> 'custom' OR category IS NOT NULL OR originated_from_discord)",
             name="ck_tag_source_category",
         ),
     )

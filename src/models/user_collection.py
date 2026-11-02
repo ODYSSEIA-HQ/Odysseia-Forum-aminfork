@@ -21,8 +21,10 @@ class UserCollection(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    user_id: int = Field(
-        sa_column=Column(BigInteger, index=True), description="收藏用户的 Discord ID"
+    user_id: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, index=True),
+        description="收藏用户的 Discord ID",
     )
 
     target_type: int = Field(
@@ -42,3 +44,10 @@ class UserCollection(SQLModel, table=True):
         description="收藏时间 (UTC)",
     )
     note: Optional[str] = Field(default=None, description="用户为收藏添加的备注")
+
+    fluxer_user_id: str | None = Field(
+        default=None,
+        index=True,
+        description="创建此收藏记录的用户 Fluxer ID",
+    )
+    """收藏此目标内容的用户 Fluxer ID，用于确定收藏归属及读取个人收藏。"""

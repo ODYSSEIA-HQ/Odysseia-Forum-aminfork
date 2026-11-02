@@ -11,6 +11,9 @@ class TagProposalBlock(SQLModel, table=True):
 
     __tablename__ = "tag_proposal_block"
 
+    work_id: int | None = Field(default=None, sa_column=Column(BigInteger, index=True))
+    """逻辑作品关联，旧帖子和新作品入口共用同一治理轮次。"""
+
     target_type: str = Field(
         primary_key=True, description="被限制的目标类型：thread 为帖子，booklist 为书单"
     )
