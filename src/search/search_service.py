@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import time
+from dataclasses import replace
+from identity.runtime import uses_canonical_storage
+from identity.business_identity import resolve_business_id, resolve_business_ids
 from typing import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +20,7 @@ from dto.search import (
     SimilarThreadSourceDTO,
     SimilarThreadSourceTagDTO,
 )
-from models import Author, Tag, Thread, TagBinding, BooklistItem
+from models import Author, User, Tag, Thread, TagBinding, BooklistItem
 from search.qo.cleaned_thread_search import CleanedThreadSearchQuery
 from search.qo.thread_search import ThreadSearchQuery
 from shared.channel_mapping_utils import ChannelMappingUtils
@@ -124,6 +127,7 @@ class SearchService:
         total_display_count: int,
         exploration_factor: float,
         strength_weight: float,
+        model=Thread,
     ):
         """
         应用 UCB1 算法对帖子进行排序。
@@ -135,9 +139,9 @@ class SearchService:
 
         # reaction_count as x
         # display_count as n
-        x = cast(Thread.reaction_count, Float)
+        x = cast(model.reaction_count, Float)
         n = case(
-            (Thread.display_count > 0, cast(Thread.display_count, Float)),
+            (model.display_count > 0, cast(model.display_count, Float)),
             else_=1.0,  # 避免除零，并给新帖子最大探索加成
         )
 
@@ -149,7 +153,7 @@ class SearchService:
 
         return statement, final_score
 
-    def _apply_reddit_hot_ranking(self, statement, time_decay: float):
+    def _apply_reddit_hot_ranking(self, statement, time_decay: float, model=Thread):
         """
         应用 Reddit Hot 算法对帖子排序。
         Score = log10(max(1, reaction_count)) + (created_at_unix / time_decay)
@@ -161,7 +165,7 @@ class SearchService:
         reaction_score = (
             func.log(
                 case(
-                    (Thread.reaction_count > 1, cast(Thread.reaction_count, Float)),
+                    (model.reaction_count > 1, cast(model.reaction_count, Float)),
                     else_=1.0,
                 )
             )
@@ -169,7 +173,7 @@ class SearchService:
         )
 
         # created_at 是 UTC datetime，用 extract(epoch) 转 Unix 秒（跨数据库兼容）
-        time_score = func.extract("epoch", Thread.created_at).cast(Float) / float(
+        time_score = func.extract("epoch", model.created_at).cast(Float) / float(
             time_decay
         )
 
@@ -198,6 +202,26 @@ class SearchService:
             if debug_timing:
                 t0 = time.perf_counter()
 
+            # 将机器人来源的 Discord ID 批量映射到统一身份。
+            if uses_canonical_storage():
+                query = replace(
+                    query,
+                    include_authors=await resolve_business_ids(
+                        self.session, query.include_authors
+                    )
+                    if query.include_authors
+                    else query.include_authors,
+                    exclude_authors=await resolve_business_ids(
+                        self.session, query.exclude_authors
+                    )
+                    if query.exclude_authors
+                    else query.exclude_authors,
+                    user_id_for_collection_search=await resolve_business_id(
+                        self.session, query.user_id_for_collection_search
+                    )
+                    if query.user_id_for_collection_search is not None
+                    else None,
+                )
             # 清洗查询数据
             CleanedQo = self._clean_query(query, exclude_thread_ids)
 
@@ -207,8 +231,8 @@ class SearchService:
             # --- 步骤 1: 构建过滤器列表 ---
             filters = []
 
-            # 只搜索 not_found_count == 0 的帖子，避免显示被软删除的帖子
-            filters.append(Thread.not_found_count == 0)
+            # 只搜索未明确软删除的帖子，临时抓取失败不影响可见性
+            filters.append(Thread.deleted_at.is_(None))
 
             # 只搜索 show_flag == True 的帖子，避免显示被隐藏的帖子
             filters.append(Thread.show_flag)
@@ -234,14 +258,23 @@ class SearchService:
                 # 查找匹配的作者 ID，以便后续过滤
                 search_pattern = f"%{CleanedQo.normalized_author_name}%"
 
-                author_subquery = select(Author.id).where(
-                    (
-                        func.lower(Author.name)
-                        == CleanedQo.normalized_author_name.lower()
+                if uses_canonical_storage():
+                    author_subquery = select(User.id).where(
+                        (
+                            func.lower(User.username)
+                            == CleanedQo.normalized_author_name.lower()
+                        )
+                        | (User.display_name.like(search_pattern))
                     )
-                    | (Author.global_name.like(search_pattern))  # type: ignore
-                    | (Author.display_name.like(search_pattern))  # type: ignore
-                )  # type: ignore
+                else:
+                    author_subquery = select(Author.id).where(
+                        (
+                            func.lower(Author.name)
+                            == CleanedQo.normalized_author_name.lower()
+                        )
+                        | (Author.global_name.like(search_pattern))
+                        | (Author.display_name.like(search_pattern))
+                    )
 
                 author_result = await self.session.execute(author_subquery)
                 matched_author_ids = set(author_result.scalars().all())
@@ -255,13 +288,21 @@ class SearchService:
                     CleanedQo.final_include_author_ids = matched_author_ids
 
             # 应用作者过滤器
-            if CleanedQo.final_include_author_ids:
+            if CleanedQo.final_include_author_ids or CleanedQo.normalized_author_name:
                 filters.append(
-                    Thread.author_id.in_(list(CleanedQo.final_include_author_ids))  # type: ignore
+                    (
+                        Thread.fluxer_author_id
+                        if uses_canonical_storage()
+                        else Thread.author_id
+                    ).in_(list(CleanedQo.final_include_author_ids))  # type: ignore
                 )
             if query.exclude_authors:
                 filters.append(
-                    Thread.author_id.notin_(query.exclude_authors)  # type: ignore
+                    (
+                        Thread.fluxer_author_id
+                        if uses_canonical_storage()
+                        else Thread.author_id
+                    ).notin_(query.exclude_authors)  # type: ignore
                 )
 
             # 反应数范围过滤
@@ -350,7 +391,14 @@ class SearchService:
                 # 查询用户的帖子收藏记录，获取该用户收藏过的所有 thread_id
                 collected_stmt = (
                     select(BooklistItem.thread_id)
-                    .where(BooklistItem.owner_id == query.user_id_for_collection_search)
+                    .where(
+                        (
+                            BooklistItem.fluxer_owner_id
+                            if uses_canonical_storage()
+                            else BooklistItem.owner_id
+                        )
+                        == query.user_id_for_collection_search
+                    )
                     .distinct()
                 )
 
@@ -451,7 +499,12 @@ class SearchService:
                     BooklistItem,
                     and_(
                         Thread.thread_id == BooklistItem.thread_id,
-                        BooklistItem.owner_id == query.user_id_for_collection_search,
+                        (
+                            BooklistItem.fluxer_owner_id
+                            if uses_canonical_storage()
+                            else BooklistItem.owner_id
+                        )
+                        == query.user_id_for_collection_search,
                     ),
                 ).group_by(Thread.id)  # type: ignore
 
@@ -506,10 +559,18 @@ class SearchService:
         self, author_id: int, *, include_abyss: bool = True
     ) -> Sequence[Tag]:
         """获取指定作者发布过的所有帖子的唯一标签列表"""
+        author_id = await resolve_business_id(self.session, author_id)
         statement = (
             select(Tag)
             .join(Thread, Tag.threads)  # type: ignore
-            .where(Thread.author_id == author_id)  # type: ignore
+            .where(
+                (
+                    Thread.fluxer_author_id
+                    if uses_canonical_storage()
+                    else Thread.author_id
+                )
+                == author_id
+            )  # type: ignore
             .distinct()
         )
         if not include_abyss:
@@ -527,7 +588,7 @@ class SearchService:
             select(Thread)
             .where(
                 Thread.thread_id == discord_thread_id,  # type: ignore[arg-type]
-                Thread.not_found_count == 0,
+                Thread.deleted_at.is_(None),
                 Thread.show_flag,
             )
             .options(
@@ -546,6 +607,7 @@ class SearchService:
         self, user_id: int, *, include_abyss: bool = True
     ) -> Sequence[Tag]:
         """获取指定用户收藏的所有帖子的唯一标签列表"""
+        user_id = await resolve_business_id(self.session, user_id)
 
         statement = (
             select(Tag)
@@ -556,7 +618,12 @@ class SearchService:
                 Thread.thread_id == BooklistItem.thread_id,  # type: ignore
             )
             .where(
-                BooklistItem.owner_id == user_id,
+                (
+                    BooklistItem.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else BooklistItem.owner_id
+                )
+                == user_id,
                 TagBinding.target_type == "thread",
                 TagBinding.ended_at.is_(None),
                 Tag.deleted_at.is_(None),
@@ -775,7 +842,7 @@ class SearchService:
         """用单条投影查询读取可访问源帖及其标签。"""
         filters = [
             Thread.thread_id == source_thread_id,
-            Thread.not_found_count == 0,
+            Thread.deleted_at.is_(None),
             Thread.show_flag,
         ]
         if exclude_channel_ids:
@@ -832,7 +899,7 @@ class SearchService:
         }
         filters = [
             Thread.thread_id.in_(candidate_ids),  # type: ignore[arg-type]
-            Thread.not_found_count == 0,
+            Thread.deleted_at.is_(None),
             Thread.show_flag,
         ]
         if exclude_channel_ids:
@@ -903,7 +970,7 @@ class SearchService:
         # 限定候选帖子及其可见性。
         filters = [
             Thread.thread_id.in_(thread_ids),  # type: ignore[arg-type]
-            Thread.not_found_count == 0,
+            Thread.deleted_at.is_(None),
             Thread.show_flag,
         ]
         if channel_ids is not None:
@@ -933,7 +1000,11 @@ class SearchService:
         filters = []
         if prefs.exclude_authors:
             filters.append(
-                Thread.author_id.notin_(prefs.exclude_authors)  # type: ignore[arg-type]
+                (
+                    Thread.fluxer_author_id
+                    if uses_canonical_storage()
+                    else Thread.author_id
+                ).notin_(prefs.exclude_authors)  # type: ignore[arg-type]
             )
 
         if prefs.exclude_tags:
@@ -968,7 +1039,7 @@ class SearchService:
         time_decay: float,
     ) -> list[int]:
         """查询一个标签匹配层级的候选 Discord 帖子 ID。"""
-        filters = [Thread.not_found_count == 0, Thread.show_flag]
+        filters = [Thread.deleted_at.is_(None), Thread.show_flag]
         if exclude_thread_ids:
             filters.append(
                 Thread.thread_id.notin_(exclude_thread_ids)  # type: ignore[arg-type]

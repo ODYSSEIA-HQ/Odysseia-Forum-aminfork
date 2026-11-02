@@ -24,6 +24,7 @@ class BooklistPublishRepository:
         guild_id: int,
         thread_id: int,
         discord_user_id: int,
+        fluxer_user_id: str | None = None,
     ) -> BooklistPublish:
         """按书单原子创建或更新唯一发布记录。"""
         # 事务锁负责串行化“查询后更新/替换”，唯一约束负责兜底数据不变量。
@@ -36,6 +37,7 @@ class BooklistPublishRepository:
                 guild_id=guild_id,
                 thread_id=thread_id,
                 discord_user_id=discord_user_id,
+                fluxer_user_id=fluxer_user_id,
             )
             self.session.add(record)
         else:
@@ -51,6 +53,7 @@ class BooklistPublishRepository:
                     guild_id=guild_id,
                     thread_id=thread_id,
                     discord_user_id=discord_user_id,
+                    fluxer_user_id=fluxer_user_id,
                 )
                 self.session.add(record)
                 logger.info(
@@ -60,6 +63,8 @@ class BooklistPublishRepository:
                 )
             else:
                 record.discord_user_id = discord_user_id
+                if fluxer_user_id is not None:
+                    record.fluxer_user_id = fluxer_user_id
                 now = utc_now()
                 # updated_at 同时作为同目标连续发布的本地请求版本。
                 if now <= record.updated_at:

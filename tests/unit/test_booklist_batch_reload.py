@@ -42,6 +42,7 @@ async def batch_repository():
         Column("id", Integer, primary_key=True),
         Column("owner_id", Integer),
         Column("item_count", Integer),
+        Column("merged_into_id", Integer),
     )
     mapper_registry.map_imperatively(booklist_model, booklist_table)
     source_path = root / "src/core/booklist_repository.py"
@@ -101,9 +102,11 @@ async def test_batch_reload_query_count_and_fields(batch_repository, size):
     """验证回读次数按批次增长，提交后全部字段、请求顺序和计数保持正确。"""
     repository, engine, _ = batch_repository
     statements = []
-    listener = lambda connection, cursor, statement, parameters, context, many: (
+
+    def listener(connection, cursor, statement, parameters, context, many):
+        """记录本测试连接执行的语句数量。"""
         statements.append(statement)
-    )
+
     event.listen(engine.sync_engine, "before_cursor_execute", listener)
     participated_at = datetime(2026, 10, 24, 12, 0)  # noqa: DTZ001 — 模型使用无时区 UTC。
     thread_ids = list(reversed(range(10000, 10000 + size)))

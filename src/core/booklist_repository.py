@@ -1,8 +1,11 @@
+from identity.business_identity import discord_id_for_business_id
+from identity.business_identity import resolve_business_id, resolve_business_ids
 from core.tag_binding_repository import TagBindingRepository
+from identity.runtime import uses_canonical_storage
 import logging
 from typing import List, Optional, Set, Tuple
 
-from sqlalchemy import update
+from sqlalchemy import update, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import and_, asc, delete, desc, func, select
@@ -28,15 +31,30 @@ class BooklistRepository:
 
     async def get_or_create_default_booklist(self, owner_id: int) -> Booklist:
         """获取用户的默认书单，如果不存在则自动创建"""
+        owner_id = await resolve_business_id(self.session, owner_id)
+        legacy_discord_id = await discord_id_for_business_id(self.session, owner_id)
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
+            {"key": "default-booklist:" + str(owner_id)},
+        )
         statement = select(Booklist).where(
-            and_(Booklist.owner_id == owner_id, Booklist.is_default)
+            and_(
+                (
+                    Booklist.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else Booklist.owner_id
+                )
+                == owner_id,
+                Booklist.is_default,
+            )
         )
         result = await self.session.execute(statement)
         booklist = result.scalar_one_or_none()
 
         if not booklist:
             booklist = Booklist(
-                owner_id=owner_id,
+                owner_id=legacy_discord_id,
+                fluxer_owner_id=str(owner_id) if uses_canonical_storage() else None,
                 title="默认收藏",
                 description="默认收藏夹",
                 is_public=False,  # 默认书单设定为私有
@@ -71,8 +89,11 @@ class BooklistRepository:
         """
         创建新书单
         """
+        owner_id = await resolve_business_id(self.session, owner_id)
+        legacy_discord_id = await discord_id_for_business_id(self.session, owner_id)
         booklist = Booklist(
-            owner_id=owner_id,
+            owner_id=legacy_discord_id,
+            fluxer_owner_id=str(owner_id) if uses_canonical_storage() else None,
             title=title,
             description=description,
             cover_image_url=cover_image_url,
@@ -101,16 +122,45 @@ class BooklistRepository:
         """
         根据ID获取书单
         """
-        statement = select(Booklist).where(Booklist.id == booklist_id)
+        statement = (
+            select(Booklist)
+            .where(Booklist.id == booklist_id)
+            .execution_options(populate_existing=True)
+        )
         result = await self.session.execute(statement)
-        return result.scalar_one_or_none()
+        row = result.scalar_one_or_none()
+        seen = set()
+        while row is not None and row.merged_into_id is not None:
+            if row.id in seen:
+                raise ValueError("书单重定向出现循环")
+            seen.add(row.id)
+            row = await self.session.get(Booklist, row.merged_into_id)
+        return row
+
+    async def resolve_booklist_ids(self, ids):
+        """批量沿默认书单合并链解析旧ID，保留来源对应关系。"""
+        if not ids:
+            return {}
+        rows = await self.session.execute(
+            text("""WITH RECURSIVE chain(original,id,next,path) AS (
+          SELECT id,id,merged_into_id,ARRAY[id] FROM booklist WHERE id=ANY(CAST(:ids AS INTEGER[]))
+          UNION ALL SELECT c.original,b.id,b.merged_into_id,c.path||b.id FROM chain c JOIN booklist b ON b.id=c.next
+          WHERE NOT b.id=ANY(c.path) AND cardinality(c.path)<64)
+          SELECT original,id FROM chain WHERE next IS NULL"""),
+            {"ids": list(set(ids))},
+        )
+        return dict(rows.all())
 
     async def get_open_graph_booklist(
         self, booklist_id: int
     ) -> BooklistShareQueryDTO | None:
         """查询公开书单分享所需标量并在 Session 内转换为 DTO。"""
         statement = select(
-            Booklist.owner_id,
+            (
+                Booklist.fluxer_owner_id
+                if uses_canonical_storage()
+                else Booklist.owner_id
+            ).label("owner_id"),
             Booklist.title,
             Booklist.description,
             Booklist.cover_image_url,
@@ -125,7 +175,7 @@ class BooklistRepository:
         if row is None:
             return None
         return BooklistShareQueryDTO(
-            owner_id=int(row.owner_id),
+            owner_id=(row.owner_id if uses_canonical_storage() else int(row.owner_id)),
             title=row.title,
             description=row.description,
             cover_image_url=row.cover_image_url,
@@ -292,6 +342,14 @@ class BooklistRepository:
         """
         分页搜索书单（支持 FTS 全文搜索）
         """
+        if owner_id is not None:
+            owner_id = await resolve_business_id(self.session, owner_id)
+        if owner_ids is not None:
+            owner_ids = await resolve_business_ids(self.session, owner_ids)
+        if collected_by_user_id is not None:
+            collected_by_user_id = await resolve_business_id(
+                self.session, collected_by_user_id
+            )
         await require_current_tag_ids(
             self.session, [*(include_tag_ids or []), *(exclude_tag_ids or [])]
         )
@@ -318,9 +376,22 @@ class BooklistRepository:
         )
 
         if owner_id is not None:
-            query = query.where(Booklist.owner_id == owner_id)
+            query = query.where(
+                (
+                    Booklist.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else Booklist.owner_id
+                )
+                == owner_id
+            )
         if owner_ids is not None:
-            query = query.where(Booklist.owner_id.in_(owner_ids))  # type: ignore
+            query = query.where(
+                (
+                    Booklist.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else Booklist.owner_id
+                ).in_(owner_ids)
+            )  # type: ignore
         if is_public is not None:
             query = query.where(Booklist.is_public == is_public)
         if is_tournament is not None:
@@ -342,7 +413,12 @@ class BooklistRepository:
                 UserCollection,
                 and_(
                     Booklist.id == UserCollection.target_id,
-                    UserCollection.user_id == collected_by_user_id,
+                    (
+                        UserCollection.fluxer_user_id
+                        if uses_canonical_storage()
+                        else UserCollection.user_id
+                    )
+                    == collected_by_user_id,
                     UserCollection.target_type == CollectionType.BOOKLIST.value,
                 ),
             )
@@ -434,6 +510,9 @@ class BooklistRepository:
                     booklist_id=booklist_id,
                     thread_id=item_data.thread_id,  # type: ignore
                     owner_id=owner_id,
+                    fluxer_owner_id=getattr(booklist, "fluxer_owner_id", None)
+                    if booklist
+                    else None,
                     comment=item_data.comment,
                     display_order=display_order,
                     tournament_participated_at=getattr(
@@ -464,7 +543,9 @@ class BooklistRepository:
                     .execution_options(populate_existing=True)
                 )
                 result = await self.session.execute(statement)
-                reloaded_items.update({item.id: item for item in result.scalars().all()})
+                reloaded_items.update(
+                    {item.id: item for item in result.scalars().all()}
+                )
             # logger.info(f"{len(new_booklist_items)} 个帖子已添加到书单 {booklist_id}")
             return [reloaded_items[item_id] for item_id in new_item_ids]
         except Exception as e:
@@ -516,6 +597,8 @@ class BooklistRepository:
         跳过已存在的项（on_conflict_do_nothing 保证幂等），
         返回实际新增了帖子的书单 ID 列表。
         """
+        owner_id = await resolve_business_id(self.session, owner_id)
+        legacy_discord_id = await discord_id_for_business_id(self.session, owner_id)
         if not booklist_ids:
             return []
 
@@ -536,7 +619,8 @@ class BooklistRepository:
             {
                 "booklist_id": bid,
                 "thread_id": thread_id,
-                "owner_id": owner_id,
+                "owner_id": legacy_discord_id,
+                "fluxer_owner_id": str(owner_id) if uses_canonical_storage() else None,
                 "display_order": max_orders.get(bid, 0) + 1,
                 "comment": comment,
             }
@@ -632,12 +716,18 @@ class BooklistRepository:
         """
         查询指定的一批帖子中，有哪些已经被该用户加入过任何书单。
         """
+        owner_id = await resolve_business_id(self.session, owner_id)
         if not thread_ids:
             return set()
 
         statement = select(BooklistItem.thread_id).where(
             and_(
-                BooklistItem.owner_id == owner_id,
+                (
+                    BooklistItem.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else BooklistItem.owner_id
+                )
+                == owner_id,
                 BooklistItem.thread_id.in_(thread_ids),  # type: ignore
             )
         )

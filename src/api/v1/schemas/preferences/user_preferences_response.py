@@ -10,7 +10,7 @@ class UserPreferencesResponse(BaseModel):
     包含用户在论坛搜索中的所有个性化设置，用于定制化搜索体验
     """
 
-    user_id: int = Field(description="Discord 用户 ID")
+    user_id: int | str = Field(description="当前身份模式下的用户 ID")
     """用户ID"""
 
     # 频道选择
@@ -20,12 +20,12 @@ class UserPreferencesResponse(BaseModel):
     """偏好的频道ID列表"""
 
     # 作者偏好
-    include_authors: Optional[List[int]] = Field(
+    include_authors: Optional[List[int | str]] = Field(
         default=None, description="只看这些作者的帖子，作者ID列表"
     )
     """包含的作者ID列表"""
 
-    exclude_authors: Optional[List[int]] = Field(
+    exclude_authors: Optional[List[int | str]] = Field(
         default=None, description="屏蔽这些作者的帖子，作者ID列表"
     )
     """排除的作者ID列表"""

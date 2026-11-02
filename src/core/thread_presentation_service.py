@@ -1,4 +1,6 @@
 from sqlalchemy import select
+from identity.runtime import is_fluxer_mode
+from identity.identity_repository import IdentityRepository
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.thread_update_service import ThreadUpdateService
@@ -22,9 +24,21 @@ class ThreadPresentationService:
     ) -> ThreadPresentationContext:
         """加载一批作品的展示上下文且不产生逐帖查询。"""
         pairs = [
-            (int(getattr(thread, "thread_id")), int(getattr(thread, "author_id")))
+            (
+                int(getattr(thread, "thread_id")),
+                getattr(thread, "fluxer_author_id", None)
+                if is_fluxer_mode()
+                else int(getattr(thread, "author_id")),
+            )
             for thread in threads
         ]
+        profiles = (
+            await IdentityRepository(self.session).profiles(
+                {author_id for _, author_id in pairs if author_id is not None}
+            )
+            if is_fluxer_mode() and pairs
+            else {}
+        )
         viewer_flags = await ViewerFlagService(self.session).get_flags(user_id, pairs)
         update_ids = {
             int(update_id)
@@ -55,6 +69,7 @@ class ThreadPresentationService:
                 native_tag_ids.setdefault(target_id, set()).add(tag_id)
         return ThreadPresentationContext(
             native_tag_ids=native_tag_ids,
+            author_profiles=profiles,
             viewer_flags=viewer_flags,
             latest_updates=latest_updates,
             custom_tags=await load_custom_tags(

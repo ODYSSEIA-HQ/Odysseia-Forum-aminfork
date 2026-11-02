@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from models import UserUpdatePreference
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id, discord_id_for_business_id
 
 
 class UserUpdatePreferenceRepository:
@@ -18,9 +20,15 @@ class UserUpdatePreferenceRepository:
         self, user_id: int, thread_id: int
     ) -> Optional[UserUpdatePreference]:
         """获取用户在指定帖子上的更新检测偏好。"""
+        user_id = await resolve_business_id(self.session, user_id)
         # 查询用户在指定帖子上的偏好记录。
         stmt = select(UserUpdatePreference).where(
-            UserUpdatePreference.user_id == user_id,
+            (
+                UserUpdatePreference.fluxer_user_id
+                if is_fluxer_mode()
+                else UserUpdatePreference.user_id
+            )
+            == user_id,
             UserUpdatePreference.thread_id == thread_id,
         )
         result = await self.session.execute(stmt)
@@ -28,6 +36,7 @@ class UserUpdatePreferenceRepository:
 
     async def set_auto_sync(self, user_id: int, thread_id: int, enabled: bool) -> None:
         """设置用户在指定帖子上的自动同步偏好。"""
+        user_id = await resolve_business_id(self.session, user_id)
         # 创建或更新自动同步偏好。
         preference = await self.get_preference(user_id, thread_id)
         if preference:
@@ -36,13 +45,17 @@ class UserUpdatePreferenceRepository:
                 preference.no_remind = False
         else:
             preference = UserUpdatePreference(
-                user_id=user_id, thread_id=thread_id, auto_sync=enabled
+                user_id=await discord_id_for_business_id(self.session, user_id),
+                fluxer_user_id=str(user_id) if is_fluxer_mode() else None,
+                thread_id=thread_id,
+                auto_sync=enabled,
             )
             self.session.add(preference)
         await self.session.commit()
 
     async def set_no_remind(self, user_id: int, thread_id: int, enabled: bool) -> None:
         """设置用户在指定帖子上是否不再提醒。"""
+        user_id = await resolve_business_id(self.session, user_id)
         # 创建或更新不再提醒偏好。
         preference = await self.get_preference(user_id, thread_id)
         if preference:
@@ -51,16 +64,25 @@ class UserUpdatePreferenceRepository:
                 preference.auto_sync = False
         else:
             preference = UserUpdatePreference(
-                user_id=user_id, thread_id=thread_id, no_remind=enabled
+                user_id=await discord_id_for_business_id(self.session, user_id),
+                fluxer_user_id=str(user_id) if is_fluxer_mode() else None,
+                thread_id=thread_id,
+                no_remind=enabled,
             )
             self.session.add(preference)
         await self.session.commit()
 
     async def get_user_preferences(self, user_id: int) -> list[UserUpdatePreference]:
         """获取用户的全部更新检测偏好。"""
+        user_id = await resolve_business_id(self.session, user_id)
         # 查询用户在所有帖子上的偏好记录。
         stmt = select(UserUpdatePreference).where(
-            UserUpdatePreference.user_id == user_id
+            (
+                UserUpdatePreference.fluxer_user_id
+                if is_fluxer_mode()
+                else UserUpdatePreference.user_id
+            )
+            == user_id
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

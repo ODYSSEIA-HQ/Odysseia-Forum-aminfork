@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from api.v1.dependencies.security import get_current_user
+from identity.principal import current_identity_id
+from identity.runtime import is_fluxer_mode
 from api.v1.schemas.follows import FollowedThreadResponse, FollowsListResponse
 from api.v1.schemas.search import AuthorDetail
 from api.v1.utils import ThreadDetailBuilder
@@ -58,7 +60,7 @@ async def get_follows(
         return {"total": 0, "threads": [], "limit": limit, "offset": offset}
 
     try:
-        user_id = int(current_user["id"])
+        user_id = current_identity_id(current_user)
 
         # 将前端可能传入的字符串雪花 ID 统一转为 int
         effective_channel_ids: Optional[List[int]] = None
@@ -107,11 +109,12 @@ async def get_follows(
                     presentation_context=presentation_context,
                 )
                 response_data = detail.model_dump()
-                response_data["author"] = (
-                    AuthorDetail.model_validate(record.author)
-                    if record.author
-                    else None
-                )
+                if not is_fluxer_mode():
+                    response_data["author"] = (
+                        AuthorDetail.model_validate(record.author)
+                        if record.author
+                        else None
+                    )
                 threads.append(
                     FollowedThreadResponse(
                         **response_data,
@@ -146,7 +149,7 @@ async def mark_all_viewed(current_user: Dict[str, Any] = Depends(get_current_use
     用于用户打开关注列表后，批量更新查看时间
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = current_identity_id(current_user)
 
         async with AsyncSessionFactory() as session:
             marked_read = await NotificationRepository(session).mark_all_read(user_id)
@@ -172,7 +175,7 @@ async def get_unread_count(current_user: Dict[str, Any] = Depends(get_current_us
         return {"unread_count": 0}
 
     try:
-        user_id = int(current_user["id"])
+        user_id = current_identity_id(current_user)
 
         async with AsyncSessionFactory() as session:
             count = await NotificationRepository(session).unread_count(user_id=user_id)
@@ -196,7 +199,7 @@ async def add_follow(
     - **thread_id**: 帖子Discord ID
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = current_identity_id(current_user)
 
         async with AsyncSessionFactory() as session:
             follow_service = ThreadFollowRepository(session)
@@ -230,7 +233,7 @@ async def remove_follow(
     注意：用户不能取消关注自己的帖子
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = current_identity_id(current_user)
 
         # 检查是否是用户自己的帖子
         from sqlmodel import select
@@ -239,7 +242,9 @@ async def remove_follow(
 
         async with AsyncSessionFactory() as session:
             # 查询帖子作者
-            statement = select(Thread.author_id).where(Thread.thread_id == thread_id)
+            statement = select(
+                Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id
+            ).where(Thread.thread_id == thread_id)
             result = await session.execute(statement)
             author_id = result.scalar_one_or_none()
 

@@ -1,6 +1,9 @@
 """书单相关路由"""
 
 from shared.tag_error import TagError
+from identity.runtime import is_fluxer_mode
+from identity.identity_repository import IdentityRepository
+from identity.principal import current_identity_id, require_discord_id
 
 import logging
 from core.tag_query import load_custom_tags
@@ -39,7 +42,7 @@ from core.booklist_publish_repository import BooklistPublishRepository
 from core.booklist_repository import BooklistRepository
 from core.collection_repository import CollectionRepository
 from dto.booklist_items_sync_dto import BooklistItemsSyncDTO
-from models import Author, BooklistItem
+from models import Author, BooklistItem, User
 from shared.database import AsyncSessionFactory
 from shared.keyword_parser import parse_search_keywords
 from shared.request_id import RequestId
@@ -101,6 +104,9 @@ async def _fill_authors_for_booklists(
     session: Any, booklists: List[Any]
 ) -> Dict[int, Any]:
     """获取书单的作者映射，并在不存在或过期时将其加入到 Redis 待拉取队列"""
+    if is_fluxer_mode():
+        owner_ids = {b.fluxer_owner_id for b in booklists if b.fluxer_owner_id}
+        return await IdentityRepository(session).profiles(owner_ids)
     owner_ids = list(set(b.owner_id for b in booklists if getattr(b, "owner_id", None)))
     if not owner_ids:
         return {}
@@ -155,11 +161,27 @@ async def _fill_fallback_covers(session: Any, booklists: List[Any]) -> Dict[int,
     return await item_repo.get_fallback_covers(missing_ids)
 
 
+def _principal_id(current_user: dict[str, Any]) -> int | str:
+    """按当前身份模式获取业务用户 ID。"""
+    return current_identity_id(current_user)
+
+
+def _is_booklist_owner(booklist: Any, user_id: int | str) -> bool:
+    """按身份模式校验书单所有权，禁止跨平台数字碰撞。"""
+    from identity.canonical_user_id import CanonicalUserId
+
+    if is_fluxer_mode() or isinstance(user_id, CanonicalUserId):
+        return booklist.fluxer_owner_id is not None and booklist.fluxer_owner_id == str(
+            user_id
+        )
+    return booklist.owner_id == user_id
+
+
 def _apply_anonymous_author(
     detail: BooklistSummary, booklist: Any, current_user_id: int, author_map: dict
 ):
     if getattr(booklist, "is_anonymous", False):
-        if current_user_id != booklist.owner_id:
+        if not _is_booklist_owner(booklist, current_user_id):
             detail.owner_id = 0
         detail.author = AuthorDetail(
             id=0,
@@ -167,6 +189,15 @@ def _apply_anonymous_author(
             global_name=None,
             display_name="匿名用户",
             avatar_url="https://cdn.discordapp.com/embed/avatars/0.png",
+        )
+    elif is_fluxer_mode() and booklist.fluxer_owner_id in author_map:
+        profile = author_map[booklist.fluxer_owner_id]
+        detail.author = AuthorDetail(
+            id=profile.id,
+            name=profile.username,
+            global_name=profile.display_name,
+            display_name=profile.display_name or profile.username,
+            avatar_url=profile.avatar_url,
         )
     elif booklist.owner_id in author_map:
         detail.author = AuthorDetail.model_validate(
@@ -213,7 +244,7 @@ async def create_booklist(
     - default_sort_order: 默认排序顺序，默认为 desc
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         sort_method, sort_order = _resolve_sort_params(
             default_sort_method=default_sort_method,
             default_sort_order=default_sort_order,
@@ -278,7 +309,7 @@ async def list_public_booklists(
         default="and",
         description="包含标签的组合逻辑：and 要求全部命中，or 要求至少命中一个；分别作用于 include_tags 和 include_tag_ids，两组条件共同生效，不改变排除条件",
     ),
-    owner_id: Optional[int] = Query(None, description="创建者用户ID"),
+    owner_id: Optional[str] = Query(None, description="创建者用户ID"),
     keywords: Optional[str] = Query(None, description="模糊搜索关键词，匹配标题和描述"),
     included_thread_id: Optional[int] = Query(
         None, description="筛选包含指定帖子ID的书单"
@@ -318,10 +349,12 @@ async def list_public_booklists(
     - offset: 偏移量
     """
     try:
+        if owner_id is not None and not is_fluxer_mode():
+            owner_id = int(owner_id)
         # 当 search_by_collect 为真时，获取当前用户ID作为 collected_by_user_id
         collected_by_user_id = None
         if search_by_collect:
-            collected_by_user_id = int(current_user["id"])
+            collected_by_user_id = _principal_id(current_user)
 
         # 解析高级搜索关键词（author:Name, "精确短语", -排除词）
         parsed_author_name, final_keywords, final_exclude_keywords = (
@@ -333,11 +366,17 @@ async def list_public_booklists(
             resolved_owner_ids: list[int] | None = None
             if parsed_author_name:
                 search_pattern = f"%{parsed_author_name}%"
-                author_stmt = select(Author.id).where(
-                    (func.lower(Author.name) == parsed_author_name.lower())  # type: ignore
-                    | (Author.global_name.like(search_pattern))  # type: ignore
-                    | (Author.display_name.like(search_pattern))  # type: ignore
-                )
+                if is_fluxer_mode():
+                    author_stmt = select(User.id).where(
+                        (func.lower(User.username) == parsed_author_name.lower())
+                        | (User.display_name.like(search_pattern))
+                    )
+                else:
+                    author_stmt = select(Author.id).where(
+                        (func.lower(Author.name) == parsed_author_name.lower())
+                        | (Author.global_name.like(search_pattern))
+                        | (Author.display_name.like(search_pattern))
+                    )
                 author_rows = await session.execute(author_stmt)
                 matched = set(author_rows.scalars().all())
                 if matched:
@@ -347,7 +386,7 @@ async def list_public_booklists(
                         resolved_owner_ids = list(matched)
                 else:
                     # 作者未找到，用哨兵值确保空结果
-                    resolved_owner_ids = [-1]
+                    resolved_owner_ids = []
 
             service = BooklistRepository(session)
             booklists, total = await service.list_booklists(
@@ -372,7 +411,7 @@ async def list_public_booklists(
 
             # 检查收藏状态
             collected_booklist_ids = set()
-            user_id = int(current_user["id"])
+            user_id = _principal_id(current_user)
             if user_id and booklists:
                 booklist_ids = [b.id for b in booklists if b.id is not None]
                 collection_service = CollectionRepository(session)
@@ -393,7 +432,12 @@ async def list_public_booklists(
 
             results = []
             for b in booklists:
-                summary = BooklistSummary.model_validate(b, from_attributes=True)
+                summary = BooklistSummary.model_validate(
+                    {**b.model_dump(), "owner_id": b.fluxer_owner_id}
+                    if is_fluxer_mode()
+                    else b,
+                    from_attributes=True,
+                )
                 summary.custom_tags = custom_tag_map.get(b.id, [])
                 _apply_anonymous_author(summary, b, user_id, author_map)
 
@@ -481,7 +525,7 @@ async def list_my_booklists(
     - offset: 偏移量
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         owner_id = None
         collected_by_user_id = None
 
@@ -500,11 +544,17 @@ async def list_my_booklists(
             resolved_owner_ids: list[int] | None = None
             if parsed_author_name:
                 search_pattern = f"%{parsed_author_name}%"
-                author_stmt = select(Author.id).where(
-                    (func.lower(Author.name) == parsed_author_name.lower())  # type: ignore
-                    | (Author.global_name.like(search_pattern))  # type: ignore
-                    | (Author.display_name.like(search_pattern))  # type: ignore
-                )
+                if is_fluxer_mode():
+                    author_stmt = select(User.id).where(
+                        (func.lower(User.username) == parsed_author_name.lower())
+                        | (User.display_name.like(search_pattern))
+                    )
+                else:
+                    author_stmt = select(Author.id).where(
+                        (func.lower(Author.name) == parsed_author_name.lower())
+                        | (Author.global_name.like(search_pattern))
+                        | (Author.display_name.like(search_pattern))
+                    )
                 author_rows = await session.execute(author_stmt)
                 matched = set(author_rows.scalars().all())
                 if matched:
@@ -514,7 +564,7 @@ async def list_my_booklists(
                         resolved_owner_ids = list(matched)
                 else:
                     # 作者未找到，用哨兵值确保空结果
-                    resolved_owner_ids = [-1]
+                    resolved_owner_ids = []
 
             service = BooklistRepository(session)
             booklists, total = await service.list_booklists(
@@ -537,7 +587,7 @@ async def list_my_booklists(
 
             # 检查收藏状态
             collected_booklist_ids = set()
-            user_id = int(current_user["id"])
+            user_id = _principal_id(current_user)
             if user_id and booklists:
                 booklist_ids = [b.id for b in booklists if b.id is not None]
                 collection_service = CollectionRepository(session)
@@ -569,7 +619,12 @@ async def list_my_booklists(
 
             results = []
             for b in booklists:
-                summary = BooklistSummary.model_validate(b, from_attributes=True)
+                summary = BooklistSummary.model_validate(
+                    {**b.model_dump(), "owner_id": b.fluxer_owner_id}
+                    if is_fluxer_mode()
+                    else b,
+                    from_attributes=True,
+                )
                 summary.custom_tags = custom_tag_map.get(b.id, [])
                 _apply_anonymous_author(summary, b, user_id, author_map)
 
@@ -608,19 +663,23 @@ async def get_booklist(
         async with AsyncSessionFactory() as session:
             service = BooklistRepository(session)
             booklist = await service.get_booklist(booklist_id)
+            if booklist is not None:
+                booklist_id = booklist.id
             if not booklist:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
                 )
             # 权限检查：非公开书单只有所有者可以查看
-            if not booklist.is_public and booklist.owner_id != int(current_user["id"]):
+            if not booklist.is_public and not _is_booklist_owner(
+                booklist, _principal_id(current_user)
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="无权查看此书单"
                 )
 
             # 检查当前用户是否收藏了该书单
             collected_flag = False
-            user_id = int(current_user["id"])
+            user_id = _principal_id(current_user)
             if booklist_id is not None:
                 collection_service = CollectionRepository(session)
                 collected_ids = await collection_service.get_collected_target_ids(
@@ -630,7 +689,12 @@ async def get_booklist(
 
             # 获取书单创建者信息
             author_map = await _fill_authors_for_booklists(session, [booklist])
-            detail = BooklistDetail.model_validate(booklist, from_attributes=True)
+            detail = BooklistDetail.model_validate(
+                {**booklist.model_dump(), "owner_id": booklist.fluxer_owner_id}
+                if is_fluxer_mode()
+                else booklist,
+                from_attributes=True,
+            )
             detail.custom_tags = (
                 await load_custom_tags(session, "booklist", [booklist.id])
             ).get(booklist.id, [])
@@ -703,7 +767,7 @@ async def update_booklist(
     - default_sort_order: 默认排序顺序（可选）
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         sort_method, sort_order = _resolve_sort_params(
             default_sort_method=default_sort_method,
             default_sort_order=default_sort_order,
@@ -714,11 +778,13 @@ async def update_booklist(
             service = BooklistRepository(session)
             # 检查权限
             booklist = await service.get_booklist(booklist_id)
+            if booklist is not None:
+                booklist_id = booklist.id
             if not booklist:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
                 )
-            if booklist.owner_id != user_id:
+            if not _is_booklist_owner(booklist, user_id):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="无权修改此书单"
                 )
@@ -768,16 +834,18 @@ async def delete_booklist(
     - booklist_id: 书单ID
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         async with AsyncSessionFactory() as session:
             service = BooklistRepository(session)
             # 检查权限
             booklist = await service.get_booklist(booklist_id)
+            if booklist is not None:
+                booklist_id = booklist.id
             if not booklist:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
                 )
-            if booklist.owner_id != user_id:
+            if not _is_booklist_owner(booklist, user_id):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="无权删除此书单"
                 )
@@ -785,6 +853,8 @@ async def delete_booklist(
             # 删除前保存是否存在发布记录，供本地提交后通知外部服务。
             publish_repo = BooklistPublishRepository(session)
             publish_record = await publish_repo.get_by_booklist(booklist_id)
+            if is_fluxer_mode() and publish_record:
+                require_discord_id(current_user)
             success = await service.delete_booklist(booklist_id)
             if not success:
                 raise HTTPException(
@@ -833,8 +903,8 @@ async def publish_booklist(
         )
 
     try:
-        user_id = int(current_user["id"])
-        discord_user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
+        discord_user_id = int(require_discord_id(current_user))
 
         # 解析 thread_url → guild_id + thread_id
         guild_id, thread_id = ThreadLinkParser.parse_thread_url(request.thread_url)
@@ -843,11 +913,13 @@ async def publish_booklist(
             # 权限校验
             booklist_repo = BooklistRepository(session)
             booklist = await booklist_repo.get_booklist(booklist_id)
+            if booklist is not None:
+                booklist_id = booklist.id
             if not booklist:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
                 )
-            if booklist.owner_id != user_id:
+            if not _is_booklist_owner(booklist, user_id):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="无权发布此书单"
                 )
@@ -857,7 +929,13 @@ async def publish_booklist(
                 base_url=_booklist_publish_base_url,
                 api_key=_booklist_publish_api_key,
             )
-            await service.publish(booklist_id, guild_id, thread_id, discord_user_id)
+            await service.publish(
+                booklist_id,
+                guild_id,
+                thread_id,
+                discord_user_id,
+                **({"fluxer_user_id": user_id} if is_fluxer_mode() else {}),
+            )
 
         return {
             "message": "书单发布请求已提交",
@@ -884,16 +962,20 @@ async def unpublish_booklist(
     取消发布书单，删除所有发布记录。
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
+        if is_fluxer_mode():
+            require_discord_id(current_user)
         async with AsyncSessionFactory() as session:
             # 权限校验
             booklist_repo = BooklistRepository(session)
             booklist = await booklist_repo.get_booklist(booklist_id)
+            if booklist is not None:
+                booklist_id = booklist.id
             if not booklist:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
                 )
-            if booklist.owner_id != user_id:
+            if not _is_booklist_owner(booklist, user_id):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="无权取消发布此书单"
                 )
@@ -939,7 +1021,7 @@ async def add_threads_to_booklist(
     detail[].msg 提供中文提示，detail[].loc 定位具体条目；超范围时提示检查遗漏逗号。
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         async with AsyncSessionFactory() as session:
             service = BooklistService(session)
             added_items = await service.add_threads(
@@ -989,7 +1071,7 @@ async def remove_threads_from_booklist(
     - **request body**: 包含一个`thread_ids`列表，每个元素为要移除的帖子ID
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         async with AsyncSessionFactory() as session:
             service = BooklistService(session)
             deleted_count = await service.remove_threads(
@@ -1028,7 +1110,7 @@ async def sync_thread_in_booklists(
     - **comment**: 应用于目标书单项的推荐语（可选）
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         async with AsyncSessionFactory() as session:
             service = BooklistService(session)
             result = await service.sync_thread_in_booklists(
@@ -1091,11 +1173,15 @@ async def get_booklist_items(
             service = BooklistRepository(session)
             # 检查权限
             booklist = await service.get_booklist(booklist_id)
+            if booklist is not None:
+                booklist_id = booklist.id
             if not booklist:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
                 )
-            if not booklist.is_public and booklist.owner_id != int(current_user["id"]):
+            if not booklist.is_public and not _is_booklist_owner(
+                booklist, _principal_id(current_user)
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="无权查看此书单内容"
                 )
@@ -1133,7 +1219,7 @@ async def get_booklist_items(
                 offset=offset,
             )
 
-            user_id = int(current_user["id"])
+            user_id = _principal_id(current_user)
 
             # 预计算全量反向映射 channel_id -> virtual_tags
             channel_to_virtual: Dict[int, List[str]] = {}
@@ -1179,17 +1265,19 @@ async def update_booklist_item(
         - display_order: (可选) 新的排序权重
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = _principal_id(current_user)
         async with AsyncSessionFactory() as session:
             # 权限检查
             booklist_service = BooklistRepository(session)
             booklist_item_service = BooklistItemRepository(session)
             booklist = await booklist_service.get_booklist(booklist_id)
+            if booklist is not None:
+                booklist_id = booklist.id
             if not booklist:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
                 )
-            if booklist.owner_id != user_id:
+            if not _is_booklist_owner(booklist, user_id):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN, detail="无权修改此书单"
                 )

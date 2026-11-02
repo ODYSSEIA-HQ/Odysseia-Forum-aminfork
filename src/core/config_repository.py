@@ -7,6 +7,8 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select, update
 
 from models import BotConfig, MutexTagGroup, MutexTagRule
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from shared.enum import SearchConfigDefaults, SearchConfigType
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,10 @@ class ConfigRepository:
         # 动态构建要更新的值，并加入 update_user_id
         update_data = new_values.copy()
         update_data["update_user_id"] = user_id
+        if is_fluxer_mode():
+            update_data["fluxer_update_user_id"] = (
+                await resolve_business_id(self.session, user_id) if user_id else None
+            )
 
         stmt = (
             update(BotConfig)

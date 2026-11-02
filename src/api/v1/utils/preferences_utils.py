@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from core.preferences_repository import PreferencesRepository
+from identity.runtime import is_fluxer_mode
 from dto.preferences import UserSearchPreferencesDTO
 from shared.enum import CacheKeys, ConstantEnum
 
@@ -17,7 +18,9 @@ async def get_user_preferences_cached(
 
     供 search 和 banner 路由共用。
     """
-    cache_key = CacheKeys.USER_PREFERENCES.format(user_id=user_id, guild_id=guild_id)
+    cache_key = (
+        "fluxer:" if is_fluxer_mode() else ""
+    ) + CacheKeys.USER_PREFERENCES.format(user_id=user_id, guild_id=guild_id)
 
     # 尝试 Redis 命中
     try:

@@ -1,3 +1,5 @@
+from sqlalchemy import event
+from sqlalchemy.orm import Session, with_loader_criteria
 import os
 
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -74,3 +76,28 @@ async def close_db():
     print("正在关闭数据库连接池...")
     await async_engine.dispose()
     print("数据库连接池已关闭。")
+
+
+# 旧 API 和 Discord Bot 默认只读取 Discord 来源，避免相同雪花编号跨平台碰撞。
+
+
+@event.listens_for(Session, "do_orm_execute")
+def isolate_legacy_thread_platform(execute_state):
+    """在既有 ORM 查询统一施加 Discord 来源过滤。"""
+    from identity.runtime import request_identity_mode
+    from models.thread import Thread
+
+    if (
+        request_identity_mode.get() != "fluxer"
+        and not execute_state.execution_options.get("all_platforms")
+    ):
+        if (
+            execute_state.is_select
+            or execute_state.is_update
+            or execute_state.is_delete
+        ):
+            execute_state.statement = execute_state.statement.options(
+                with_loader_criteria(
+                    Thread, Thread.platform == "discord", include_aliases=True
+                )
+            )

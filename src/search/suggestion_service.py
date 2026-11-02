@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import or_, select
 
 from dto.search import SuggestionResultDTO
-from models import Author, Booklist, Tag, Thread
+from models import Author, Booklist, Tag, Thread, User
+from identity.runtime import is_fluxer_mode
 
 
 class SuggestionService:
@@ -34,29 +35,31 @@ class SuggestionService:
         is_numeric = keyword.isdigit()
 
         # --- 作者查询 ---
-        author_stmt = select(Author)
+        profile_model = User if is_fluxer_mode() else Author
+        profile_name = User.username if is_fluxer_mode() else Author.name
+        author_stmt = select(profile_model)
         if is_numeric:
             author_stmt = author_stmt.where(
                 or_(
-                    func.cast(Author.id, String).like(search_pattern),  # type: ignore[arg-type]
-                    Author.name.like(search_pattern),  # type: ignore[attr-defined]
-                    Author.display_name.like(search_pattern),  # type: ignore[attr-defined]
+                    func.cast(profile_model.id, String).like(search_pattern),  # type: ignore[arg-type]
+                    profile_name.like(search_pattern),  # type: ignore[attr-defined]
+                    profile_model.display_name.like(search_pattern),  # type: ignore[attr-defined]
                 )
             )
         else:
             author_stmt = author_stmt.where(
                 or_(
-                    Author.name.like(search_pattern),  # type: ignore[attr-defined]
-                    Author.display_name.like(search_pattern),  # type: ignore[attr-defined]
+                    profile_name.like(search_pattern),  # type: ignore[attr-defined]
+                    profile_model.display_name.like(search_pattern),  # type: ignore[attr-defined]
                 )
             )
         if exclude_authors:
-            author_stmt = author_stmt.where(Author.id.notin_(exclude_authors))  # type: ignore[attr-defined]
+            author_stmt = author_stmt.where(profile_model.id.notin_(exclude_authors))  # type: ignore[attr-defined]
         author_stmt = author_stmt.limit(limit)
 
         # --- 帖子查询 ---
         thread_stmt = select(Thread).where(
-            Thread.not_found_count == 0,
+            Thread.deleted_at.is_(None),
             Thread.show_flag,  # type: ignore[attr-defined]
         )
         if is_numeric:
@@ -70,7 +73,11 @@ class SuggestionService:
             thread_stmt = thread_stmt.where(Thread.title.like(search_pattern))  # type: ignore[attr-defined]
 
         if exclude_authors:
-            thread_stmt = thread_stmt.where(Thread.author_id.notin_(exclude_authors))  # type: ignore[attr-defined]
+            thread_stmt = thread_stmt.where(
+                (
+                    Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id
+                ).notin_(exclude_authors)
+            )  # type: ignore[attr-defined]
 
         if exclude_keywords and exclude_keywords.strip():
             for kw in re.split(r"[,，/\s]+", exclude_keywords.strip()):
@@ -92,7 +99,8 @@ class SuggestionService:
         if current_user_id:
             visibility_cond = or_(
                 visibility_cond,
-                Booklist.owner_id == current_user_id,  # type: ignore[attr-defined]
+                (Booklist.fluxer_owner_id if is_fluxer_mode() else Booklist.owner_id)
+                == current_user_id,  # type: ignore[attr-defined]
             )
         booklist_stmt = booklist_stmt.where(visibility_cond)
         if is_numeric:

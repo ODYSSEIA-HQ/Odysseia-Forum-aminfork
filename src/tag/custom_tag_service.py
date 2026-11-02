@@ -5,6 +5,8 @@ from datetime import timedelta
 from sqlalchemy import func, or_, select, text
 
 from core.tag_access_service import TagAccessService
+from identity.runtime import uses_canonical_storage
+from identity.business_identity import resolve_business_id
 from core.tag_data_repository import TagDataRepository
 from core.tag_merge_service import TagMergeService
 from core.tag_presentation import load_discord_sources, tag_data
@@ -31,6 +33,7 @@ class CustomTagService:
         self.access = access or TagAccessService(config)
         self.tag_cache = {}
         self.source_cache = {}
+        self.work_principal = None
 
     def repo(self, model):
         """获取当前事务内的单表仓储。"""
@@ -69,6 +72,8 @@ class CustomTagService:
         }
         if command.action not in handlers:
             raise TagError("unknown_command", "未知标签操作", 400)
+        if uses_canonical_storage():
+            await resolve_business_id(self.session, command.actor_id, source="discord")
         # 池维护与绑定写入互斥，防止软删除和新增绑定交错。
         exclusive = command.action in ("manage", "merge")
         lock = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
@@ -81,7 +86,7 @@ class CustomTagService:
             "review",
             "vote",
             "audit",
-        ) and command.payload.get("target_type") in ("thread", "booklist")
+        ) and command.payload.get("target_type") in ("thread", "booklist", "work")
         if not target_action:
             await self.session.execute(text(f"SELECT {lock}(73902141)"))
         return await handlers[command.action](command.actor_id, command.payload)
@@ -94,9 +99,15 @@ class CustomTagService:
                 detail["tag_name"] = tag.name
                 detail["category"] = tag.category
         detail["target_id_kind"] = "internal"
+        canonical_actor = (
+            await resolve_business_id(self.session, actor, source="discord")
+            if uses_canonical_storage() and actor
+            else None
+        )
         await self.repo(OperationLog).add(
             type=action,
             actor_id=actor,
+            fluxer_actor_id=canonical_actor,
             target_type=kind,
             target_id=target_id,
             tag_id=tag_id,
@@ -106,6 +117,10 @@ class CustomTagService:
     async def target(self, actor, payload, manage=False, audit=False, lock=True):
         """无锁核验实时权限，再刷新目标状态并按需获取写锁。"""
         kind, target_id = payload["target_type"], int(payload["target_id"])
+        if kind == "work":
+            return await self.work_target(
+                actor, target_id, manage=manage, audit=audit, lock=lock
+            )
         if kind not in ("thread", "booklist"):
             raise TagError("invalid_target", "目标类型无效", 422)
         model = Thread if kind == "thread" else Booklist
@@ -120,16 +135,37 @@ class CustomTagService:
         # 保存标量快照，避免 populate_existing 原地刷新后丢失授权依据。
         access_fields = (
             (
-                "id", "guild_id", "channel_id", "author_id", "show_flag", "not_found_count"
+                "id",
+                "guild_id",
+                "channel_id",
+                "author_id",
+                "fluxer_author_id",
+                "show_flag",
+                "not_found_count",
             )
             if kind == "thread"
-            else ("id", "owner_id", "is_public")
+            else ("id", "owner_id", "fluxer_owner_id", "is_public")
         )
         access_state = tuple(getattr(target, field) for field in access_fields)
-        allowed = await self.access.access(
-            actor, kind, target, manage=manage, audit=audit
+        if uses_canonical_storage():
+            canonical_actor = await resolve_business_id(
+                self.session, actor, source="discord"
+            )
+            allowed = await self.access.access(
+                actor,
+                kind,
+                target,
+                manage=manage,
+                audit=audit,
+                canonical_user_id=canonical_actor,
+            )
+        else:
+            allowed = await self.access.access(
+                actor, kind, target, manage=manage, audit=audit
+            )
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock_shared(73902141)")
         )
-        await self.session.execute(text("SELECT pg_advisory_xact_lock_shared(73902141)"))
         target = await self.repo(model).one(key == target_id, lock=lock, refresh=True)
         if target is None:
             raise TagError("not_found", "目标不存在", 404)
@@ -138,11 +174,77 @@ class CustomTagService:
             raise TagError("concurrent_conflict", "目标访问权限已变化，请刷新后重试")
         return kind, target.id, target, allowed
 
+    async def work_target(self, actor, target_id, manage=False, audit=False, lock=True):
+        """作品标签沿用同一审核投票事实，权限使用统一作者及当前成员。"""
+        from models.work import Work
+        from models.user import User
+        from identity.identity_repository import IdentityRepository
+        from shared.abyss_tag_visibility import can_view_abyss_tags
+        from work.work_service import WorkService
+
+        canonical = await resolve_business_id(self.session, actor, source="discord")
+        principal = self.work_principal
+        if principal is None:
+            bindings = await IdentityRepository(self.session).fluxer_to_discord(
+                [canonical]
+            )
+            current = bindings.get(str(canonical))
+            if current is None:
+                raise TagError("forbidden", "当前身份未绑定 Discord", 403)
+            roles = await self.access.roles(int(current), self.access.main_guild)
+            required = self.access.config.get("auth", {}).get("role_ids", [])
+            required = required.split(",") if isinstance(required, str) else required
+            if not roles.intersection(str(value).strip() for value in required):
+                raise TagError("forbidden", "需要正式成员身份组", 403)
+            user = await self.session.get(User, str(canonical))
+            principal = {
+                "id": str(canonical),
+                "show_nsfw": bool(user and user.show_nsfw),
+                "is_admin": str(self.access.config.get("management_role_id") or "")
+                in roles,
+                "can_view_abyss": can_view_abyss_tags(
+                    roles, self.access.config.get("abyss")
+                ),
+            }
+        from fastapi import HTTPException
+
+        try:
+            target = await WorkService(self.session).visible(target_id, principal)
+        except HTTPException as exc:
+            raise TagError("not_found", str(exc.detail), exc.status_code) from exc
+        allowed = target.author_id == principal["id"] or principal["is_admin"]
+        if (manage and not allowed) or (audit and not principal["is_admin"]):
+            raise TagError("forbidden", "需要作者或管理权限", 403)
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock_shared(73902141)")
+        )
+        target = await self.repo(Work).one(
+            Work.id == target_id, lock=lock, refresh=True
+        )
+        if target is None or target.deleted_at:
+            raise TagError("not_found", "作品不存在", 404)
+        return "work", target.id, target, allowed
+
+    def logical_target(self, model, kind, target_id):
+        """旧帖子与作品入口共享已关联的治理事实，不复制轮次和票数。"""
+        from sqlalchemy import and_
+
+        direct = and_(model.target_type == kind, model.target_id == target_id)
+        if kind == "work":
+            return or_(direct, model.work_id == target_id)
+        if kind == "thread":
+            work_id = (
+                select(Thread.work_id).where(Thread.id == target_id).scalar_subquery()
+            )
+            return or_(
+                direct, and_(model.target_type == "work", model.work_id == work_id)
+            )
+        return direct
+
     async def bindings(self, kind, target_id):
         """读取目标的全部生效绑定轮次。"""
         rows = await self.repo(TagBinding).rows(
-            TagBinding.target_type == kind,
-            TagBinding.target_id == target_id,
+            self.logical_target(TagBinding, kind, target_id),
             TagBinding.ended_at.is_(None),
             TagBinding.binding_source == "local",
         )
@@ -150,6 +252,28 @@ class CustomTagService:
 
     async def native_tags(self, kind, target):
         """按内部帖子主键读取原生标签。"""
+        if kind == "work":
+            from models.work_native_tag_binding import WorkNativeTagBinding
+            from models.work_native_tag_source import WorkNativeTagSource
+
+            return list(
+                (
+                    await self.session.execute(
+                        select(Tag)
+                        .join(WorkNativeTagSource, WorkNativeTagSource.tag_id == Tag.id)
+                        .join(
+                            WorkNativeTagBinding,
+                            WorkNativeTagBinding.source_id == WorkNativeTagSource.id,
+                        )
+                        .where(
+                            WorkNativeTagBinding.work_id == target.id,
+                            Tag.deleted_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
         if kind != "thread":
             return []
         statement = (
@@ -186,6 +310,24 @@ class CustomTagService:
                     )
                 )
             ).all()
+        if kind == "work":
+            from models.work_native_tag_binding import WorkNativeTagBinding
+            from models.work_native_tag_source import WorkNativeTagSource
+
+            native_rows = (
+                await self.session.execute(
+                    select(Tag, WorkNativeTagSource.id)
+                    .join(WorkNativeTagSource, WorkNativeTagSource.tag_id == Tag.id)
+                    .join(
+                        WorkNativeTagBinding,
+                        WorkNativeTagBinding.source_id == WorkNativeTagSource.id,
+                    )
+                    .where(
+                        WorkNativeTagBinding.work_id == target_id,
+                        Tag.deleted_at.is_(None),
+                    )
+                )
+            ).all()
         native = [tag for tag, _ in native_rows]
         native_source = {tag.id: str(source_id) for tag, source_id in native_rows}
         tags = await self.repo(Tag).rows(Tag.id.in_(bindings), Tag.deleted_at.is_(None))
@@ -193,9 +335,13 @@ class CustomTagService:
         self.source_cache.update(
             await load_discord_sources(self.session, [t.id for t in tags + native])
         )
+        canonical_actor = await resolve_business_id(
+            self.session, actor, source="discord"
+        )
         votes = await self.repo(TagVote).rows(
             TagVote.binding_id.in_([b.id for b in bindings.values()]),
-            TagVote.user_id == actor,
+            (TagVote.fluxer_user_id if uses_canonical_storage() else TagVote.user_id)
+            == canonical_actor,
         )
         mine = {v.binding_id: v.vote for v in votes}
         version_data = sorted(
@@ -208,8 +354,7 @@ class CustomTagService:
                     func.max(TagBinding.created_at),
                     func.max(TagBinding.ended_at),
                 ).where(
-                    TagBinding.target_type == kind,
-                    TagBinding.target_id == target_id,
+                    self.logical_target(TagBinding, kind, target_id),
                 )
             )
         ).one()
@@ -219,7 +364,7 @@ class CustomTagService:
             dict(
                 self.tag_data(t),
                 readonly=True,
-                binding_source="discord_sync",
+                binding_source="platform_sync" if kind == "work" else "discord_sync",
                 discord_source_id=native_source[t.id],
             )
             for t in native
@@ -265,7 +410,7 @@ class CustomTagService:
         self.tag_cache.update({tag.id: tag for tag in tags})
         native = await self.native_tags(kind, target)
         native_ids = {t.id for t in native}
-        if desired & native_ids:
+        if (desired - set(current)) & native_ids:
             raise TagError("readonly_tag", "DC 同步绑定不可通过索引页修改", 403)
         relations = await self.repo(TagRelation).rows(TagRelation.kind == "excludes")
         eligible = {
@@ -308,11 +453,17 @@ class CustomTagService:
 
     async def attach(self, actor, kind, tid, tag_id, reason):
         """建立新的零票绑定并完成同标签待审核项。"""
+        canonical_actor = (
+            await resolve_business_id(self.session, actor, source="discord")
+            if uses_canonical_storage() and actor
+            else None
+        )
         binding = await self.repo(TagBinding).add(
             target_type=kind,
             target_id=tid,
             tag_id=tag_id,
             actor_id=actor,
+            fluxer_actor_id=canonical_actor,
         )
         await self.log(
             "tag.bind",
@@ -324,8 +475,7 @@ class CustomTagService:
             reason=reason,
         )
         pending = await self.repo(TagProposal).rows(
-            TagProposal.target_type == kind,
-            TagProposal.target_id == tid,
+            self.logical_target(TagProposal, kind, tid),
             TagProposal.tag_id == tag_id,
             TagProposal.status == "pending",
         )
@@ -356,8 +506,7 @@ class CustomTagService:
     async def blocked(self, kind, tid, tag_id):
         """判断是否曾被投票移除。"""
         return await self.repo(TagProposalBlock).one(
-            TagProposalBlock.target_type == kind,
-            TagProposalBlock.target_id == tid,
+            self.logical_target(TagProposalBlock, kind, tid),
             TagProposalBlock.tag_id == tag_id,
         )
 
@@ -372,19 +521,43 @@ class CustomTagService:
             raise TagError("already_bound", "标签已存在")
         await self.validate(kind, target, current, set(current) | {tag_id})
         pending = await self.repo(TagProposal).one(
-            TagProposal.target_type == kind,
-            TagProposal.target_id == tid,
+            self.logical_target(TagProposal, kind, tid),
             TagProposal.tag_id == tag_id,
             TagProposal.status == "pending",
         )
         if pending:
             raise TagError("already_pending", "此标签已有待审核申请")
+        canonical_actor = await resolve_business_id(
+            self.session, actor, source="discord"
+        )
+        work_owner_discord = None
+        if kind == "work":
+            from identity.identity_repository import IdentityRepository
+
+            owners = await IdentityRepository(self.session).fluxer_to_discord(
+                [target.author_id]
+            )
+            work_owner_discord = owners.get(target.author_id)
         proposal = await self.repo(TagProposal).add(
             target_type=kind,
             target_id=tid,
             tag_id=tag_id,
             applicant_id=actor,
-            owner_id=target.author_id if kind == "thread" else target.owner_id,
+            fluxer_applicant_id=canonical_actor if uses_canonical_storage() else None,
+            owner_id=(int(work_owner_discord) if work_owner_discord else None)
+            if kind == "work"
+            else (target.author_id if kind == "thread" else target.owner_id),
+            fluxer_owner_id=(
+                target.author_id
+                if kind == "work"
+                else (
+                    target.fluxer_author_id
+                    if kind == "thread"
+                    else target.fluxer_owner_id
+                )
+            )
+            if uses_canonical_storage()
+            else None,
             due_at=utc_now() + timedelta(days=7),
         )
         await self.repo(TagNotificationTask).add(proposal_id=proposal.id)
@@ -419,7 +592,17 @@ class CustomTagService:
                 raise TagError("forbidden", "无审核权限", 403)
             conditions.append(TagProposal.status == "pending")
         else:
-            conditions.append(TagProposal.applicant_id == actor)
+            canonical_actor = await resolve_business_id(
+                self.session, actor, source="discord"
+            )
+            conditions.append(
+                (
+                    TagProposal.fluxer_applicant_id
+                    if uses_canonical_storage()
+                    else TagProposal.applicant_id
+                )
+                == canonical_actor
+            )
         statement = (
             select(TagProposal)
             .where(*conditions)
@@ -480,8 +663,7 @@ class CustomTagService:
         kind, tid, target, _ = await self.target(actor, payload, manage=True)
         proposal = await self.repo(TagProposal).one(
             TagProposal.id == int(payload["proposal_id"]),
-            TagProposal.target_type == kind,
-            TagProposal.target_id == tid,
+            self.logical_target(TagProposal, kind, tid),
         )
         if proposal is None:
             raise TagError("not_found", "申请不存在", 404)
@@ -494,8 +676,7 @@ class CustomTagService:
         kind, tid, target, _ = await self.target(actor, payload)
         binding = await self.repo(TagBinding).one(
             TagBinding.id == int(payload["binding_id"]),
-            TagBinding.target_type == kind,
-            TagBinding.target_id == tid,
+            self.logical_target(TagBinding, kind, tid),
             TagBinding.ended_at.is_(None),
         )
         if binding is not None and binding.binding_source != "local":
@@ -505,9 +686,13 @@ class CustomTagService:
         value = payload["vote"]
         if value not in (-1, 0, 1):
             raise TagError("invalid_vote", "投票必须为 -1、0 或 1", 422)
+        canonical_actor = await resolve_business_id(
+            self.session, actor, source="discord"
+        )
         vote = await self.repo(TagVote).one(
             TagVote.binding_id == binding.id,
-            TagVote.user_id == actor,
+            (TagVote.fluxer_user_id if uses_canonical_storage() else TagVote.user_id)
+            == canonical_actor,
         )
         old = vote.vote if vote else 0
         if old != value:
@@ -519,7 +704,12 @@ class CustomTagService:
                 await self.repo(TagVote).remove(vote)
             elif value:
                 await self.repo(TagVote).add(
-                    binding_id=binding.id, user_id=actor, vote=value
+                    binding_id=binding.id,
+                    user_id=actor,
+                    fluxer_user_id=canonical_actor
+                    if uses_canonical_storage()
+                    else None,
+                    vote=value,
                 )
             await self.log(
                 "tag.vote",
@@ -543,6 +733,8 @@ class CustomTagService:
     async def pool(self, actor, payload):
         """搜索标准名与别名，默认仅列出可选标签。"""
         conditions = []
+        if not payload.get("_include_platform_tags"):
+            conditions.append(Tag.source != "fluxer")
         if not payload.get("_can_view_abyss", False):
             conditions.append(Tag.is_abyss.is_(False))
         # 按实体当前来源筛选后再分页，转换标签仍属于自定义标签。
@@ -566,9 +758,7 @@ class CustomTagService:
             aliases = select(TagAlias.tag_id).where(TagAlias.name.ilike(pattern))
             conditions.append(or_(Tag.name.ilike(pattern), Tag.id.in_(aliases)))
         statement = (
-            select(Tag)
-            .where(*conditions)
-            .order_by(Tag.category, Tag.name, Tag.id)
+            select(Tag).where(*conditions).order_by(Tag.category, Tag.name, Tag.id)
         )
         tags = list((await self.session.execute(statement)).scalars())
         self.source_cache.update(
@@ -631,7 +821,7 @@ class CustomTagService:
                 raise TagError(
                     "tags_changed", "已合并标签不可恢复，请刷新后选择当前标签"
                 )
-        if tag is not None and tag.source == "discord":
+        if tag is not None and tag.source in ("discord", "fluxer"):
             if action in ("delete", "restore") or (
                 "name" in payload and payload["name"] != tag.name
             ):
@@ -660,15 +850,13 @@ class CustomTagService:
             )
             is_abyss = payload.get("is_abyss", tag.is_abyss if tag else False)
             if not isinstance(is_abyss, bool):
-                raise TagError(
-                    "invalid_is_abyss", "深渊向标识必须为布尔值", 422
-                )
+                raise TagError("invalid_is_abyss", "深渊向标识必须为布尔值", 422)
             if action == "update" and tag is None:
                 raise TagError("missing_tag", "修改必须提供标签 ID", 422)
             name = unicodedata.normalize(
                 "NFC", payload.get("name", tag.name if tag else "")
             ).strip()
-            if tag is not None and tag.source == "discord":
+            if tag is not None and tag.source in ("discord", "fluxer"):
                 name = tag.name
             category = payload.get("category", tag.category if tag else None)
             if (
@@ -838,7 +1026,13 @@ class CustomTagService:
             {
                 "id": str(r.id),
                 "type": r.type,
-                "actor_id": str(r.actor_id) if r.actor_id else None,
+                "actor_id": (
+                    r.fluxer_actor_id
+                    if uses_canonical_storage()
+                    else str(r.actor_id)
+                    if r.actor_id
+                    else None
+                ),
                 "tag_id": str(r.tag_id) if r.tag_id else None,
                 "detail": r.detail,
                 "created_at": r.created_at,

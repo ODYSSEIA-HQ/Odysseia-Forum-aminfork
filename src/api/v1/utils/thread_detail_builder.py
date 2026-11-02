@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Set
 
 from api.v1.schemas.search import AuthorDetail, ThreadDetail
+from identity.runtime import is_fluxer_mode
 from api.v1.schemas.search.tournament_info import TournamentInfo
 from api.v1.schemas.search.latest_update import LatestUpdate
 from dto.thread_presentation_context import ThreadPresentationContext
@@ -71,6 +72,26 @@ class ThreadDetailBuilder:
                 published_at=update_dto.published_at,
             )
 
+        author = None
+        if is_fluxer_mode():
+            profile = (
+                presentation_context.author_profiles.get(
+                    getattr(thread, "fluxer_author_id", None)
+                )
+                if presentation_context
+                else None
+            )
+            if profile:
+                author = AuthorDetail(
+                    id=profile.id,
+                    name=profile.username,
+                    global_name=profile.display_name,
+                    display_name=profile.display_name or profile.username,
+                    avatar_url=profile.avatar_url,
+                )
+        elif getattr(thread, "author", None):
+            author = AuthorDetail.model_validate(thread.author)
+
         return ThreadDetail(
             custom_tags=presentation_context.custom_tags.get(thread.id, [])
             if presentation_context
@@ -79,9 +100,7 @@ class ThreadDetailBuilder:
             guild_id=thread.guild_id,
             channel_id=thread.channel_id,
             title=thread.title,
-            author=AuthorDetail.model_validate(thread.author)
-            if getattr(thread, "author", None)
-            else None,
+            author=author,
             created_at=thread.created_at,
             last_active_at=thread.last_active_at,
             reaction_count=thread.reaction_count,

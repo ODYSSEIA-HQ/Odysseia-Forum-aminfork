@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from identity.runtime import is_fluxer_mode
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -30,7 +31,7 @@ class OpenGraphMetadataCache:
         response_model: type[MetadataDTO],
     ) -> tuple[MetadataDTO, list[int]] | None:
         """读取并校验缓存信封，Redis 或数据格式异常时按未命中处理。"""
-        cache_key = f"{self.KEY_PREFIX}:{resource_type}:{resource_id}"
+        cache_key = f"{self.KEY_PREFIX}:{'fluxer:' if is_fluxer_mode() else ''}{resource_type}:{resource_id}"
         try:
             raw_value = await self.redis.get(cache_key)
             if not raw_value:
@@ -68,7 +69,7 @@ class OpenGraphMetadataCache:
         if ttl_seconds <= 0:
             return
 
-        cache_key = f"{self.KEY_PREFIX}:{resource_type}:{resource_id}"
+        cache_key = f"{self.KEY_PREFIX}:{'fluxer:' if is_fluxer_mode() else ''}{resource_type}:{resource_id}"
         envelope = OpenGraphMetadataCacheDTO(
             payload=metadata.model_dump(mode="json"),
             source_thread_ids=source_thread_ids,
@@ -87,7 +88,7 @@ class OpenGraphMetadataCache:
 
     async def invalidate(self, resource_type: str, resource_id: int) -> None:
         """删除复核失败的缓存且不让 Redis 故障中断数据库重建。"""
-        cache_key = f"{self.KEY_PREFIX}:{resource_type}:{resource_id}"
+        cache_key = f"{self.KEY_PREFIX}:{'fluxer:' if is_fluxer_mode() else ''}{resource_type}:{resource_id}"
         try:
             await self.redis.delete(cache_key)
         except Exception:

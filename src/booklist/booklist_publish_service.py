@@ -6,6 +6,8 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.booklist_item_repository import BooklistItemRepository
+from identity.runtime import is_fluxer_mode
+from identity.identity_repository import IdentityRepository
 from core.booklist_publish_repository import BooklistPublishRepository
 from core.booklist_repository import BooklistRepository
 from core.booklist_sort_constants import DEFAULT_SORT_METHOD, DEFAULT_SORT_ORDER
@@ -50,6 +52,7 @@ class BooklistPublishService:
         guild_id: int,
         thread_id: int,
         discord_user_id: int,
+        fluxer_user_id: str | None = None,
     ) -> None:
         """
         发布（或更新）书单到 Discord 讨论帖。
@@ -62,7 +65,13 @@ class BooklistPublishService:
         self._ensure_configured()
 
         record = await self.publish_repo.upsert(
-            booklist_id, guild_id, thread_id, discord_user_id
+            booklist_id,
+            guild_id,
+            thread_id,
+            discord_user_id,
+            **(
+                {"fluxer_user_id": fluxer_user_id} if fluxer_user_id is not None else {}
+            ),
         )
         if record.id is None:  # pragma: no cover - 主键必定已生成
             raise RuntimeError(f"书单 {booklist_id} 发布记录缺少主键")
@@ -130,6 +139,17 @@ class BooklistPublishService:
         if not record:
             return
 
+        if is_fluxer_mode():
+            if not record.fluxer_user_id or not record.discord_user_id:
+                return
+            mapping = await IdentityRepository(self.session).fluxer_to_discord(
+                [record.fluxer_user_id]
+            )
+            if mapping.get(record.fluxer_user_id) != str(record.discord_user_id):
+                logger.warning(
+                    "书单 %d 的 Discord 身份映射不可用，跳过同步", booklist_id
+                )
+                return
         guild_id = record.guild_id
         thread_id = record.thread_id
         discord_user_id = record.discord_user_id

@@ -150,9 +150,7 @@ class TagStatisticsService:
         items.sort(key=lambda item: (-item.total_thread_count, item.tag_name))
         return TagStatsResponse(total_threads=total_threads, items=items)
 
-    async def _get_real_tag_rows(
-        self, guild_id, channel_ids, *, can_view_abyss: bool
-    ):
+    async def _get_real_tag_rows(self, guild_id, channel_ids, *, can_view_abyss: bool):
         """按来源、分类、名称和频道聚合有效绑定，并对同组帖子去重。"""
         statement = (
             select(
@@ -171,7 +169,7 @@ class TagStatisticsService:
                 TagBinding.target_type == "thread",
                 TagBinding.ended_at.is_(None),
                 Tag.deleted_at.is_(None),
-                Thread.not_found_count == 0,
+                Thread.deleted_at.is_(None),
                 Thread.show_flag.is_(True),
             )
             .group_by(

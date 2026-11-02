@@ -3,6 +3,7 @@ from typing import List, Optional, Union, Any
 from pydantic import BaseModel, Field, field_validator
 
 from shared.enum import DefaultPreferences
+from identity.runtime import is_fluxer_mode
 from shared.request_id import RequestId
 
 
@@ -139,14 +140,20 @@ class SearchRequest(BaseModel):
         description="调试模式：为真时打印各阶段耗时日志，正常请求请勿开启以减少开销",
     )
 
+    @field_validator("include_authors", "exclude_authors", mode="before")
+    @classmethod
+    def convert_author_ids(cls, values: Any) -> Any:
+        """统一身份使用字符串，旧模式继续使用 Discord 数值 ID。"""
+        if values is None:
+            return None
+        return [str(value) if is_fluxer_mode() else int(value) for value in values]
+
     # --- 统一转换逻辑 ---
 
     @field_validator(
         "guild_id",
         "channel_ids",
         "exclude_channel_ids",
-        "include_authors",
-        "exclude_authors",
         "exclude_thread_ids",
         mode="before",
     )

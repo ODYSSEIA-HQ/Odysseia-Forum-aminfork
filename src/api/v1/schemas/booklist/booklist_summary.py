@@ -13,7 +13,7 @@ class BooklistSummary(BaseModel):
     id: int = Field(description="书单ID")
     """书单ID"""
 
-    owner_id: int = Field(description="创建者用户ID")
+    owner_id: int | str = Field(description="创建者用户ID")
     """创建者用户ID"""
 
     title: str = Field(description="书单标题")
@@ -90,8 +90,8 @@ class BooklistSummary(BaseModel):
     """是否被标记帖子命中"""
 
     @field_serializer("owner_id")
-    def serialize_owner_id(self, value: int) -> str:
-        """将 Discord ID 序列化为字符串，避免 JavaScript 精度丢失"""
+    def serialize_owner_id(self, value: int | str) -> str:
+        """将书单所有者 ID 序列化为字符串，避免 JavaScript 精度丢失"""
         return str(value)
 
     @field_serializer("tournament_channel_id")

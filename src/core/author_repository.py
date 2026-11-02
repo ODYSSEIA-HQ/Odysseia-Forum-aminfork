@@ -5,7 +5,9 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import Author, Thread
+from models import Author, User, Thread
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from dto.open_graph import AuthorShareQueryDTO
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,11 @@ class AuthorRepository:
         Args:
             author_data: 包含作者信息的字典，键应与 Author 模型字段匹配。
         """
+        if is_fluxer_mode():
+            author_data = dict(author_data)
+            author_data["fluxer_user_id"] = await resolve_business_id(
+                self.session, author_data["id"]
+            )
         stmt = pg_insert(Author).values(author_data)
         update_stmt = stmt.on_conflict_do_update(
             constraint="author_pkey",
@@ -50,11 +57,18 @@ class AuthorRepository:
 
     async def get_open_graph_author(self, author_id: int) -> AuthorShareQueryDTO | None:
         """查询作者分享所需标量并在 Session 内转换为 DTO。"""
-        statement = select(
-            Author.display_name,
-            Author.avatar_url,
-            Author.last_updated,
-        ).where(Author.id == author_id)
+        if is_fluxer_mode():
+            statement = select(
+                func.coalesce(User.display_name, User.username).label("display_name"),
+                User.avatar_url,
+                User.updated_at.label("last_updated"),
+            ).where(User.id == str(author_id))
+        else:
+            statement = select(
+                Author.display_name,
+                Author.avatar_url,
+                Author.last_updated,
+            ).where(Author.id == author_id)
         row = (await self.session.execute(statement)).first()
         if row is None:
             return None
@@ -72,14 +86,19 @@ class AuthorRepository:
         result = await self.session.execute(statement)
         return result.scalars().all()
 
-    async def get_author_stats(self, author_id: int) -> dict:
+    async def get_author_stats(
+        self, author_id: int | str, *, unified: bool = False
+    ) -> dict:
         """获取指定作者的发帖数、总反应数和总回复数统计。"""
-        # 仅统计未被标记为软删除的帖子 (not_found_count == 0)
+        # 仅统计未被明确软删除的帖子，临时抓取失败不影响可见性
         statement = select(
             func.count(Thread.id).label("thread_count"),  # type: ignore
             func.coalesce(func.sum(Thread.reaction_count), 0).label("reaction_count"),
             func.coalesce(func.sum(Thread.reply_count), 0).label("reply_count"),
-        ).where(Thread.author_id == author_id, Thread.not_found_count == 0)  # type: ignore
+        ).where(
+            (Thread.fluxer_author_id if unified else Thread.author_id) == author_id,
+            Thread.deleted_at.is_(None),
+        )  # type: ignore
 
         result = await self.session.execute(statement)
         row = result.first()

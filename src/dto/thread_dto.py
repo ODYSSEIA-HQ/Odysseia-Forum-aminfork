@@ -21,6 +21,7 @@ class ThreadDTO(BaseModel):
     thread_id: int = Field(description="帖子的 Discord ID")
     title: str = Field(description="帖子标题")
     author_id: int = Field(description="帖子作者的 Discord ID")
+    fluxer_author_id: str | None = Field(default=None, description="统一作者 ID")
     created_at: datetime = Field(description="帖子创建时间 (UTC)")
     last_active_at: Optional[datetime] = Field(
         default=None, description="帖子最后活跃时间 (UTC)"
@@ -56,6 +57,7 @@ class ThreadDTO(BaseModel):
             thread_id=thread.thread_id,
             title=thread.title,
             author_id=thread.author_id,
+            fluxer_author_id=getattr(thread, "fluxer_author_id", None),
             created_at=thread.created_at,
             last_active_at=thread.last_active_at,
             reaction_count=thread.reaction_count,

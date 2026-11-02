@@ -52,10 +52,11 @@
    - 如果你在写一个 `Repository` 的方法，**不要**在里面写 `async with session.begin():`。Session 的开启、提交 (`commit`) 或回滚 (`rollback`) 应该由调用端 (如 Cog 或 Service) 控制。
    - 例外情况：某些独立且封装完整的工具函数（如 `ImpressionCacheService.flush_to_db`），内部自行使用了 `session_factory()`。
 
-### 软删除机制 (`not_found_count`)
+### 权威软删除与读取失败计数
    - 我们的系统在一次拉取同步失败时**不物理删除**帖子记录，以防是 API 抽风。
    - 当抓取不到帖子时，`thread_repository.increment_not_found_count` 会被调用。
-   - 在编写任何面向用户展示的 SQL 过滤条件时，加上 `where(Thread.not_found_count == 0)` 和 `where(Thread.show_flag == True)`。
+   - `not_found_count` 仅记录临时读取异常，不得据此隐藏或删除。面向用户查询使用 `Thread.deleted_at IS NULL` 与 `Thread.show_flag=True`。
+   - gateway权威删除写入不可恢复source_deleted；管理移除索引为可恢复index_removed。Work关联来源禁止物理DELETE，关系必须保留。
 
 ### 避免 UI 直接操作数据库
    - 如果你要在 UI 层新增一个业务逻辑，请先检查 `core` 里是否已经有对应的 Repository。如果没有，请在 Repository 中添加 SQL 方法，而不是在 `views` 里直接写 `select`。

@@ -6,3 +6,5 @@ class TargetType(IntEnum):
 
     THREAD = 1  # 论坛帖子
     CHANNEL = 2  # 频道
+
+    WORK = 3  # 统一作品

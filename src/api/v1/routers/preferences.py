@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from api.v1.dependencies.security import require_auth
+from identity.runtime import is_fluxer_mode, uses_canonical_storage
 from api.v1.schemas.preferences import (
     UserPreferencesResponse,
     UserPreferencesUpdateRequest,
@@ -27,10 +28,17 @@ router = APIRouter(
     response_model=UserPreferencesResponse,
     summary="获取指定用户的搜索偏好",
 )
-async def get_user_preferences(user_id: int):
+async def get_user_preferences(
+    user_id: str, current_user: dict = Depends(require_auth)
+):
     """
     获取用户的搜索偏好设置。固定使用配置的主服务器 ID。
     """
+    if str(current_user["id"]) != str(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="无权访问其他用户的偏好"
+        )
+    user_id = str(user_id) if is_fluxer_mode() else int(user_id)
     if not async_session_factory:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -49,6 +57,12 @@ async def get_user_preferences(user_id: int):
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"未找到用户ID {user_id} 的偏好设置",
                 )
+            if uses_canonical_storage() and not is_fluxer_mode():
+                from identity.legacy_api_adapter import LegacyApiAdapter
+
+                return await LegacyApiAdapter(session).preferences_to_wire(
+                    prefs_dto, user_id
+                )
             return prefs_dto
     except HTTPException:
         raise
@@ -65,10 +79,19 @@ async def get_user_preferences(user_id: int):
     response_model=UserPreferencesResponse,
     summary="创建或更新用户搜索偏好",
 )
-async def update_user_preferences(user_id: int, request: UserPreferencesUpdateRequest):
+async def update_user_preferences(
+    user_id: str,
+    request: UserPreferencesUpdateRequest,
+    current_user: dict = Depends(require_auth),
+):
     """
     创建或更新用户的搜索偏好设置。固定使用配置的主服务器 ID。
     """
+    if str(current_user["id"]) != str(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="无权访问其他用户的偏好"
+        )
+    user_id = str(user_id) if is_fluxer_mode() else int(user_id)
     if not async_session_factory:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -87,9 +110,20 @@ async def update_user_preferences(user_id: int, request: UserPreferencesUpdateRe
                 session, redis_client=RedisManager.get_client()
             )
             # 使用注入的 main_guild_id
+            if uses_canonical_storage() and not is_fluxer_mode():
+                from identity.legacy_api_adapter import LegacyApiAdapter
+
+                existing = await repo.get_user_preferences(user_id, main_guild_id)
+                update_data = await LegacyApiAdapter(
+                    session
+                ).preserve_native_preferences(update_data, existing)
             updated_prefs = await repo.save_user_preferences(
                 user_id, update_data, main_guild_id
             )
+            if uses_canonical_storage() and not is_fluxer_mode():
+                return await LegacyApiAdapter(session).preferences_to_wire(
+                    updated_prefs, user_id
+                )
             return updated_prefs
     except HTTPException:
         raise

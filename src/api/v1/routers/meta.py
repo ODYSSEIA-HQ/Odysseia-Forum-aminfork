@@ -9,6 +9,7 @@ from fastapi.responses import Response
 from api.v1.dependencies.security import get_current_user, require_auth
 from core.cache_service import CacheService
 from core.user_role_service import UserRoleService
+from identity.runtime import is_fluxer_mode
 from dto.meta import ChannelDetail
 from dto.meta.user_role import UserRole
 from meta.meta_service import MetaService
@@ -42,7 +43,14 @@ async def get_user_role(
         raise HTTPException(503, "用户身份查询服务尚未初始化", headers=cache_headers)
     try:
         # 查询并判定当前用户是否为管理组身份和 BOT 管理员身份。
-        return await UserRoleService(role_config).get_role(int(current_user["id"]))
+        discord_id = (
+            current_user.get("discord_user_id")
+            if is_fluxer_mode()
+            else current_user["id"]
+        )
+        if not discord_id:
+            return UserRole(is_management_member=False, is_bot_admin=False)
+        return await UserRoleService(role_config).get_role(int(discord_id))
     except TagError as exc:
         raise HTTPException(exc.status, exc.detail, headers=cache_headers) from exc
 

@@ -1,9 +1,11 @@
+from identity.business_identity import resolve_business_id
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List
 
 from fastapi import HTTPException, status
+from identity.runtime import uses_canonical_storage
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -59,13 +61,20 @@ class BooklistService:
 
         返回 DTO 列表，确保在 session 外也能安全访问。
         """
+        user_id = await resolve_business_id(self.session, user_id)
         # 权限校验：确认书单存在且属于当前用户
         booklist = await self.booklist_repo.get_booklist(booklist_id)
+        if booklist is not None:
+            booklist_id = booklist.id
         if not booklist:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
             )
-        if booklist.owner_id != user_id:
+        if (
+            booklist.fluxer_owner_id != str(user_id)
+            if uses_canonical_storage()
+            else booklist.owner_id != user_id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="无权修改此书单"
             )
@@ -128,13 +137,20 @@ class BooklistService:
         """
         从书单批量移除帖子，并同步帖子的被收藏次数（跨书单去重）
         """
+        user_id = await resolve_business_id(self.session, user_id)
         # 权限校验：确认书单存在且属于当前用户
         booklist = await self.booklist_repo.get_booklist(booklist_id)
+        if booklist is not None:
+            booklist_id = booklist.id
         if not booklist:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="书单不存在"
             )
-        if booklist.owner_id != user_id:
+        if (
+            booklist.fluxer_owner_id != str(user_id)
+            if uses_canonical_storage()
+            else booklist.owner_id != user_id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="无权修改此书单"
             )
@@ -181,6 +197,7 @@ class BooklistService:
         - target_booklist_ids：操作后应包含该帖子的书单（必须是 scope 的子集）
         - comment：应用于目标书单项的推荐语
         """
+        user_id = await resolve_business_id(self.session, user_id)
         # 1. 校验 scope 不能为空
         if not scope_booklist_ids:
             raise HTTPException(
@@ -198,17 +215,29 @@ class BooklistService:
                 detail=f"target_booklist_ids 包含不在 scope 中的书单: {outside}",
             )
 
+        if uses_canonical_storage():
+            aliases = await self.booklist_repo.resolve_booklist_ids(scope_set)
+            if set(aliases) != scope_set:
+                raise HTTPException(status_code=404, detail="书单不存在或重定向失效")
+            target_set = {aliases[value] for value in target_set}
+            scope_set = set(aliases.values())
+
         # 3. 校验所有权：所有 scope 书单必须属于当前用户
         stmt = (
-            select(Booklist.id, Booklist.owner_id).where(
-                Booklist.id.in_(list(scope_set))
-            )  # type: ignore
+            select(
+                Booklist.id,
+                Booklist.fluxer_owner_id
+                if uses_canonical_storage()
+                else Booklist.owner_id,
+            ).where(Booklist.id.in_(list(scope_set)))  # type: ignore
         )
         booklist_rows = (await self.session.execute(stmt)).all()
         found_ids = {row[0] for row in booklist_rows}
 
         for row in booklist_rows:
-            if row[1] != user_id:
+            if row[1] is None or row[1] != (
+                str(user_id) if uses_canonical_storage() else user_id
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"书单 {row[0]} 不属于当前用户",

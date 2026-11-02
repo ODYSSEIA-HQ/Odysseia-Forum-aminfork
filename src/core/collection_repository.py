@@ -1,9 +1,12 @@
+from identity.business_identity import discord_id_for_business_id
+from identity.business_identity import resolve_business_id
 import logging
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import List, Sequence, Tuple, Type, TypeVar
 
 from sqlalchemy import case, update
+from identity.runtime import uses_canonical_storage
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,6 +62,8 @@ class CollectionRepository:
         Returns:
             bool: 如果是新收藏则返回 True，如果已存在则返回 False
         """
+        user_id = await resolve_business_id(self.session, user_id)
+        legacy_discord_id = await discord_id_for_business_id(self.session, user_id)
         if target_type == CollectionType.THREAD.value:
             # 帖子类型，路由到默认书单
             repo = BooklistRepository(self.session)
@@ -94,7 +99,8 @@ class CollectionRepository:
             new_item = BooklistItem(
                 booklist_id=booklist.id,
                 thread_id=target_id,
-                owner_id=user_id,
+                owner_id=legacy_discord_id,
+                fluxer_owner_id=str(user_id) if uses_canonical_storage() else None,
                 display_order=max_order + 1,
             )
             self.session.add(new_item)
@@ -106,7 +112,8 @@ class CollectionRepository:
         else:
             # target_type == 2 (书单) , 操作 UserCollection
             new_collection = UserCollection(
-                user_id=user_id,
+                user_id=legacy_discord_id,
+                fluxer_user_id=str(user_id) if uses_canonical_storage() else None,
                 target_type=target_type,
                 target_id=target_id,
             )
@@ -137,11 +144,17 @@ class CollectionRepository:
         Returns:
             bool: 如果成功移除了记录则返回 True，如果记录不存在则返回 False。
         """
+        user_id = await resolve_business_id(self.session, user_id)
         if target_type == CollectionType.THREAD.value:
             # 类型为帖子，路由到默认书单
             # 查找该帖子存在于用户的哪些书单中
             stmt = select(BooklistItem.booklist_id).where(
-                BooklistItem.owner_id == user_id,
+                (
+                    BooklistItem.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else BooklistItem.owner_id
+                )
+                == user_id,
                 BooklistItem.thread_id == target_id,
             )
             affected_booklists = (await self.session.execute(stmt)).scalars().all()
@@ -151,7 +164,12 @@ class CollectionRepository:
 
             # 从用户的所有书单中删除该帖子
             del_stmt = delete(BooklistItem).where(
-                BooklistItem.owner_id == user_id,  # type: ignore
+                (
+                    BooklistItem.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else BooklistItem.owner_id
+                )
+                == user_id,  # type: ignore
                 BooklistItem.thread_id == target_id,  # type: ignore
             )
             await self.session.execute(del_stmt)
@@ -169,7 +187,12 @@ class CollectionRepository:
             # target_type == 2 (书单) , 操作 UserCollection
             statement = delete(UserCollection).where(
                 and_(
-                    UserCollection.user_id == user_id,
+                    (
+                        UserCollection.fluxer_user_id
+                        if uses_canonical_storage()
+                        else UserCollection.user_id
+                    )
+                    == user_id,
                     UserCollection.target_type == target_type,
                     UserCollection.target_id == target_id,
                 )
@@ -192,6 +215,8 @@ class CollectionRepository:
         Returns:
             包含成功添加的ID列表和计数的 DTO
         """
+        user_id = await resolve_business_id(self.session, user_id)
+        legacy_discord_id = await discord_id_for_business_id(self.session, user_id)
         if not target_ids:
             return BatchAddResult(added_ids=[], added_count=0, duplicate_count=0)
 
@@ -238,7 +263,10 @@ class CollectionRepository:
                 {
                     "booklist_id": booklist.id,
                     "thread_id": tid,
-                    "owner_id": user_id,
+                    "owner_id": legacy_discord_id,
+                    "fluxer_owner_id": str(user_id)
+                    if uses_canonical_storage()
+                    else None,
                     "display_order": max_order + 1 + i,
                 }
                 for i, tid in enumerate(new_ids)
@@ -261,7 +289,12 @@ class CollectionRepository:
             # target_type == 2 (书单) , 操作 UserCollection
             # 找出哪些是新的收藏
             existing_stmt = select(UserCollection.target_id).where(
-                UserCollection.user_id == user_id,
+                (
+                    UserCollection.fluxer_user_id
+                    if uses_canonical_storage()
+                    else UserCollection.user_id
+                )
+                == user_id,
                 UserCollection.target_type == target_type,
                 UserCollection.target_id.in_(target_ids),  # type: ignore
             )
@@ -276,7 +309,14 @@ class CollectionRepository:
 
             # 只插入新的收藏
             values = [
-                {"user_id": user_id, "target_type": target_type, "target_id": tid}
+                {
+                    "user_id": legacy_discord_id,
+                    "fluxer_user_id": str(user_id)
+                    if uses_canonical_storage()
+                    else None,
+                    "target_type": target_type,
+                    "target_id": tid,
+                }
                 for tid in new_ids
             ]
             if values:
@@ -304,6 +344,7 @@ class CollectionRepository:
         Returns:
             包含成功移除的ID列表和计数的 DTO
         """
+        user_id = await resolve_business_id(self.session, user_id)
         if not target_ids:
             return BatchRemoveResult(removed_ids=[], removed_count=0, not_found_count=0)
 
@@ -313,7 +354,12 @@ class CollectionRepository:
             select_stmt = select(
                 BooklistItem.booklist_id, BooklistItem.thread_id
             ).where(
-                BooklistItem.owner_id == user_id,
+                (
+                    BooklistItem.fluxer_owner_id
+                    if uses_canonical_storage()
+                    else BooklistItem.owner_id
+                )
+                == user_id,
                 BooklistItem.thread_id.in_(target_ids),  # type: ignore
             )
             items_to_remove = (await self.session.execute(select_stmt)).all()
@@ -331,7 +377,12 @@ class CollectionRepository:
             # 删除书单项
             await self.session.execute(
                 delete(BooklistItem).where(
-                    BooklistItem.owner_id == user_id,  # type: ignore
+                    (
+                        BooklistItem.fluxer_owner_id
+                        if uses_canonical_storage()
+                        else BooklistItem.owner_id
+                    )
+                    == user_id,  # type: ignore
                     BooklistItem.thread_id.in_(removed_thread_ids),  # type: ignore
                 )
             )
@@ -361,7 +412,12 @@ class CollectionRepository:
             # 找出实际存在的收藏
             select_stmt = select(UserCollection.target_id).where(
                 and_(
-                    UserCollection.user_id == user_id,
+                    (
+                        UserCollection.fluxer_user_id
+                        if uses_canonical_storage()
+                        else UserCollection.user_id
+                    )
+                    == user_id,
                     UserCollection.target_type == target_type,
                     UserCollection.target_id.in_(target_ids),  # type: ignore
                 )
@@ -377,7 +433,12 @@ class CollectionRepository:
             # 删除这些收藏
             delete_stmt = delete(UserCollection).where(
                 and_(
-                    UserCollection.user_id == user_id,
+                    (
+                        UserCollection.fluxer_user_id
+                        if uses_canonical_storage()
+                        else UserCollection.user_id
+                    )
+                    == user_id,
                     UserCollection.target_type == target_type,
                     UserCollection.target_id.in_(ids_to_remove),  # type: ignore
                 )
@@ -395,11 +456,17 @@ class CollectionRepository:
         self, user_id: int, page: int, per_page: int
     ) -> Tuple[List[Thread], int]:
         """获取用户已关注但未收藏的帖子"""
+        user_id = await resolve_business_id(self.session, user_id)
         offset = (page - 1) * per_page
 
         # 子查询：获取用户已收藏的帖子ID（通过 owner_id 查询用户的所有书单项）
         collected_subquery = select(BooklistItem.thread_id).where(
-            BooklistItem.owner_id == user_id
+            (
+                BooklistItem.fluxer_owner_id
+                if uses_canonical_storage()
+                else BooklistItem.owner_id
+            )
+            == user_id
         )
 
         # 主查询（仅活跃关注）
@@ -407,7 +474,12 @@ class CollectionRepository:
             select(Thread)
             .join(ThreadFollow, Thread.thread_id == ThreadFollow.thread_id)  # type: ignore
             .where(
-                ThreadFollow.user_id == user_id,
+                (
+                    ThreadFollow.fluxer_user_id
+                    if uses_canonical_storage()
+                    else ThreadFollow.user_id
+                )
+                == user_id,
                 ThreadFollow.active_flag,  # type: ignore
                 Thread.thread_id.not_in(collected_subquery),  # type: ignore
             )
@@ -454,13 +526,21 @@ class CollectionRepository:
         Raises:
             AttributeError: 当 model_class 不是 Thread 或 Booklist 时。
         """
+        user_id = await resolve_business_id(self.session, user_id)
         offset = (page - 1) * per_page
         if target_type == CollectionType.THREAD:
             # 使用 group_by 按帖子 PK 去重，以防多书单同一帖子引发排序和分页爆炸
             base_query = (
                 select(Thread)
                 .join(BooklistItem, Thread.thread_id == BooklistItem.thread_id)  # type: ignore
-                .where(BooklistItem.owner_id == user_id)
+                .where(
+                    (
+                        BooklistItem.fluxer_owner_id
+                        if uses_canonical_storage()
+                        else BooklistItem.owner_id
+                    )
+                    == user_id
+                )
                 .group_by(Thread.id)  # type: ignore
             )
             # 排序：按该帖子被加入任意书单的“最新时间”倒序
@@ -486,7 +566,14 @@ class CollectionRepository:
                         UserCollection.target_type == target_type,
                     ),
                 )
-                .where(UserCollection.user_id == user_id)
+                .where(
+                    (
+                        UserCollection.fluxer_user_id
+                        if uses_canonical_storage()
+                        else UserCollection.user_id
+                    )
+                    == user_id
+                )
             )
             # 排序：按收藏时间倒序
             sort_order = desc(UserCollection.created_at)
@@ -519,6 +606,7 @@ class CollectionRepository:
         Returns:
             一个包含已收藏目标ID的集合。
         """
+        user_id = await resolve_business_id(self.session, user_id)
         if not target_ids:
             return set()
 
@@ -526,7 +614,12 @@ class CollectionRepository:
             # 帖子类型，通过 owner_id 查询用户的所有书单项
             statement = select(BooklistItem.thread_id).where(
                 and_(
-                    BooklistItem.owner_id == user_id,
+                    (
+                        BooklistItem.fluxer_owner_id
+                        if uses_canonical_storage()
+                        else BooklistItem.owner_id
+                    )
+                    == user_id,
                     BooklistItem.thread_id.in_(target_ids),  # type: ignore
                 )
             )
@@ -536,7 +629,12 @@ class CollectionRepository:
             # 书单类型，查询 UserCollection
             statement = select(UserCollection.target_id).where(
                 and_(
-                    UserCollection.user_id == user_id,
+                    (
+                        UserCollection.fluxer_user_id
+                        if uses_canonical_storage()
+                        else UserCollection.user_id
+                    )
+                    == user_id,
                     UserCollection.target_type == target_type,
                     UserCollection.target_id.in_(target_ids),  # type: ignore
                 )

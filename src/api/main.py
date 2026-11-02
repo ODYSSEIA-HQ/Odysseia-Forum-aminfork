@@ -30,6 +30,7 @@ from api.v1.routers import (
 from shared.database import AsyncSessionFactory
 from shared.redis_client import RedisManager
 
+from api.v2.routers.works import router as work_v2_router
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +383,7 @@ async def debug_pools():
     }
 
 
+app.include_router(work_v2_router)
 app.include_router(auth.router, prefix="/v2")
 
 

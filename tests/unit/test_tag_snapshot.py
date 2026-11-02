@@ -63,6 +63,11 @@ class TestTagSnapshot(unittest.IsolatedAsyncioTestCase):
             func=func,
             hashlib=hashlib,
             load_discord_sources=load_sources,
+            is_fluxer_mode=lambda: False,
+            uses_canonical_storage=lambda: False,
+            resolve_business_id=AsyncMock(
+                side_effect=lambda _session, actor, **kwargs: actor
+            ),
         )
         root = Path(__file__).resolve().parents[2]
         tree = ast.parse(
@@ -85,6 +90,9 @@ class TestTagSnapshot(unittest.IsolatedAsyncioTestCase):
         service.repo = MagicMock(return_value=repository)
         service.tag_cache = {}
         service.source_cache = {}
+        service.logical_target = lambda model, kind, target: (
+            model.target_type == kind
+        ) & (model.target_id == target)
         service.tag_data = lambda value: {"id": str(value.id)}
         return service, models, session, database_native, history
 

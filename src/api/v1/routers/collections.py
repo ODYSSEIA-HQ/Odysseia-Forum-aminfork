@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from api.v1.dependencies.security import get_current_user
 from core.booklist_repository import BooklistRepository
+from identity.runtime import is_fluxer_mode
 from core.collection_repository import CollectionRepository
 from core.thread_repository import ThreadRepository
 from shared.database import AsyncSessionFactory
@@ -30,7 +31,9 @@ async def batch_add_collections(
     - target_type: 目标类型，1=帖子，2=书单，默认为1（帖子）
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = (
+            str(current_user["id"]) if is_fluxer_mode() else int(current_user["id"])
+        )
 
         async with AsyncSessionFactory() as session:
             collection_service = CollectionRepository(session)
@@ -87,7 +90,9 @@ async def batch_remove_collections(
     - target_type: 目标类型，1=帖子，2=书单，默认为1（帖子）
     """
     try:
-        user_id = int(current_user["id"])
+        user_id = (
+            str(current_user["id"]) if is_fluxer_mode() else int(current_user["id"])
+        )
 
         async with AsyncSessionFactory() as session:
             collection_service = CollectionRepository(session)

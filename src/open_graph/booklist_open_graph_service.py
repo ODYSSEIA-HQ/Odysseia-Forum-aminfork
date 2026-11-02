@@ -58,7 +58,7 @@ class BooklistOpenGraphService:
 
         # 非匿名书单单独查询作者；作者记录缺失时按契约返回 null。
         author_name: str | None = None
-        if not booklist.is_anonymous:
+        if not booklist.is_anonymous and booklist.owner_id is not None:
             async with self.session_factory() as session:
                 owner = await AuthorRepository(session).get_open_graph_author(
                     booklist.owner_id

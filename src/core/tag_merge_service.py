@@ -13,6 +13,8 @@ from models.tag_proposal_block import TagProposalBlock
 from models.tag_notification_task import TagNotificationTask
 from models.operation_log import OperationLog
 from shared.tag_error import TagError
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from shared.tag_rules import validate_graph
 from shared.time_utils import utc_now
 
@@ -123,6 +125,11 @@ class TagMergeService:
 
     async def execute(self, source_id, target_id, version, actor):
         """保持目标轮次、继承限制并软删除旧概念，不保存跳转字段。"""
+        canonical_actor = (
+            await resolve_business_id(self.session, actor)
+            if is_fluxer_mode() and actor
+            else None
+        )
         preview, source, target, data, edges = await self.inspect(source_id, target_id)
         if preview["version"] != version:
             raise TagError("stale_merge", "合并涉及的数据已变化，请刷新预检后重试")
@@ -158,6 +165,7 @@ class TagMergeService:
                     binding_source=old.binding_source,
                     discord_source_id=old.discord_source_id,
                     actor_id=actor,
+                    fluxer_actor_id=canonical_actor,
                 )
                 additions.append(existing)
             mapping.append((old, existing))
@@ -245,6 +253,7 @@ class TagMergeService:
                 OperationLog(
                     type="tag.binding.merge",
                     actor_id=actor,
+                    fluxer_actor_id=canonical_actor,
                     target_type=old.target_type,
                     target_id=old.target_id,
                     tag_id=target_id,
@@ -262,6 +271,7 @@ class TagMergeService:
             OperationLog(
                 type="tag.pool.merge",
                 actor_id=actor,
+                fluxer_actor_id=canonical_actor,
                 target_type="tag",
                 target_id=source_id,
                 tag_id=source_id,

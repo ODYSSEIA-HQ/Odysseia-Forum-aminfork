@@ -18,5 +18,8 @@ class ThreadPresentationContext:
     custom_tags: dict[int, list[CustomTagBindingResponse]] = field(default_factory=dict)
     """以内部帖子 ID 为键的当前本地标签列表，包含分类、绑定轮次及正负票数"""
 
+    author_profiles: dict[str, object] = field(default_factory=dict)
+    """统一作者资料，以 Fluxer ID 索引。"""
+
     native_tag_ids: dict[int, set[int]] = field(default_factory=dict)
     """按内部帖子 ID 保存当前只读绑定的标准标签 ID，不根据概念来源推断"""

@@ -7,6 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.v1.dependencies.security import get_current_user, require_auth
+from identity.runtime import is_fluxer_mode
+from identity.principal import current_identity_id, require_discord_id
+from identity.business_identity import resolve_business_id
 from api.v1.schemas.tags import TagStatsRequest, TagStatsResponse
 from tag.tag_statistics_service import TagStatisticsService
 from core.cache_service import CacheService
@@ -93,7 +96,18 @@ async def dispatch(action: str, user: dict[str, Any], **payload: Any) -> Any:
     if mediator is None:
         raise HTTPException(503, "标签服务尚未初始化")
     try:
-        return await mediator.request(TagCommand(action, int(user["id"]), payload))
+        actor_id = int(require_discord_id(user))
+        if is_fluxer_mode():
+            if async_session_factory is None:
+                raise HTTPException(503, "身份映射服务尚未初始化")
+            async with async_session_factory() as session:
+                try:
+                    projected_id = await resolve_business_id(session, actor_id)
+                except ValueError as exc:
+                    raise HTTPException(403, "Discord 身份映射尚未同步") from exc
+                if projected_id != current_identity_id(user):
+                    raise HTTPException(403, "Discord 身份映射尚未同步")
+        return await mediator.request(TagCommand(action, actor_id, payload))
     except TagError as exc:
         raise HTTPException(exc.status, exc.detail) from exc
 

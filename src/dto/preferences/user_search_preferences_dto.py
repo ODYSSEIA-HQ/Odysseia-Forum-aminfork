@@ -6,17 +6,17 @@ from pydantic import BaseModel, ConfigDict
 class UserSearchPreferencesDTO(BaseModel):
     """用于传输用户搜索偏好设置的数据传输对象。"""
 
-    user_id: int
+    user_id: int | str
     """用户ID"""
 
     preferred_channels: Optional[List[int]] = None
     """偏好的频道ID列表"""
 
     # 作者偏好
-    include_authors: Optional[List[int]] = None
+    include_authors: Optional[List[int | str]] = None
     """包含的作者ID列表"""
 
-    exclude_authors: Optional[List[int]] = None
+    exclude_authors: Optional[List[int | str]] = None
     """排除的作者ID列表"""
 
     # 标签偏好

@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.v1.dependencies.security import require_api_key
+from identity.runtime import is_fluxer_mode
+from identity.identity_repository import IdentityRepository
 from api.v1.schemas.base import PaginatedResponse
 from api.v1.utils import BooklistItemEnricher
 from api.v1.schemas.booklist import BooklistDetail, BooklistItemDetail
@@ -37,6 +39,9 @@ async def _fill_authors_for_booklists(
     session: Any, booklists: List[Any]
 ) -> Dict[int, Any]:
     """获取书单的作者映射（bot 场景不处理 Redis 过期队列）"""
+    if is_fluxer_mode():
+        owner_ids = {b.fluxer_owner_id for b in booklists if b.fluxer_owner_id}
+        return await IdentityRepository(session).profiles(owner_ids)
     owner_ids = list(set(b.owner_id for b in booklists if getattr(b, "owner_id", None)))
     if not owner_ids:
         return {}
@@ -58,6 +63,15 @@ def _apply_author_to_detail(
             global_name=None,
             display_name="匿名用户",
             avatar_url="https://cdn.discordapp.com/embed/avatars/0.png",
+        )
+    elif is_fluxer_mode() and booklist.fluxer_owner_id in author_map:
+        profile = author_map[booklist.fluxer_owner_id]
+        detail.author = AuthorDetail(
+            id=profile.id,
+            name=profile.username,
+            global_name=profile.display_name,
+            display_name=profile.display_name or profile.username,
+            avatar_url=profile.avatar_url,
         )
     elif booklist.owner_id in author_map:
         detail.author = AuthorDetail.model_validate(
@@ -150,7 +164,12 @@ async def list_tournaments(
 
             results = []
             for b in booklists:
-                detail = BooklistDetail.model_validate(b, from_attributes=True)
+                detail = BooklistDetail.model_validate(
+                    {**b.model_dump(), "owner_id": b.fluxer_owner_id}
+                    if is_fluxer_mode()
+                    else b,
+                    from_attributes=True,
+                )
                 _apply_author_to_detail(detail, b, author_map)
                 results.append(detail)
 
@@ -195,7 +214,12 @@ async def get_tournament(
                 )
 
             author_map = await _fill_authors_for_booklists(session, [booklist])
-            detail = BooklistDetail.model_validate(booklist, from_attributes=True)
+            detail = BooklistDetail.model_validate(
+                {**booklist.model_dump(), "owner_id": booklist.fluxer_owner_id}
+                if is_fluxer_mode()
+                else booklist,
+                from_attributes=True,
+            )
             _apply_author_to_detail(detail, booklist, author_map)
 
         return detail

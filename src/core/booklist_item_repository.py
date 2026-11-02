@@ -16,7 +16,8 @@ from core.booklist_sort_constants import (
     SORT_METHOD_COLUMN_MAP,
 )
 from dto.open_graph import OpenGraphWorkCandidateDTO
-from models import Author, Booklist, BooklistItem, Thread
+from models import Author, User, Booklist, BooklistItem, Thread
+from identity.runtime import uses_canonical_storage, is_fluxer_mode
 from shared.enum.search_config_type import SearchConfigDefaults
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class BooklistItemRepository:
             .where(
                 BooklistItem.booklist_id == booklist_id,
                 Thread.show_flag.is_(True),  # type: ignore[attr-defined]
-                Thread.not_found_count == 0,
+                Thread.deleted_at.is_(None),
             )
         )
         if excluded_channel_ids:
@@ -91,7 +92,7 @@ class BooklistItemRepository:
             .where(
                 BooklistItem.booklist_id == booklist_id,
                 Thread.show_flag.is_(True),  # type: ignore[attr-defined]
-                Thread.not_found_count == 0,
+                Thread.deleted_at.is_(None),
             )
             .order_by(
                 Thread.reaction_count.desc(),
@@ -130,7 +131,7 @@ class BooklistItemRepository:
                 BooklistItem.booklist_id == booklist_id,
                 Thread.thread_id.in_(unique_thread_ids),  # type: ignore[attr-defined]
                 Thread.show_flag.is_(True),  # type: ignore[attr-defined]
-                Thread.not_found_count == 0,
+                Thread.deleted_at.is_(None),
             )
         )
         if excluded_channel_ids:
@@ -182,10 +183,14 @@ class BooklistItemRepository:
         """
         获取单个书单项的详细信息
         """
+        profile_model = User if uses_canonical_storage() else Author
+        author_column = (
+            Thread.fluxer_author_id if uses_canonical_storage() else Thread.author_id
+        )
         query = (
-            select(BooklistItem, Thread, Author)
+            select(BooklistItem, Thread, profile_model)
             .join(Thread, BooklistItem.thread_id == Thread.thread_id)  # type: ignore
-            .join(Author, Thread.author_id == Author.id)  # type: ignore
+            .join(profile_model, author_column == profile_model.id)  # type: ignore
             .where(
                 and_(
                     BooklistItem.booklist_id == booklist_id,
@@ -201,7 +206,17 @@ class BooklistItemRepository:
             return None
 
         item, thread, author = row
-        author_detail = AuthorDetail.model_validate(author)
+        author_detail = (
+            AuthorDetail(
+                id=author.id if is_fluxer_mode() else thread.author_id,
+                name=author.username,
+                global_name=author.display_name,
+                display_name=author.display_name or author.username,
+                avatar_url=author.avatar_url,
+            )
+            if uses_canonical_storage()
+            else AuthorDetail.model_validate(author)
+        )
         item_detail = BooklistItemDetail(
             booklist_item_id=item.id,
             thread_id=thread.thread_id,
@@ -301,10 +316,14 @@ class BooklistItemRepository:
         分页获取书单内的帖子详情，并根据书单的默认排序方式排序
         """
 
+        profile_model = User if uses_canonical_storage() else Author
+        author_column = (
+            Thread.fluxer_author_id if uses_canonical_storage() else Thread.author_id
+        )
         base_query = (
-            select(BooklistItem, Thread, Author)
+            select(BooklistItem, Thread, profile_model)
             .join(Thread, BooklistItem.thread_id == Thread.thread_id)  # type: ignore
-            .join(Author, Thread.author_id == Author.id)  # type: ignore
+            .join(profile_model, author_column == profile_model.id)  # type: ignore
             .where(BooklistItem.booklist_id == booklist_id)  # type: ignore
             .options(selectinload(Thread.tags))  # type: ignore
         )
@@ -326,7 +345,17 @@ class BooklistItemRepository:
 
         items = []
         for item, thread, author in rows:
-            author_detail = AuthorDetail.model_validate(author)
+            author_detail = (
+                AuthorDetail(
+                    id=author.id if is_fluxer_mode() else thread.author_id,
+                    name=author.username,
+                    global_name=author.display_name,
+                    display_name=author.display_name or author.username,
+                    avatar_url=author.avatar_url,
+                )
+                if uses_canonical_storage()
+                else AuthorDetail.model_validate(author)
+            )
             item_detail = BooklistItemDetail(
                 booklist_item_id=item.id,
                 thread_id=thread.thread_id,

@@ -42,20 +42,70 @@ def tag_filters(
 ) -> list[ColumnElement[bool]]:
     """按统一内部 ID 筛选目标实际绑定的原生和自定义标签。"""
 
+    target_work_id = None
+    if kind == "thread":
+        from models.thread import Thread
+        from sqlalchemy.orm import aliased
+
+        source_thread = aliased(Thread)
+        target_work_id = (
+            select(source_thread.work_id)
+            .where(source_thread.id == target_column)
+            .correlate_except(source_thread)
+            .scalar_subquery()
+        )
+
     def matches(ids: Sequence[int]) -> ColumnElement[bool]:
         """合并同一批 ID 在两类绑定中的命中结果。"""
         custom = (
             select(col(TagBinding.id))
             .join(Tag, col(Tag.id) == col(TagBinding.tag_id))
             .where(
-                col(TagBinding.target_type) == kind,
-                col(TagBinding.target_id) == target_column,
+                or_(
+                    and_(
+                        col(TagBinding.target_type) == kind,
+                        col(TagBinding.target_id) == target_column,
+                    ),
+                    col(TagBinding.work_id) == target_column,
+                )
+                if kind == "work"
+                else or_(
+                    and_(
+                        col(TagBinding.target_type) == kind,
+                        col(TagBinding.target_id) == target_column,
+                    ),
+                    col(TagBinding.work_id) == target_work_id,
+                )
+                if kind == "thread"
+                else and_(
+                    col(TagBinding.target_type) == kind,
+                    col(TagBinding.target_id) == target_column,
+                ),
                 col(TagBinding.ended_at).is_(None),
                 col(Tag.deleted_at).is_(None),
                 col(Tag.id).in_(ids),
             )
             .exists()
         )
+        if kind == "work":
+            from models.work_native_tag_binding import WorkNativeTagBinding
+            from models.work_native_tag_source import WorkNativeTagSource
+
+            native = (
+                select(WorkNativeTagBinding.work_id)
+                .join(
+                    WorkNativeTagSource,
+                    WorkNativeTagSource.id == WorkNativeTagBinding.source_id,
+                )
+                .join(Tag, Tag.id == WorkNativeTagSource.tag_id)
+                .where(
+                    WorkNativeTagBinding.work_id == target_column,
+                    Tag.id.in_(ids),
+                    Tag.deleted_at.is_(None),
+                )
+                .exists()
+            )
+            return or_(custom, native)
         return custom
 
     conditions: list[ColumnElement[bool]] = []

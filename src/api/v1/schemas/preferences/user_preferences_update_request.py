@@ -1,6 +1,7 @@
 from typing import List, Optional, Union, Any
 
 from pydantic import BaseModel, Field, field_validator
+from identity.runtime import is_fluxer_mode
 
 
 class UserPreferencesUpdateRequest(BaseModel):
@@ -129,9 +130,15 @@ class UserPreferencesUpdateRequest(BaseModel):
             raise ValueError("网页端每页结果数量不能大于100")
         return v
 
-    @field_validator(
-        "preferred_channels", "include_authors", "exclude_authors", mode="before"
-    )
+    @field_validator("include_authors", "exclude_authors", mode="before")
+    @classmethod
+    def convert_author_ids(cls, values: Any) -> Any:
+        """统一身份以字符串保存，旧模式保留 Discord 数值。"""
+        if values is None:
+            return None
+        return [str(value) if is_fluxer_mode() else int(value) for value in values]
+
+    @field_validator("preferred_channels", mode="before")
     @classmethod
     def convert_ids_to_int(cls, v: Any) -> Any:
         """

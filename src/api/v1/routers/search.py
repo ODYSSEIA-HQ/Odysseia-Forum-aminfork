@@ -1,3 +1,6 @@
+from search.search_preferences import (
+    merge_search_preferences as _merge_user_preferences,
+)
 from shared.tag_error import TagError
 from shared.abyss_tag_visibility import can_view_abyss_tags
 from core.tag_presentation import load_discord_sources, tag_data
@@ -34,13 +37,14 @@ from core.preferences_repository import PreferencesRepository
 from core.tag_cache_service import TagCacheService
 from core.thread_repository import ThreadRepository
 from core.thread_presentation_service import ThreadPresentationService
-from dto.preferences import UserSearchPreferencesDTO
 from dto.search import SearchConfigDTO
 from search.qo.thread_search import ThreadSearchQuery
 from search.search_service import SearchService
 from search.similar_threads_busy_error import SimilarThreadsBusyError
 from search.similar_threads_cache_service import SimilarThreadsCacheService
 from search.suggestion_service import SuggestionService
+from identity.runtime import is_fluxer_mode
+from identity.principal import current_identity_id
 from shared.enum import AbyssDefaults, CollectionType, SearchTimeout
 from shared.channel_mapping_utils import ChannelMappingUtils
 from shared.keyword_parser import parse_search_keywords
@@ -96,7 +100,11 @@ async def execute_search(
             detail="Search 服务尚未初始化",
         )
 
-    user_id = int(current_user["id"]) if current_user and "id" in current_user else None
+    user_id = (
+        current_identity_id(current_user)
+        if current_user and "id" in current_user
+        else None
+    )
 
     # [深渊区权限判断] 读取用户身份组，判断是否需要屏蔽深渊区频道
     user_roles = current_user.get("roles", []) if current_user else []
@@ -149,7 +157,7 @@ async def execute_search(
     # 处理收藏搜索：仅在启用收藏搜索且用户已登录时返回用户ID
     user_id_for_collection_search = None
     if request.search_by_collection and current_user and "id" in current_user:
-        user_id_for_collection_search = int(current_user["id"])
+        user_id_for_collection_search = current_identity_id(current_user)
 
     # 处理频道映射虚拟标签，解析实际搜索的频道ID和标签
     all_indexed_channels = cache_service_instance.get_indexed_channel_ids_list()
@@ -226,7 +234,7 @@ async def execute_search(
 
             # 获取当前用户ID用于后续收藏状态查询
             user_id = (
-                int(current_user["id"])
+                current_identity_id(current_user)
                 if current_user and "id" in current_user
                 else None
             )
@@ -355,7 +363,11 @@ async def get_thread_detail(
             detail="Search 服务尚未初始化",
         )
 
-    user_id = int(current_user["id"]) if current_user and "id" in current_user else None
+    user_id = (
+        current_identity_id(current_user)
+        if current_user and "id" in current_user
+        else None
+    )
 
     try:
         async with async_session_factory() as session:
@@ -446,7 +458,11 @@ async def get_similar_threads(
             detail="Search 服务尚未初始化",
         )
 
-    user_id = int(current_user["id"]) if current_user and "id" in current_user else None
+    user_id = (
+        current_identity_id(current_user)
+        if current_user and "id" in current_user
+        else None
+    )
 
     # [深渊区权限判断] 读取用户身份组，屏蔽无权限查看的深渊区频道
     user_roles = current_user.get("roles", []) if current_user else []
@@ -594,7 +610,11 @@ async def get_search_suggestions(
             detail="服务尚未初始化",
         )
 
-    user_id = int(current_user["id"]) if current_user and "id" in current_user else None
+    user_id = (
+        current_identity_id(current_user)
+        if current_user and "id" in current_user
+        else None
+    )
 
     exclude_authors = None
     exclude_keywords = None
@@ -636,8 +656,10 @@ async def get_search_suggestions(
                 authors=[
                     AuthorSuggestion(
                         id=a.id,
-                        name=a.name,
-                        display_name=a.display_name,
+                        name=a.username if is_fluxer_mode() else a.name,
+                        display_name=(a.display_name or a.username)
+                        if is_fluxer_mode()
+                        else a.display_name,
                         avatar_url=a.avatar_url,
                     )
                     for a in raw_data.authors
@@ -677,42 +699,6 @@ async def get_search_suggestions(
 # -------------------------
 # 辅助方法
 # -------------------------
-
-
-def _merge_user_preferences(request: SearchRequest, prefs: UserSearchPreferencesDTO):
-    """
-    将用户偏好合并到搜索请求中。
-    原则：仅当前端未显示传递（未出现在 unset 列表中）
-    且偏好有值时，才使用偏好值覆盖。
-    """
-    # 获取前端明确传递的字段集合
-    explicit_fields = request.model_dump(exclude_unset=True)
-
-    # 映射表: 偏好字段名 -> 请求对象字段名
-    mapping = {
-        "preferred_channels": "channel_ids",
-        "include_authors": "include_authors",
-        "exclude_authors": "exclude_authors",
-        "include_tags": "include_tags",
-        "exclude_tags": "exclude_tags",
-        "include_keywords": "keywords",
-        "exclude_keywords": "exclude_keywords",
-        "exclude_keyword_exemption_markers": ("exclude_keyword_exemption_markers"),
-        "sort_method": "sort_method",
-        "custom_base_sort": "custom_base_sort",
-        "created_after": "created_after",
-        "created_before": "created_before",
-        "active_after": "active_after",
-        "active_before": "active_before",
-    }
-
-    for pref_key, req_key in mapping.items():
-        # 如果前端没传这个参数
-        if req_key not in explicit_fields:
-            pref_value = getattr(prefs, pref_key, None)
-            # 如果偏好设置中有非空有效值，则覆盖默认值
-            if pref_value is not None and pref_value != "":
-                setattr(request, req_key, pref_value)
 
 
 async def _perform_search_and_update_counts(

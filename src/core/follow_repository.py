@@ -1,8 +1,12 @@
+from identity.business_identity import discord_id_for_business_id
+from identity.identity_repository import IdentityRepository
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import and_, func, select, update
+from identity.runtime import uses_canonical_storage
+from identity.business_identity import resolve_business_id, resolve_business_ids
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col
 
@@ -34,11 +38,18 @@ class ThreadFollowRepository:
         Returns:
             是否成功添加/重新激活（已存在且活跃时返回False）
         """
+        user_id = await resolve_business_id(self.session, user_id)
+        legacy_discord_id = await discord_id_for_business_id(self.session, user_id)
         try:
             # 检查是否已有记录（无论活跃与否）
             statement = select(ThreadFollow).where(
                 and_(
-                    ThreadFollow.user_id == user_id,  # type: ignore
+                    (
+                        ThreadFollow.fluxer_user_id
+                        if uses_canonical_storage()
+                        else ThreadFollow.user_id
+                    )
+                    == user_id,  # type: ignore
                     ThreadFollow.thread_id == thread_id,  # type: ignore
                 )
             )
@@ -62,7 +73,8 @@ class ThreadFollowRepository:
 
             # 创建关注记录
             follow = ThreadFollow(
-                user_id=user_id,
+                user_id=legacy_discord_id,
+                fluxer_user_id=str(user_id) if uses_canonical_storage() else None,
                 thread_id=thread_id,
                 followed_at=now,
                 last_viewed_at=now if auto_view else None,
@@ -91,6 +103,7 @@ class ThreadFollowRepository:
         Returns:
             成功添加/重新激活的数量
         """
+        user_ids = await resolve_business_ids(self.session, user_ids)
         if not user_ids:
             return 0
 
@@ -99,13 +112,20 @@ class ThreadFollowRepository:
             statement = select(ThreadFollow).where(
                 and_(
                     ThreadFollow.thread_id == thread_id,  # type: ignore[arg-type]
-                    col(ThreadFollow.user_id).in_(user_ids),
+                    col(
+                        ThreadFollow.fluxer_user_id
+                        if uses_canonical_storage()
+                        else ThreadFollow.user_id
+                    ).in_(user_ids),
                 )
             )
             result = await self.session.execute(statement)
             existing_follows = result.scalars().all()
 
-            existing_map = {f.user_id: f for f in existing_follows}
+            existing_map = {
+                (f.fluxer_user_id if uses_canonical_storage() else f.user_id): f
+                for f in existing_follows
+            }
             now = datetime.now(timezone.utc).replace(tzinfo=None)
 
             # 重新激活非活跃的已有记录
@@ -122,9 +142,25 @@ class ThreadFollowRepository:
 
             # 批量创建新关注记录
             if new_user_ids:
+                discord_ids = (
+                    await IdentityRepository(self.session).fluxer_to_discord(
+                        new_user_ids
+                    )
+                    if uses_canonical_storage()
+                    else {}
+                )
                 follows = [
                     ThreadFollow(
-                        user_id=user_id,
+                        user_id=(
+                            int(discord_ids[str(user_id)])
+                            if str(user_id) in discord_ids
+                            else None
+                        )
+                        if uses_canonical_storage()
+                        else user_id,
+                        fluxer_user_id=str(user_id)
+                        if uses_canonical_storage()
+                        else None,
                         thread_id=thread_id,
                         followed_at=now,
                         last_viewed_at=None,  # 首次添加时不标记为已查看
@@ -159,13 +195,19 @@ class ThreadFollowRepository:
         Returns:
             是否成功取消
         """
+        user_id = await resolve_business_id(self.session, user_id)
         try:
             # 仅标记活跃关注为非活跃，已非活跃的不重复操作
             stmt = (
                 update(ThreadFollow)
                 .where(
                     and_(
-                        ThreadFollow.user_id == user_id,  # type: ignore[arg-type]
+                        (
+                            ThreadFollow.fluxer_user_id
+                            if uses_canonical_storage()
+                            else ThreadFollow.user_id
+                        )
+                        == user_id,  # type: ignore[arg-type]
                         ThreadFollow.thread_id == thread_id,  # type: ignore[arg-type]
                         ThreadFollow.active_flag,  # type: ignore[arg-type]
                     )
@@ -198,6 +240,7 @@ class ThreadFollowRepository:
         Returns:
             受影响的行数
         """
+        user_ids = await resolve_business_ids(self.session, user_ids)
         if not user_ids:
             return 0
 
@@ -207,7 +250,11 @@ class ThreadFollowRepository:
                 .where(
                     and_(
                         ThreadFollow.thread_id == thread_id,  # type: ignore[arg-type]
-                        col(ThreadFollow.user_id).in_(user_ids),
+                        col(
+                            ThreadFollow.fluxer_user_id
+                            if uses_canonical_storage()
+                            else ThreadFollow.user_id
+                        ).in_(user_ids),
                         ThreadFollow.active_flag,  # type: ignore[arg-type]
                     )
                 )
@@ -238,6 +285,7 @@ class ThreadFollowRepository:
         Returns:
             是否成功更新
         """
+        user_id = await resolve_business_id(self.session, user_id)
         try:
             now = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -245,7 +293,12 @@ class ThreadFollowRepository:
                 # 更新单个帖子
                 statement = select(ThreadFollow).where(
                     and_(
-                        ThreadFollow.user_id == user_id,  # type: ignore
+                        (
+                            ThreadFollow.fluxer_user_id
+                            if uses_canonical_storage()
+                            else ThreadFollow.user_id
+                        )
+                        == user_id,  # type: ignore
                         ThreadFollow.thread_id == thread_id,  # type: ignore
                     )
                 )
@@ -263,7 +316,14 @@ class ThreadFollowRepository:
                     return False
             else:
                 # 更新所有关注
-                statement = select(ThreadFollow).where(ThreadFollow.user_id == user_id)  # type: ignore
+                statement = select(ThreadFollow).where(
+                    (
+                        ThreadFollow.fluxer_user_id
+                        if uses_canonical_storage()
+                        else ThreadFollow.user_id
+                    )
+                    == user_id
+                )  # type: ignore
                 result = await self.session.execute(statement)
                 follows = result.scalars().all()
 
@@ -301,6 +361,7 @@ class ThreadFollowRepository:
         Returns:
             (帖子列表, 总数)
         """
+        user_id = await resolve_business_id(self.session, user_id)
         try:
             # 构建查询，使用selectinload加载tags，joinedload加载author
             from sqlalchemy.orm import joinedload, selectinload
@@ -308,7 +369,14 @@ class ThreadFollowRepository:
             statement = (
                 select(Thread, ThreadFollow)
                 .join(ThreadFollow, Thread.thread_id == ThreadFollow.thread_id)  # type: ignore[arg-type]
-                .where(ThreadFollow.user_id == user_id)  # type: ignore[arg-type]
+                .where(
+                    (
+                        ThreadFollow.fluxer_user_id
+                        if uses_canonical_storage()
+                        else ThreadFollow.user_id
+                    )
+                    == user_id
+                )  # type: ignore[arg-type]
                 .options(
                     selectinload(Thread.tags),  # type: ignore[arg-type]
                     joinedload(Thread.author),  # type: ignore[arg-type]
@@ -331,7 +399,14 @@ class ThreadFollowRepository:
             count_statement = (
                 select(func.count())
                 .select_from(ThreadFollow)
-                .where(ThreadFollow.user_id == user_id)  # type: ignore[arg-type]
+                .where(
+                    (
+                        ThreadFollow.fluxer_user_id
+                        if uses_canonical_storage()
+                        else ThreadFollow.user_id
+                    )
+                    == user_id
+                )  # type: ignore[arg-type]
             )
             if active_flag is not None:
                 count_statement = count_statement.where(
@@ -375,6 +450,7 @@ class ThreadFollowRepository:
         Returns:
             未读更新数量
         """
+        user_id = await resolve_business_id(self.session, user_id)
         try:
             # 查询有更新且未查看的帖子数量，仅活跃关注
             statement = (
@@ -383,7 +459,12 @@ class ThreadFollowRepository:
                 .join(Thread, ThreadFollow.thread_id == Thread.thread_id)  # type: ignore[arg-type]
                 .where(
                     and_(
-                        ThreadFollow.user_id == user_id,  # type: ignore[arg-type]
+                        (
+                            ThreadFollow.fluxer_user_id
+                            if uses_canonical_storage()
+                            else ThreadFollow.user_id
+                        )
+                        == user_id,  # type: ignore[arg-type]
                         ThreadFollow.active_flag,  # type: ignore[arg-type]
                         Thread.latest_update_at.isnot(None),  # type: ignore[attr-defined]
                         # 未查看 或 更新时间晚于查看时间
@@ -418,9 +499,15 @@ class ThreadFollowRepository:
         Returns:
             是否关注
         """
+        user_id = await resolve_business_id(self.session, user_id)
         try:
             conditions = [
-                ThreadFollow.user_id == user_id,  # type: ignore[arg-type]
+                (
+                    ThreadFollow.fluxer_user_id
+                    if uses_canonical_storage()
+                    else ThreadFollow.user_id
+                )
+                == user_id,  # type: ignore[arg-type]
                 ThreadFollow.thread_id == thread_id,  # type: ignore[arg-type]
             ]
             if active_only:

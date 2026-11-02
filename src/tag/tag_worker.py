@@ -8,6 +8,8 @@ from core.tag_data_repository import TagDataRepository
 from models import Notification, Thread
 from models.tag_notification_task import TagNotificationTask
 from models.tag_proposal import TagProposal
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from shared.tag_error import TagError
 from shared.time_utils import utc_now
 from tag.custom_tag_service import CustomTagService
@@ -137,16 +139,36 @@ class TagWorker:
             )
             task.attempts += 1
             try:
-                delivered = await send(notice)
+                if is_fluxer_mode() and not proposal.fluxer_owner_id:
+                    raise ValueError("标签申请目标作者尚未映射")
+                can_send_discord = bool(proposal.owner_id)
+                if is_fluxer_mode() and can_send_discord:
+                    can_send_discord = (
+                        await resolve_business_id(session, proposal.owner_id)
+                        == proposal.fluxer_owner_id
+                    )
+                delivered = await send(notice) if can_send_discord else False
                 if not delivered:
                     existing = await TagDataRepository(session, Notification).one(
-                        Notification.user_id == proposal.owner_id,
+                        (
+                            Notification.fluxer_user_id
+                            if is_fluxer_mode()
+                            else Notification.user_id
+                        )
+                        == (
+                            proposal.fluxer_owner_id
+                            if is_fluxer_mode()
+                            else proposal.owner_id
+                        ),
                         Notification.event_type == "tag_review",
                         Notification.event_source_id == proposal.id,
                     )
                     if existing is None:
                         await TagDataRepository(session, Notification).add(
                             user_id=proposal.owner_id,
+                            fluxer_user_id=proposal.fluxer_owner_id
+                            if is_fluxer_mode()
+                            else None,
                             event_type="tag_review",
                             event_source_id=proposal.id,
                             target_type=proposal.target_type,
