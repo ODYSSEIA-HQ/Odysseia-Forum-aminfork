@@ -72,6 +72,19 @@ class WorkTaskWorker:
                 )
                 .exists()
             )
+            # 同帖较早编辑仍可重试时，不让新编辑越过旧任务。
+            blocked_edit = (
+                select(earlier.id)
+                .where(
+                    earlier.work_id == WorkTask.work_id,
+                    earlier.kind == "edit_thread",
+                    earlier.id < WorkTask.id,
+                    earlier.payload["thread_id"].as_string()
+                    == WorkTask.payload["thread_id"].as_string(),
+                    earlier.status.in_(["pending", "running"]),
+                )
+                .exists()
+            )
             task = (
                 (
                     await session.execute(
@@ -89,6 +102,7 @@ class WorkTaskWorker:
                             )
                         )
                         .where(or_(WorkTask.kind != "move", ~blocked_move))
+                        .where(or_(WorkTask.kind != "edit_thread", ~blocked_edit))
                         .order_by(WorkTask.id)
                         .with_for_update(skip_locked=True)
                         .limit(1)
