@@ -2,7 +2,8 @@
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from fastapi import HTTPException
 from sqlalchemy import select, or_, and_, update, func, text
 from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import insert
@@ -72,7 +73,7 @@ class WorkTaskWorker:
                 )
                 .exists()
             )
-            # 同帖较早编辑仍可重试时，不让新编辑越过旧任务。
+            # 同帖较早编辑仍可能重试时，不允许较新编辑先执行再被旧值覆盖。
             blocked_edit = (
                 select(earlier.id)
                 .where(
@@ -130,7 +131,8 @@ class WorkTaskWorker:
                     task.error = "SUPERSEDED"
                     await session.commit()
                     return True
-            if task.dispatched_at is None:
+            already_dispatched = task.dispatched_at is not None
+            if task.dispatched_at is None and task.kind != "create_child":
                 task.dispatched_at = now
             task.status = "running"
             task.attempts += 1
@@ -142,6 +144,8 @@ class WorkTaskWorker:
             attempt = task.attempts
             await session.commit()
         try:
+            if kind == "create_child" and not already_dispatched:
+                payload = await self.prepare_child_dispatch(identifier, work_id, attempt)
             result = await self.execute(identifier, work_id, kind, payload)
             async with self.sessions() as session:
                 task = await session.get(WorkTask, identifier, with_for_update=True)
@@ -174,6 +178,122 @@ class WorkTaskWorker:
                     )
                     await session.commit()
         return True
+
+    async def prepare_child_dispatch(self, identifier, work_id, attempt):
+        """首发采用最新分类，原子持久化目标及发送标记后才允许原生创建。"""
+        from api.v2.config import get_work_config
+        from identity.integration_rpc_error import IntegrationRpcError
+        from models.discord_identity import DiscordIdentity
+        from shared.abyss_tag_visibility import can_view_abyss_tags
+        from work.work_permission_service import WorkPermissionService
+        from work.work_moderation_service import WorkModerationService
+
+        config = get_work_config()
+        async with self.sessions() as session:
+            task = await session.get(WorkTask, identifier)
+            current = await session.get(Work, work_id)
+            if current is None or current.deleted_at or not current.source_visible:
+                raise IntegrationRpcError("CHILD_WORK_UNAVAILABLE", False)
+            revision = current.classification_revision
+            abyss = current.is_abyss
+            if current.source_platform == "discord" and config.get("abyss") is not None:
+                abyss = current.source_channel_id in {
+                    str(value) for value in config["abyss"].get("channel_ids", [])
+                }
+            classification = (revision, current.is_nsfw, abyss, current.source_channel_id)
+            key = ("abyss" if abyss else "normal") + ("_nsfw" if current.is_nsfw else "")
+            forums = config.get("work_forums", {})
+            target, guild = forums.get(key), forums.get("guild_id")
+            actor_id = task.payload["actor_id"]
+            binding = (
+                await session.execute(
+                    select(DiscordIdentity.discord_user_id, DiscordIdentity.version).where(
+                        DiscordIdentity.user_id == actor_id,
+                        DiscordIdentity.is_current.is_(True),
+                    )
+                )
+            ).one_or_none()
+            if binding is None:
+                raise IntegrationRpcError("CHILD_ACTOR_INELIGIBLE", False)
+            discord_id, binding_version = binding
+        if not target or not guild:
+            raise IntegrationRpcError("CHILD_TARGET_UNAVAILABLE", True)
+        if not await get_auth_service().legacy_eligibility(
+            discord_id, actor_id, binding_version, force_authority=True
+        ):
+            raise IntegrationRpcError("CHILD_ACTOR_INELIGIBLE", False)
+        # 在数据库事务之外核验当前资格，不冒用管理身份进入受限分类。
+        permissions = WorkPermissionService(config)
+        try:
+            try:
+                member = await permissions.member(actor_id, discord_id, binding_version, sensitive=True)
+            except HTTPException as exc:
+                if exc.status_code == 403:
+                    raise IntegrationRpcError("CHILD_ACTOR_INELIGIBLE", False) from exc
+                raise
+        finally:
+            await permissions.close()
+        roles = {str(value) for value in member["roles"]}
+        required = config.get("auth", {}).get("role_ids", [])
+        required = required.split(",") if isinstance(required, str) else required
+        if not roles.intersection(str(value).strip() for value in required) or (
+            abyss and not can_view_abyss_tags(roles, config.get("abyss"))
+        ):
+            raise IntegrationRpcError("CHILD_ACTOR_INELIGIBLE", False)
+        deadline = member.get("communication_disabled_until")
+        try:
+            muted = bool(deadline) and datetime.fromisoformat(deadline.replace("Z", "+00:00")) > datetime.now(timezone.utc)
+        except (ValueError, TypeError) as exc:
+            raise IntegrationRpcError("CHILD_ACTOR_STATE_UNKNOWN", True) from exc
+        async with self.sessions() as session:
+            # 与身份投影、任务结果及帖子触发器保持一致锁序，避免等待期间换绑。
+            for key in ("identity-merge:" + actor_id, "binding:" + actor_id):
+                await session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"), {"key": key})
+            latest_binding = (
+                await session.execute(
+                    select(DiscordIdentity.discord_user_id, DiscordIdentity.version).where(
+                        DiscordIdentity.user_id == actor_id,
+                        DiscordIdentity.is_current.is_(True),
+                    ).with_for_update()
+                )
+            ).one_or_none()
+            if latest_binding is None or tuple(latest_binding) != (discord_id, binding_version):
+                raise IntegrationRpcError("CHILD_BINDING_CHANGED", True)
+            task = await session.get(WorkTask, identifier, with_for_update=True)
+            if task.status != "running" or task.attempts != attempt or task.dispatched_at is not None:
+                raise IntegrationRpcError("CHILD_LEASE_CHANGED", True)
+            await session.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": work_id})
+            main = (
+                await session.execute(
+                    select(Thread).where(Thread.work_id == work_id, Thread.role == "main").with_for_update()
+                )
+            ).scalars().first()
+            current = await session.get(Work, work_id, populate_existing=True, with_for_update=True)
+            latest_abyss = current.is_abyss
+            if current.source_platform == "discord" and config.get("abyss") is not None:
+                latest_abyss = current.source_channel_id in {
+                    str(value) for value in config["abyss"].get("channel_ids", [])
+                }
+            latest_classification = (
+                current.classification_revision, current.is_nsfw, latest_abyss, current.source_channel_id
+            )
+            if latest_classification != classification:
+                raise IntegrationRpcError("CHILD_CLASSIFICATION_CHANGED", True)
+            if current.deleted_at or not current.source_visible:
+                raise IntegrationRpcError("CHILD_WORK_UNAVAILABLE", False)
+            if main is None or main.deleted_at or main.archived or main.archive_owner_ids or main.lock_owner_ids or main.platform_locked:
+                raise IntegrationRpcError("CHILD_MAIN_UNAVAILABLE", False)
+            try:
+                await WorkModerationService(session).require_speech(current, {"id": actor_id, "can_speak": not muted})
+            except HTTPException as exc:
+                if exc.status_code == 403:
+                    raise IntegrationRpcError("CHILD_ACTOR_INELIGIBLE", False) from exc
+                raise
+            task.payload = {**task.payload, "guild_id": str(guild), "channel_id": str(target), "classification_revision": revision}
+            task.dispatched_at = utc_now()
+            payload = dict(task.payload)
+            await session.commit()
+            return payload
 
     async def execute(self, identifier, work_id, kind, payload):
         """以持久任务编号作为平台幂等键，不写入用户会话。"""
@@ -362,6 +482,8 @@ class WorkTaskWorker:
                 )
             )
         elif task.kind in ("create_main", "create_child"):
+            # 先串行作品，再写会触发作品投影的帖子，避免与分类事务反序等待。
+            await session.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": task.work_id})
             payload = task.payload
             external = int(result["thread_id"])
             existing = (
