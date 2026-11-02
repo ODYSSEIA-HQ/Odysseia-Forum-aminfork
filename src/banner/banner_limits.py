@@ -1,0 +1,5 @@
+"""各协议共享的真实轮播容量和展示时长。"""
+
+GLOBAL_MAX_BANNERS = 3
+CHANNEL_MAX_BANNERS = 8
+BANNER_DURATION_DAYS = 3

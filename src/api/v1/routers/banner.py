@@ -9,6 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.v1.dependencies.security import get_current_user, require_auth
+from identity.principal import current_identity_id, require_discord_id
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from api.v1.schemas.banner import (
     BannerApplicationRequest,
     BannerApplicationResponse,
@@ -96,7 +99,7 @@ async def apply_banner(
         )
     guild_id, target_id = parsed
 
-    user_id = int(current_user.get("id", 0))
+    user_id = int(require_discord_id(current_user))
 
     # 创建 ChannelSyncService（如果有 bot_token）
     channel_sync = None
@@ -105,6 +108,13 @@ async def apply_banner(
 
     try:
         async with async_session_factory() as session:
+            if is_fluxer_mode() and await resolve_business_id(
+                session, user_id, source="discord"
+            ) != current_identity_id(current_user):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Discord 身份映射尚未同步",
+                )
             service = BannerService(session, channel_sync=channel_sync)
             result = await service.validate_and_create_application(
                 target_id=target_id,
@@ -141,6 +151,8 @@ async def apply_banner(
                 application_id=application.id if application else None,
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"处理Banner申请时出错: {e}", exc_info=True)
         return BannerApplicationResponse(
@@ -177,7 +189,7 @@ async def get_active_banners(
         async with async_session_factory() as session:
             service = BannerService(session)
             # 加载用户搜索偏好，失败时仅跳过偏好项。
-            user_id = int(current_user.get("id", 0)) if current_user else 0
+            user_id = current_identity_id(current_user) if current_user else None
             prefs = None
             redis_client = None
             if user_id:
@@ -200,16 +212,22 @@ async def get_active_banners(
             # 频道目标按轮播标题快照过滤，避免同目标不同范围的标题互相影响。
             excluded_banner_ids: set[int] = set()
             if prefs and prefs.exclude_keywords:
-                excluded_banner_ids = await BannerTitleFilterRepository(session).get_excluded_ids(
+                excluded_banner_ids = await BannerTitleFilterRepository(
+                    session
+                ).get_excluded_ids(
                     titles={
-                        banner.id: banner.title for banner in banners
-                        if banner.target_type == TargetType.CHANNEL.value and banner.id is not None
+                        banner.id: banner.title
+                        for banner in banners
+                        if banner.target_type == TargetType.CHANNEL.value
+                        and banner.id is not None
                     },
                     exclude_keywords=prefs.exclude_keywords,
                     exemption_markers=prefs.exclude_keyword_exemption_markers,
                     redis_client=redis_client,
                 )
-            banners = [banner for banner in banners if banner.id not in excluded_banner_ids]
+            banners = [
+                banner for banner in banners if banner.id not in excluded_banner_ids
+            ]
 
             # 批量筛选帖子 Banner，并同时取得其服务器 ID。
             thread_tids = [
@@ -275,8 +293,12 @@ async def get_active_banners(
                     end_time=banner.end_time,
                 )
                 for banner in banners
-                if banner.target_type != TargetType.THREAD.value
-                or banner.thread_id in allowed_thread_guilds
+                if banner.target_type
+                in (TargetType.THREAD.value, TargetType.CHANNEL.value)
+                and (
+                    banner.target_type != TargetType.THREAD.value
+                    or banner.thread_id in allowed_thread_guilds
+                )
             ]
     except Exception as e:
         logger.error(f"获取Banner列表时出错: {e}", exc_info=True)

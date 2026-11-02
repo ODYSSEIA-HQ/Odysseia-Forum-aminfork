@@ -84,7 +84,7 @@ async def test_status_uses_two_queries_and_detached_dtos(configured_count):
         assert scopes[0].waiting_count == 2
         assert scopes[0].capacity == 3
         assert scopes[1].waiting_count == 1
-        assert scopes[1].capacity == 3
+        assert scopes[1].capacity == 8
         assert [i.target_id for i in scopes[1].items] == [200]
         assert scopes[-2].waiting_count == 1 and not scopes[-2].items
         assert scopes[-1].waiting_count == 0

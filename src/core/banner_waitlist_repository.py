@@ -1,11 +1,13 @@
-from datetime import datetime
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from typing import List, Optional, cast
 
-from sqlalchemy import ColumnElement, Select, func
+from sqlalchemy import ColumnElement, Select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import desc, select
 
 from models import BannerWaitlist
+from shared.time_utils import utc_now
 
 
 class BannerWaitlistRepository:
@@ -23,11 +25,18 @@ class BannerWaitlistRepository:
         )
         return {channel_id: count for channel_id, count in result.all()}
 
-    def owned_banner_query(self, applicant_id: int) -> Select:
+    def owned_banner_query(
+        self, applicant_id: int, owner_id: str | None = None
+    ) -> Select:
         """构造新归属记录查询，供服务层使用同一 SQL 快照检查占位。"""
         # 空申请ID及其他申请人的记录不参与限制。
         return select(BannerWaitlist.id).where(
-            BannerWaitlist.applicant_id == applicant_id,
+            or_(
+                BannerWaitlist.applicant_id == applicant_id,
+                BannerWaitlist.fluxer_owner_id == owner_id
+                if owner_id is not None
+                else False,
+            ),
             BannerWaitlist.application_id.is_not(None),
         )
 
@@ -49,16 +58,19 @@ class BannerWaitlistRepository:
 
     async def add(
         self,
-        thread_id: int,
+        thread_id: int | None,
         channel_id: Optional[int],
         cover_image_url: str | None,
         title: str,
         target_type: int = 1,
         application_id: int | None = None,
         applicant_id: int | None = None,
+        work_id: int | None = None,
+        fluxer_owner_id: str | None = None,
+        fluxer_applicant_id: str | None = None,
     ) -> None:
         """插入一条等待记录（含 position 计算）。"""
-        now = datetime.now().replace(microsecond=0)
+        now = utc_now().replace(microsecond=0)
         channel_id_col = cast(ColumnElement, BannerWaitlist.channel_id)
         position_col = cast(ColumnElement, BannerWaitlist.position)
 
@@ -73,12 +85,20 @@ class BannerWaitlistRepository:
 
         item = BannerWaitlist(
             thread_id=thread_id,
+            work_id=work_id,
+            fluxer_owner_id=fluxer_owner_id,
             channel_id=channel_id,
             cover_image_url=cover_image_url,
             title=title,
             target_type=target_type,
             application_id=application_id,
             applicant_id=applicant_id,
+            fluxer_applicant_id=fluxer_applicant_id
+            or (
+                await resolve_business_id(self.session, applicant_id, source="discord")
+                if is_fluxer_mode() and applicant_id
+                else None
+            ),
             queued_at=now,
             position=new_position,
         )
@@ -92,7 +112,7 @@ class BannerWaitlistRepository:
         result = await self.session.execute(
             select(BannerWaitlist)
             .where(channel_id_col == channel_id)
-            .order_by(position_col)
+            .order_by(position_col, BannerWaitlist.queued_at, BannerWaitlist.id)
             .limit(1)
         )
         item = result.scalar_one_or_none()

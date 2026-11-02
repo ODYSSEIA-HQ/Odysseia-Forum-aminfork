@@ -1,13 +1,21 @@
 """Banner申请和管理服务"""
 
+from identity.runtime import is_fluxer_mode, uses_canonical_storage
+from identity.business_identity import resolve_business_id
+
 import logging
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from banner.channel_sync import ChannelSyncService
+from banner.banner_limits import (
+    GLOBAL_MAX_BANNERS,
+    CHANNEL_MAX_BANNERS,
+    BANNER_DURATION_DAYS,
+)
 from banner.dto.application_result import ApplicationResult
 from banner.dto.banner_approval_result import BannerApprovalResult
 from banner.dto.banner_review_application import BannerReviewApplication
@@ -37,11 +45,11 @@ class BannerService:
     """Banner申请和轮播管理服务"""
 
     # 全频道最多3个banner
-    GLOBAL_MAX_BANNERS = 3
-    # 每个频道最多3个banner
-    CHANNEL_MAX_BANNERS = 3
+    GLOBAL_MAX_BANNERS = GLOBAL_MAX_BANNERS
+    # 每个频道最多8个banner
+    CHANNEL_MAX_BANNERS = CHANNEL_MAX_BANNERS
     # Banner展示时长：3天
-    BANNER_DURATION_DAYS = 3
+    BANNER_DURATION_DAYS = BANNER_DURATION_DAYS
     APPLICANT_LIMIT_MESSAGE = (
         "您已有正在播放或等待展示的 Banner，暂时无法申请。请在展示结束或移除后重试。"
     )
@@ -68,7 +76,9 @@ class BannerService:
         for banner in banners:
             grouped.setdefault(banner.channel_id, []).append(
                 BannerStatusItem(
-                    target_id=banner.thread_id,
+                    target_id=banner.work_id
+                    if banner.target_type == TargetType.WORK.value
+                    else banner.thread_id,
                     target_type=banner.target_type,
                     title=banner.title,
                     end_time=banner.end_time,
@@ -98,14 +108,19 @@ class BannerService:
 
     async def has_ongoing_banner(self, applicant_id: int) -> bool:
         """跨所有展示范围检查申请人的新轮播及等待项。"""
+        owner = (
+            str(await resolve_business_id(self.session, applicant_id, source="discord"))
+            if uses_canonical_storage()
+            else None
+        )
         # 同一 SQL 快照避免等待项晋升时两次查询之间出现占位空隙。
         result = await self.session.execute(
             select(
                 or_(
                     self.carousel_repo.owned_banner_query(
-                        applicant_id, utc_now()
+                        applicant_id, utc_now(), owner
                     ).exists(),
-                    self.waitlist_repo.owned_banner_query(applicant_id).exists(),
+                    self.waitlist_repo.owned_banner_query(applicant_id, owner).exists(),
                 )
             )
         )
@@ -166,12 +181,17 @@ class BannerService:
         thread_repo = ThreadRepository(self.session)
         thread = await thread_repo.get_thread_with_tags(target_id)
         if thread:
-            if not thread.show_flag or thread.not_found_count > 0:
+            if not thread.show_flag or thread.deleted_at is not None:
                 return ApplicationResult(
                     success=False,
                     message="该帖子当前不可见，无法申请Banner",
                 )
-            if thread.author_id != applicant_id:
+            canonical_applicant_id = await resolve_business_id(
+                self.session, applicant_id, source="discord"
+            )
+            if thread.author_id != applicant_id or (
+                is_fluxer_mode() and thread.fluxer_author_id != canonical_applicant_id
+            ):
                 return ApplicationResult(
                     success=False,
                     message="只能为自己的帖子申请Banner",
@@ -242,6 +262,7 @@ class BannerService:
     ) -> ApplicationResult:
         """验证并创建Banner申请。"""
         try:
+            await resolve_business_id(self.session, applicant_id, source="discord")
             # 所有入口创建均加锁，只有 Bot 开启占位限制。
             await self.app_repo.lock_applicant(applicant_id)
             if enforce_applicant_limit and await self.has_ongoing_banner(applicant_id):
@@ -300,7 +321,11 @@ class BannerService:
     ) -> BannerApprovalResult:
         """批准申请并将banner加入轮播或等待列表。"""
         try:
+            await resolve_business_id(self.session, reviewer_id, source="discord")
             application = await self._get_pending_for_review(application_id)
+            await resolve_business_id(
+                self.session, application.applicant_id, source="discord"
+            )
 
             # 根据 target_type 获取标题
             if application.target_type == TargetType.CHANNEL.value:
@@ -323,40 +348,13 @@ class BannerService:
             application.status = ApplicationStatus.APPROVED.value
             application.reviewed_at = now
             application.reviewer_id = reviewer_id
-
-            # 判断是全频道还是特定频道
-            is_global = application.target_scope == "global"
-            channel_id = None if is_global else int(application.target_scope)
-
-            # 检查当前轮播列表是否已满
-            max_banners = (
-                self.GLOBAL_MAX_BANNERS if is_global else self.CHANNEL_MAX_BANNERS
+            application.fluxer_reviewer_id = (
+                await resolve_business_id(self.session, reviewer_id, source="discord")
+                if is_fluxer_mode()
+                else None
             )
-            current_count = await self.carousel_repo.get_count(channel_id)
 
-            if current_count < max_banners:
-                await self.carousel_repo.add(
-                    thread_id=application.thread_id,
-                    channel_id=channel_id,
-                    cover_image_url=application.cover_image_url,
-                    title=target_title,
-                    duration_days=self.BANNER_DURATION_DAYS,
-                    target_type=application.target_type,
-                    application_id=application.id,
-                    applicant_id=application.applicant_id,
-                )
-                entered_carousel = True
-            else:
-                await self.waitlist_repo.add(
-                    thread_id=application.thread_id,
-                    channel_id=channel_id,
-                    cover_image_url=application.cover_image_url,
-                    title=target_title,
-                    target_type=application.target_type,
-                    application_id=application.id,
-                    applicant_id=application.applicant_id,
-                )
-                entered_carousel = False
+            entered_carousel = await self.enqueue_application(application, target_title)
 
             # 同批拒绝与批准占位一起提交，失败时全部回滚。
             reason = f"同一申请人的 Banner 申请 #{application.id} 已通过审核，本申请自动拒绝。"
@@ -381,12 +379,21 @@ class BannerService:
     ) -> BannerReviewApplication:
         """拒绝申请并返回会话独立的审核快照。"""
         try:
+            await resolve_business_id(self.session, reviewer_id, source="discord")
             application = await self._get_pending_for_review(application_id)
+            await resolve_business_id(
+                self.session, application.applicant_id, source="discord"
+            )
 
             now = utc_now()
             application.status = ApplicationStatus.REJECTED.value
             application.reviewed_at = now
             application.reviewer_id = reviewer_id
+            application.fluxer_reviewer_id = (
+                await resolve_business_id(self.session, reviewer_id, source="discord")
+                if is_fluxer_mode()
+                else None
+            )
             application.reject_reason = reason
 
             result = BannerReviewApplication.from_application(application)
@@ -396,6 +403,47 @@ class BannerService:
             await self.session.rollback()
             raise
 
+    async def lock_scope(self, channel_id: int | None) -> None:
+        """串行化同一展示范围的审批、清理与 FIFO 晋升。"""
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
+            {
+                "key": f"banner:scope:{channel_id if channel_id is not None else 'global'}"
+            },
+        )
+
+    async def enqueue_application(
+        self, application: BannerApplication, title: str
+    ) -> bool:
+        """使用既有轮播和候补队列，旧候补优先占据空位。"""
+        channel_id = (
+            None
+            if application.target_scope == "global"
+            else int(application.target_scope)
+        )
+        await self.lock_scope(channel_id)
+        await self._refill_scope_to_capacity(channel_id)
+        active = await self.carousel_repo.get_count(channel_id)
+        values = {
+            "thread_id": application.thread_id,
+            "channel_id": channel_id,
+            "cover_image_url": application.cover_image_url,
+            "title": title,
+            "target_type": application.target_type,
+            "application_id": application.id,
+            "applicant_id": application.applicant_id,
+            "work_id": application.work_id,
+            "fluxer_owner_id": application.fluxer_owner_id,
+            "fluxer_applicant_id": application.fluxer_applicant_id,
+        }
+        if active < self._get_scope_capacity(channel_id):
+            await self.carousel_repo.add(
+                **values, duration_days=self.BANNER_DURATION_DAYS
+            )
+            return True
+        await self.waitlist_repo.add(**values)
+        return False
+
     def _get_scope_capacity(self, channel_id: Optional[int]) -> int:
         """获取全频道或单频道范围的轮播容量。"""
         return (
@@ -404,6 +452,7 @@ class BannerService:
 
     async def _refill_scope_to_capacity(self, channel_id: Optional[int]) -> int:
         """在轮播存在空位时按 FIFO 从等待队列补足。"""
+        await self.lock_scope(channel_id)
         current_count = await self.carousel_repo.get_count(channel_id)
         available_slots = max(0, self._get_scope_capacity(channel_id) - current_count)
         promoted_count = 0
@@ -413,6 +462,10 @@ class BannerService:
             waitlist_item = await self.waitlist_repo.pop(channel_id)
             if waitlist_item is None:
                 break
+            if waitlist_item.applicant_id is not None:
+                await resolve_business_id(
+                    self.session, waitlist_item.applicant_id, source="discord"
+                )
             await self.carousel_repo.add(
                 thread_id=waitlist_item.thread_id,
                 channel_id=waitlist_item.channel_id,
@@ -422,6 +475,9 @@ class BannerService:
                 target_type=waitlist_item.target_type,
                 application_id=waitlist_item.application_id,
                 applicant_id=waitlist_item.applicant_id,
+                work_id=waitlist_item.work_id,
+                fluxer_owner_id=waitlist_item.fluxer_owner_id,
+                fluxer_applicant_id=waitlist_item.fluxer_applicant_id,
             )
             promoted_count += 1
 
@@ -430,6 +486,17 @@ class BannerService:
     async def cleanup_expired_banners(self) -> int:
         """清理过期的banner并从等待列表补充。"""
         expired = await self.carousel_repo.get_expired()
+        locked_scopes = {item.channel_id for item in expired}
+        for scope in sorted(
+            locked_scopes, key=lambda value: (value is not None, value or 0)
+        ):
+            await self.lock_scope(scope)
+        # 等待范围锁后重新读取，忽略已由其他清理器处理的记录。
+        expired = [
+            item
+            for item in await self.carousel_repo.get_expired()
+            if item.channel_id in locked_scopes
+        ]
 
         affected_channel_ids: set[int | None] = set()
         for banner in expired:
@@ -447,6 +514,13 @@ class BannerService:
         """根据 thread_id 从轮播或等待列表中删除 Banner。"""
         carousel_items = await self.carousel_repo.get_by_thread(thread_id)
         waitlist_items = await self.waitlist_repo.get_by_thread(thread_id)
+
+        scopes = {item.channel_id for item in [*carousel_items, *waitlist_items]}
+        for scope in sorted(scopes, key=lambda value: (value is not None, value or 0)):
+            await self.lock_scope(scope)
+        if scopes:
+            carousel_items = await self.carousel_repo.get_by_thread(thread_id)
+            waitlist_items = await self.waitlist_repo.get_by_thread(thread_id)
 
         if not carousel_items and not waitlist_items:
             return DeleteBannerResult(

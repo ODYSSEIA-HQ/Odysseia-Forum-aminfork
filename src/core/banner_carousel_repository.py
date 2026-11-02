@@ -1,11 +1,14 @@
+from identity.runtime import is_fluxer_mode
+from identity.business_identity import resolve_business_id
 from datetime import datetime, timedelta
 from typing import List, Optional, cast
 
-from sqlalchemy import ColumnElement, Select
+from sqlalchemy import ColumnElement, Select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import and_, desc, select
 
 from models import BannerCarousel
+from banner.banner_limits import GLOBAL_MAX_BANNERS, CHANNEL_MAX_BANNERS
 from shared.time_utils import utc_now
 
 
@@ -41,7 +44,7 @@ class BannerCarouselRepository:
                 select(BannerCarousel)
                 .where(and_(channel_id_col.is_(None), end_time_col > now))
                 .order_by(position_col, BannerCarousel.id)
-                .limit(3)
+                .limit(GLOBAL_MAX_BANNERS)
             )
             return list(result.scalars().all())
 
@@ -73,7 +76,7 @@ class BannerCarouselRepository:
         channel_banners = [
             banner
             for channel_id in ordered_channel_ids
-            for banner in grouped_banners[channel_id][:5]
+            for banner in grouped_banners[channel_id][:CHANNEL_MAX_BANNERS]
         ]
 
         # 全局 Banner 只查询一次，并与频道候选按轮播记录 ID 合并排序。
@@ -113,11 +116,18 @@ class BannerCarouselRepository:
         )
         return list(result.scalars().all())
 
-    def owned_banner_query(self, applicant_id: int, now: datetime) -> Select:
+    def owned_banner_query(
+        self, applicant_id: int, now: datetime, owner_id: str | None = None
+    ) -> Select:
         """构造新归属记录查询，供服务层使用同一 SQL 快照检查占位。"""
         # 空申请ID及其他申请人的记录不参与限制。
         return select(BannerCarousel.id).where(
-            BannerCarousel.applicant_id == applicant_id,
+            or_(
+                BannerCarousel.applicant_id == applicant_id,
+                BannerCarousel.fluxer_owner_id == owner_id
+                if owner_id is not None
+                else False,
+            ),
             BannerCarousel.application_id.is_not(None),
             BannerCarousel.end_time > now,
         )
@@ -131,7 +141,7 @@ class BannerCarouselRepository:
 
     async def add(
         self,
-        thread_id: int,
+        thread_id: int | None,
         channel_id: Optional[int],
         cover_image_url: str | None,
         title: str,
@@ -139,6 +149,9 @@ class BannerCarouselRepository:
         target_type: int = 1,
         application_id: int | None = None,
         applicant_id: int | None = None,
+        work_id: int | None = None,
+        fluxer_owner_id: str | None = None,
+        fluxer_applicant_id: str | None = None,
     ) -> None:
         """插入一条轮播记录（含 position 计算）。"""
         start_time = utc_now().replace(microsecond=0)
@@ -158,12 +171,20 @@ class BannerCarouselRepository:
 
         item = BannerCarousel(
             thread_id=thread_id,
+            work_id=work_id,
+            fluxer_owner_id=fluxer_owner_id,
             channel_id=channel_id,
             cover_image_url=cover_image_url,
             title=title,
             target_type=target_type,
             application_id=application_id,
             applicant_id=applicant_id,
+            fluxer_applicant_id=fluxer_applicant_id
+            or (
+                await resolve_business_id(self.session, applicant_id, source="discord")
+                if is_fluxer_mode() and applicant_id
+                else None
+            ),
             start_time=start_time,
             end_time=end_time,
             position=new_position,

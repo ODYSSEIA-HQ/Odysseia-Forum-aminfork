@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from identity.principal import current_identity_id
 from api.v1.dependencies.security import get_current_user, require_auth
 from api.v1.schemas.discovery import DiscoveryRailsResponse
 from api.v1.schemas.search import ThreadDetail
@@ -89,7 +90,11 @@ async def get_discovery_rails(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="数据库尚未初始化"
         )
 
-    user_id = int(current_user["id"]) if current_user and "id" in current_user else None
+    user_id = (
+        current_identity_id(current_user)
+        if current_user and "id" in current_user
+        else None
+    )
     prefs = None
     effective_channel_ids = _resolve_rails_channel_ids(channel_ids)
 
@@ -185,7 +190,11 @@ async def get_random_threads(
         )
 
     # 获取当前请求的用户标识和身份组
-    user_id = int(current_user["id"]) if current_user and "id" in current_user else None
+    user_id = (
+        current_identity_id(current_user)
+        if current_user and "id" in current_user
+        else None
+    )
     user_roles = current_user.get("roles", []) if current_user else []
 
     # [深渊区权限判断] 读取用户身份组，判断是否需要屏蔽深渊区频道
@@ -311,7 +320,11 @@ async def get_single_rail(
             detail="数据库尚未初始化",
         )
 
-    user_id = int(current_user["id"]) if current_user and "id" in current_user else None
+    user_id = (
+        current_identity_id(current_user)
+        if current_user and "id" in current_user
+        else None
+    )
     prefs = None
     effective_channel_ids = _resolve_rails_channel_ids(channel_ids)
 

@@ -1,3 +1,4 @@
+from identity.runtime import is_fluxer_mode
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,7 +47,8 @@ class BannerThreadVisibilityService:
 
         filters = [
             Thread.thread_id.in_(thread_ids),
-            Thread.not_found_count == 0,
+            Thread.platform == "discord",
+            Thread.deleted_at.is_(None),
             Thread.show_flag.is_(True),
         ]
         if channel_ids is not None:
@@ -68,7 +70,11 @@ class BannerThreadVisibilityService:
             return []
         filters = []
         if prefs.exclude_authors:
-            filters.append(Thread.author_id.notin_(prefs.exclude_authors))
+            filters.append(
+                (
+                    Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id
+                ).notin_(prefs.exclude_authors)
+            )
         if prefs.exclude_tags:
             excluded_tag_ids = [
                 tag_id

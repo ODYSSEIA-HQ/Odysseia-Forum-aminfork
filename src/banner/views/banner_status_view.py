@@ -38,7 +38,13 @@ class BannerStatusView:
                 title = title[:30] + "..." if len(title) > 30 else title
                 title = discord.utils.escape_markdown(title)
                 label = (
-                    "频道" if item.target_type == TargetType.CHANNEL.value else "帖子"
+                    "作品"
+                    if item.target_type == TargetType.WORK.value
+                    else (
+                        "频道"
+                        if item.target_type == TargetType.CHANNEL.value
+                        else "帖子"
+                    )
                 )
                 seconds = (item.end_time - now).total_seconds()
                 if seconds >= 86400:

@@ -1,3 +1,4 @@
+from identity.runtime import is_fluxer_mode
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 from sqlmodel import case, select
@@ -41,7 +42,11 @@ class DiscoveryRepository:
 
         # 作者过滤
         if prefs.exclude_authors:
-            conditions.append(Thread.author_id.notin_(prefs.exclude_authors))  # type: ignore
+            conditions.append(
+                (
+                    Thread.fluxer_author_id if is_fluxer_mode() else Thread.author_id
+                ).notin_(prefs.exclude_authors)
+            )  # type: ignore
 
         # 标签过滤 (先查出 ID 再用 EXISTS 进行 OR 匹配)
         if prefs.include_tags or prefs.exclude_tags:
@@ -97,7 +102,7 @@ class DiscoveryRepository:
     ) -> list[Thread]:
         """拉取最新的帖子列表"""
         stmt = select(Thread).where(
-            Thread.not_found_count == 0, Thread.show_flag.is_(True)
+            Thread.deleted_at.is_(None), Thread.show_flag.is_(True)
         )  # type: ignore
 
         # 显式频道范围为空时必须返回空结果，不能退化为全频道查询。
@@ -129,7 +134,7 @@ class DiscoveryRepository:
 
         stmt = select(Thread).where(
             Thread.thread_id.in_(thread_ids),  # type: ignore
-            Thread.not_found_count == 0,
+            Thread.deleted_at.is_(None),
             Thread.show_flag.is_(True),  # type: ignore
         )
 
