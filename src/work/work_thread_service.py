@@ -258,14 +258,14 @@ class WorkThreadService:
         principal = command.actor
         async with self.sessions() as session:
             work = await WorkService(session).visible(work_id, principal)
-            row = await session.get(Thread, thread_id)
+            row = await session.get(Thread, thread_id, with_for_update=True, populate_existing=True)
             if row is None or row.work_id != work_id:
                 raise HTTPException(404, "帖子不存在")
             if row.fluxer_author_id != principal["id"] and (not principal["is_admin"]):
                 raise HTTPException(403, "不能删除他人子帖")
             row.deleted_at = utc_now()
             row.deletion_reason = "moderation"
-            row.lock_owner_ids = sorted(set(row.lock_owner_ids) | {principal["id"]})
+            # 软删除使用独立原生来源，不伪造操作者施加的普通锁。
             if row.platform == "fluxer":
                 session.add(
                     WorkTask(
@@ -295,7 +295,7 @@ class WorkThreadService:
             raise HTTPException(403, "需要管理权限")
         async with self.sessions() as session:
             await WorkService(session).visible(work_id, principal)
-            row = await session.get(Thread, thread_id)
+            row = await session.get(Thread, thread_id, with_for_update=True, populate_existing=True)
             if (
                 row is None
                 or row.work_id != work_id
@@ -305,14 +305,10 @@ class WorkThreadService:
                 raise HTTPException(404, "可恢复子帖不存在")
             row.deleted_at = None
             row.deletion_reason = None
-            row.lock_owner_ids = [
-                owner for owner in row.lock_owner_ids if owner != principal["id"]
-            ]
+            # 所有普通锁保持原样，恢复只撤销本次软删除来源。
             if row.platform == "fluxer":
-                for source, active in (
-                    ("forum_soft_delete", False),
-                    ("forum_work_lock", bool(row.lock_owner_ids)),
-                ):
+                # 恢复只撤删除来源，绝不重发可能已陈旧的普通锁快照。
+                for source, active in (("forum_soft_delete", False),):
                     session.add(
                         WorkTask(
                             work_id=work_id,

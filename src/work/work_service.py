@@ -268,6 +268,11 @@ class WorkService:
             text("SELECT pg_advisory_xact_lock(:id)"), {"id": work.id}
         )
         await self.session.refresh(work, with_for_update=True)
+        # Discord 主帖元数据只接受来源同步，不能以本地覆盖阻止后续更新。
+        if work.source_platform == "discord" and set(changes).intersection(
+            {"title", "description", "images"}
+        ):
+            raise HTTPException(403, "Discord 主帖标题、简介和图片只能由来源同步")
         abyss = principal.get("config", {}).get("abyss")
         if work.source_platform == "discord" and abyss is not None:
             work.is_abyss = work.source_channel_id in {
@@ -319,11 +324,6 @@ class WorkService:
             )
         if work.source_platform != "fluxer" and "attachments" in changes:
             raise HTTPException(409, "Discord来源作品不接受Fluxer主帖附件")
-        if work.source_platform == "discord":
-            local_fields = set(changes).intersection({"title", "description", "images"})
-            work.metadata_overrides = sorted(
-                set(work.metadata_overrides) | local_fields
-            )
         for key, value in changes.items():
             if key == "attachments" or (
                 work.source_platform == "fluxer" and key in ("title", "description")
