@@ -39,8 +39,11 @@ class SyncService:
         self,
         bot: "MyBot",
         session_factory: async_sessionmaker,
+        *,
+        enable_discord_thread_sync: bool = True,
     ):
         self.bot = bot
+        self.enable_discord_thread_sync = enable_discord_thread_sync
         self.session_factory = session_factory
         self._thread_locks: WeakValueDictionary[int, asyncio.Lock] = (
             WeakValueDictionary()
@@ -48,6 +51,8 @@ class SyncService:
 
     async def pre_sync_forum_tags(self, channel: discord.ForumChannel | int) -> None:
         """按论坛对象或频道 ID 预同步全部可用标签。"""
+        if not self.enable_discord_thread_sync:
+            return
         # 同时兼容现有论坛对象调用和审计中的频道 ID 调用。
         channel_id = channel if isinstance(channel, int) else channel.id
         observed_at = utc_now()
@@ -337,6 +342,10 @@ class SyncService:
         fetch_if_incomplete: bool = False,
     ) -> ThreadSyncResult:
         """串行执行同帖完整同步，保留现有调用接口和创建行为。"""
+        if not self.enable_discord_thread_sync:
+            return ThreadSyncResult(
+                success=False, error_code="discord_thread_sync_disabled"
+            )
         thread_id = thread if isinstance(thread, int) else thread.id
         async with self._thread_lock(thread_id):
             return await self._sync_thread(
@@ -522,6 +531,10 @@ class SyncService:
         self, thread_id: int, priority: int = 10
     ) -> ThreadSyncResult:
         """只审计既有帖子的频道数据，保留慢速作者和自动关注检查。"""
+        if not self.enable_discord_thread_sync:
+            return ThreadSyncResult(
+                success=False, error_code="discord_thread_sync_disabled"
+            )
         async with self._thread_lock(thread_id):
             thread, error = await self._fetch_thread_channel_for_sync(
                 thread_id, priority
@@ -576,6 +589,10 @@ class SyncService:
         self, thread_id: int, priority: int = 10
     ) -> ThreadSyncResult:
         """按帖子 ID 读取首楼，快速同步消息字段且不改变删除状态。"""
+        if not self.enable_discord_thread_sync:
+            return ThreadSyncResult(
+                success=False, error_code="discord_thread_sync_disabled"
+            )
         async with self._thread_lock(thread_id):
             try:
                 channel = self.bot.get_partial_messageable(thread_id)

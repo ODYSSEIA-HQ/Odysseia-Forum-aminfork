@@ -34,7 +34,6 @@ from core.discord_parser_patch import install_uncached_thread_members_patch
 from indexer.cog import Indexer
 from search.cog import Search
 from preferences.cog import Preferences
-from auditor.cog import Auditor
 from config.cog import Configuration
 from banner.cog import BannerManagement
 from banner.listeners.banner_event_listener import BannerEventListener
@@ -42,7 +41,6 @@ from core.config_repository import ConfigRepository
 from collection.cog import CollectionCog
 from update_detector.cog import UpdateDetector
 from author.cog import AuthorCog
-from backup.cog import BackupCog
 from shared.api_scheduler import APIScheduler
 from shared.enum import SearchConfigDefaultsInt
 from shared.event_mediator import EventMediator
@@ -155,10 +153,15 @@ class MyBot(commands.Bot):
 
         # 初始化核心服务
         self.tag_cache_service = TagCacheService(AsyncSessionFactory)
-        self.cache_service = CacheService(self, AsyncSessionFactory)
+        self.cache_service = CacheService(
+            self,
+            AsyncSessionFactory,
+            enable_discord_channel_refresh=False,
+        )
         self.sync_service = SyncService(
             bot=self,
             session_factory=AsyncSessionFactory,
+            enable_discord_thread_sync=False,
         )
         self.open_graph_reindex_consumer = OpenGraphReindexConsumer(
             sync_service=self.sync_service,
@@ -176,6 +179,8 @@ class MyBot(commands.Bot):
             self.cache_service.build_or_refresh_cache(),
         )
 
+        # 验收 BOT 不在正式 Discord 服务器，关闭来源同步并跳过 Auditor 维护任务。
+        # 测试数据库是正式数据副本，不加载会上传数据库到 S3 的 BackupCog。
         # 加载 Cogs
         cogs_to_load = [
             ThreadManager(
@@ -197,10 +202,6 @@ class MyBot(commands.Bot):
                 bot=self,
                 session_factory=AsyncSessionFactory,
                 config=self.config,
-            ),
-            Auditor(
-                bot=self,
-                session_factory=AsyncSessionFactory,
             ),
             Configuration(
                 bot=self,
@@ -228,7 +229,6 @@ class MyBot(commands.Bot):
                 bot=self,
                 session_factory=AsyncSessionFactory,
             ),
-            BackupCog(bot=self, config=self.config),
             TagCog(self, AsyncSessionFactory, self.config),
         ]
         await asyncio.gather(

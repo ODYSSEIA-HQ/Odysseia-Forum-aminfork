@@ -25,6 +25,7 @@ router = APIRouter(
 _async_session_factory: Optional[async_sessionmaker] = None
 _bot_token: Optional[str] = None
 _guild_id: Optional[str] = None
+_discord_refresh_enabled = True
 
 
 class FetchImageItem(BaseModel):
@@ -71,14 +72,17 @@ def configure_fetch_images_router(
     session_factory: async_sessionmaker,
     bot_token: Optional[str],
     guild_id: Optional[str],
+    enable_discord_refresh: bool = True,
 ) -> None:
     """
     由 bot_main 在启动时调用，注入共享依赖。
     """
     global _async_session_factory, _bot_token, _guild_id
+    global _discord_refresh_enabled
     _async_session_factory = session_factory
     _bot_token = bot_token
     _guild_id = guild_id
+    _discord_refresh_enabled = enable_discord_refresh
 
 
 @router.post("/", response_model=FetchImageResponse, summary="批量刷新帖子封面")
@@ -87,6 +91,11 @@ async def refresh_thread_thumbnails(payload: FetchImageRequest) -> FetchImageRes
     接收前端上报的失效封面列表，使用 Discord Bot Token 拉取最新的首楼消息，
     提取图片链接后更新数据库并返回。
     """
+    if not _discord_refresh_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Discord thread image refresh is disabled in this deployment",
+        )
     if not payload.items:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
