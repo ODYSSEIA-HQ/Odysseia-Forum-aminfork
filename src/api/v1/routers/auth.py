@@ -7,6 +7,7 @@
 """
 
 import hashlib
+from ipaddress import ip_address
 import json
 import logging
 import os
@@ -38,6 +39,63 @@ _OAUTH_CALLBACK_CACHE: Optional[OAuthCallbackCache] = None
 
 JWT_TTL_SECONDS = 7 * 24 * 60 * 60
 ROLE_VERIFICATION_TTL_SECONDS = int(ConstantEnum.AUTH_CACHE_TTL)
+
+
+def _public_fluxer_api_url() -> str:
+    """只返回经过校验的浏览器公开 Fluxer HTTPS 地址。"""
+    raw = os.environ.get("FLUXER_PUBLIC_API_URL", "").strip()
+    has_unsafe_character = any(
+        char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in raw
+    )
+    if not raw or has_unsafe_character:
+        return ""
+    # 拒绝查询、片段和反斜杠，避免浏览器与后端对地址产生不同解析。
+    if any(char in raw for char in ("?", "#", chr(92))):
+        return ""
+
+    # 解析 HTTPS authority 与端口，拒绝凭据和格式异常的端口。
+    try:
+        parsed = urlsplit(raw)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return ""
+
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname
+        or parsed.username
+        or parsed.password
+        or "@" in parsed.netloc
+        or (port is not None and not 1 <= port <= 65535)
+        or parsed.netloc.rsplit("@", 1)[-1].endswith(":")
+    ):
+        return ""
+
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return ""
+
+    # 不允许把私网或保留 IP 作为浏览器服务地址。
+    try:
+        literal_ip = ip_address(hostname)
+    except ValueError:
+        literal_ip = None
+
+    if literal_ip is not None and not literal_ip.is_global:
+        return ""
+    if literal_ip is None:
+        # 拒绝单标签和常见内网后缀；不做 DNS 查询。
+        numeric_host = hostname.rstrip(".")
+        if (
+            "." not in hostname
+            or hostname.endswith((".local", ".internal", ".lan", ".test"))
+            or numeric_host.isdigit()
+            or numeric_host.startswith("0x")
+            or all(part.isdigit() for part in numeric_host.split("."))
+        ):
+            return ""
+
+    return raw
 
 
 def initialize_auth_config():
@@ -1238,7 +1296,7 @@ async def auth_config():
     return JSONResponse(
         {
             "mode": "fluxer" if is_fluxer_mode() else "legacy",
-            "fluxer_api_url": os.environ.get("FLUXER_API_URL", ""),
+            "fluxer_api_url": _public_fluxer_api_url(),
         },
         headers={"Cache-Control": "no-store"},
     )
