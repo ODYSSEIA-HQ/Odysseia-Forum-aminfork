@@ -287,6 +287,7 @@ class FluxerAuthService:
                 return None
             if (
                 subject.startswith("rpc.content.")
+                or subject.startswith("rpc.preferences.")
                 or subject == "rpc.identity.v1.rebind_service"
             ):
                 code = str(error.get("code", "RPC_UNAVAILABLE"))

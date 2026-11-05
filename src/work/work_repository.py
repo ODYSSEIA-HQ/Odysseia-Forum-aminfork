@@ -36,6 +36,7 @@ class WorkRepository:
         work_ids=None,
         advanced=None,
         deleted_only=False,
+        channel_platform=None,
     ):
         """先执行既有 grouped AND/OR 搜索及访问过滤，再排序分页。"""
         abyss_config = principal.get("config", {}).get("abyss")
@@ -105,7 +106,11 @@ class WorkRepository:
         base = select(Work).outerjoin(WorkStatistics, WorkStatistics.work_id == Work.id)
         ranking = SearchService(self.session, None)
         if options:
-            filters.extend(await self.advanced_filters(principal, options, author_name))
+            filters.extend(
+                await self.advanced_filters(
+                    principal, options, author_name, channel_platform=channel_platform
+                )
+            )
             ranking._apply_range_filter(
                 filters,
                 func.coalesce(WorkStatistics.reaction_count, 0),
@@ -201,7 +206,9 @@ class WorkRepository:
                     work.is_abyss = work.source_channel_id in abyss_channels
         return rows, total
 
-    async def advanced_filters(self, principal, options, author_name):
+    async def advanced_filters(
+        self, principal, options, author_name, *, channel_platform=None
+    ):
         """复用标签、时间和作者语义，不把隐藏频道放入结果后再过滤。"""
         mappings = {
             int(key): [
@@ -220,11 +227,36 @@ class WorkRepository:
         }
         include_tags, exclude_tags = options.include_tags, options.exclude_tags
         channel_ids = options.channel_ids or None
+        selected_channels = bool(options.channel_ids)
+        if channel_platform is None and (
+            selected_channels or options.exclude_channel_ids
+        ):
+            channel_platform = options.platform or "discord"
+        # 既有虚拟频道/标签映射来自 Discord，不能解释原生同数字 ID。
+        if (
+            channel_platform == "fluxer"
+            or options.platform == "fluxer"
+            and not selected_channels
+        ):
+            mappings = {}
+        virtual_names = {
+            entry["tag_name"] for entries in mappings.values() for entry in entries
+        }
+        included_virtual = bool(virtual_names.intersection(include_tags))
+        excluded_virtual = bool(virtual_names.intersection(exclude_tags))
+        if included_virtual:
+            channel_platform = "discord"
         if mappings:
             from shared.channel_mapping_utils import ChannelMappingUtils
 
             indexed = (
-                (await self.session.execute(select(Work.source_channel_id).distinct()))
+                (
+                    await self.session.execute(
+                        select(Work.source_channel_id)
+                        .where(Work.source_platform == "discord")
+                        .distinct()
+                    )
+                )
                 .scalars()
                 .all()
             )
@@ -243,14 +275,24 @@ class WorkRepository:
             filters.append(Work.source_platform == options.platform)
         if options.guild_id:
             filters.append(Work.source_guild_id == str(options.guild_id))
+        if selected_channels or included_virtual:
+            filters.append(Work.source_platform == (channel_platform or "discord"))
         if channel_ids is not None:
-            filters.append(
-                Work.source_channel_id.in_([str(value) for value in channel_ids])
+            condition = Work.source_channel_id.in_(
+                [str(value) for value in channel_ids]
             )
+            # 反选旧虚拟频道只限制 Discord 来源，不清空不属于该命名空间的原生作品。
+            if excluded_virtual and not selected_channels and not included_virtual:
+                condition = or_(Work.source_platform != "discord", condition)
+            filters.append(condition)
         if options.exclude_channel_ids:
             filters.append(
-                Work.source_channel_id.not_in(
-                    [str(value) for value in options.exclude_channel_ids]
+                or_(
+                    Work.source_platform
+                    != (channel_platform or options.platform or "discord"),
+                    Work.source_channel_id.not_in(
+                        [str(value) for value in options.exclude_channel_ids]
+                    ),
                 )
             )
         if options.exclude_work_ids:

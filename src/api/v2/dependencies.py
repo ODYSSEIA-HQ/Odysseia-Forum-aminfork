@@ -4,6 +4,7 @@ from fastapi import Request, HTTPException
 from sqlalchemy import select
 from core.tag_access_service import TagAccessService
 from identity.auth_runtime import resolve_principal
+from identity.fluxer_preferences_client import FluxerPreferencesClient
 from models.discord_identity import DiscordIdentity
 from models.user import User
 from shared.database import AsyncSessionFactory
@@ -11,6 +12,7 @@ from shared.abyss_tag_visibility import can_view_abyss_tags
 
 
 _permission_service = None
+_PREFERENCES_STATE_KEY = "verified_fluxer_nsfw_preferences"
 
 
 async def current_member(request: Request):
@@ -40,6 +42,8 @@ async def current_member(request: Request):
         )
     if not principal:
         raise HTTPException(401, "会话无效")
+    # 中间件的身份快照只用于识别，不能携带旧偏好或可变权限到下一请求。
+    principal = dict(principal)
     async with AsyncSessionFactory() as session:
         binding = (
             (
@@ -61,7 +65,6 @@ async def current_member(request: Request):
         if str(principal.get("discord_user_id") or "") != binding.discord_user_id:
             raise HTTPException(503, "权威绑定投影正在同步，请稍后重试")
         principal["discord_user_id"] = binding.discord_user_id
-        principal["show_nsfw"] = bool(profile and profile.show_nsfw)
     from api.v2.config import get_work_config
 
     config = get_work_config()
@@ -95,6 +98,23 @@ async def current_member(request: Request):
     principal["config"] = config
     principal["forums"] = dict(config.get("work_forums", {}))
     principal["forums"].setdefault("discord_guild_id", str(access.main_guild))
+    guild_id = principal["forums"].get("guild_id")
+    if not guild_id:
+        raise HTTPException(503, "Fluxer 作品服务器尚未配置")
+    guild_id = str(guild_id)
+    state = request.scope.setdefault("state", {})
+    cache_key = (principal["id"], guild_id)
+    preferences = state.setdefault(_PREFERENCES_STATE_KEY, {})
+    if cache_key not in preferences:
+        preferences[cache_key] = await FluxerPreferencesClient().get_preferences(
+            principal["id"], guild_id
+        )
+    snapshot = preferences[cache_key]
+    # 展示偏好不等于年龄资格，任何来源的 NSFW 内容都同时满足两者。
+    principal["show_nsfw"] = snapshot["show_nsfw"] and snapshot["nsfw_eligible"]
+    principal["nsfw_preference_show_nsfw"] = snapshot["show_nsfw"]
+    principal["nsfw_eligible"] = snapshot["nsfw_eligible"]
+    principal["nsfw_preference_version"] = snapshot["version"]
     return principal
 
 

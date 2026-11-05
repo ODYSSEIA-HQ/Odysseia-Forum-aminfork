@@ -39,6 +39,15 @@ class WorkActorDTO(Mapping[str, Any]):
     show_nsfw: bool = False
     """全局成人内容偏好。"""
 
+    nsfw_preference_version: int | None = None
+    """Fluxer 成人内容偏好的权威 CAS 版本，缺失不冒充零。"""
+
+    nsfw_preference_show_nsfw: bool | None = None
+    """权威原始成人内容开关，与实际可见权限分开。"""
+
+    nsfw_eligible: bool = False
+    """原生年龄资格，开启偏好不能绕过。"""
+
     forums: dict = field(default_factory=dict, repr=False)
     """已初始化的平台论坛配置。"""
 

@@ -41,18 +41,37 @@ class WorkSearchApiService:
     async def advanced_search(self, query: WorkSearchRequest, command: WorkCommandQo):
         """高级搜索使用 V1 相同请求语法和算法，返回作品分页。"""
         principal = command.actor
-        body = query
+        body = query.model_copy(deep=True)
         from shared.tag_error import TagError
         from core.preferences_repository import PreferencesRepository
         from search.search_preferences import merge_search_preferences
+        from identity.canonical_user_id import CanonicalUserId
+        from work.work_preferences_service import search_preference_guild
 
+        inherited_discord_channels = False
         async with self.sessions() as session:
             if body.apply_preferences:
-                preferences = await PreferencesRepository(session).get_user_preferences(
-                    principal["id"], int(principal["forums"].get("discord_guild_id", 0))
-                )
+                try:
+                    preferences = await PreferencesRepository(
+                        session
+                    ).get_user_preferences(
+                        CanonicalUserId(str(principal["id"])),
+                        search_preference_guild(principal),
+                    )
+                except ValueError as exc:
+                    raise HTTPException(503, "旧作者偏好身份映射尚未就绪") from exc
+                explicit_fields = body.model_fields_set.copy()
                 if preferences:
+                    inherited_discord_channels = (
+                        bool(preferences.preferred_channels)
+                        and "channel_ids" not in explicit_fields
+                    )
                     merge_search_preferences(body, preferences)
+                if "limit" not in explicit_fields:
+                    # 旧数据可能绕过 API 校验，读取时限制查询规模但不改写偏好。
+                    body.limit = max(
+                        1, min(100, preferences.ui_page_size if preferences else 48)
+                    )
             try:
                 rows, total = await WorkRepository(session).page(
                     principal,
@@ -61,6 +80,7 @@ class WorkSearchApiService:
                     is_nsfw=body.is_nsfw,
                     is_abyss=body.is_abyss,
                     advanced=body,
+                    channel_platform="discord" if inherited_discord_channels else None,
                 )
             except TagError as exc:
                 raise HTTPException(exc.status, exc.detail) from exc

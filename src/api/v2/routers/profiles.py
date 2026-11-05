@@ -2,7 +2,9 @@
 
 from dto.work.work_actor_dto import WorkActorDTO
 from dto.work.work_command_qo import WorkCommandQo
-from fastapi import APIRouter, Depends, Body
+from fastapi import APIRouter, Depends
+from api.v2.schemas.work_preferences_response import WorkPreferencesResponse
+from api.v2.schemas.work_preferences_update_request import WorkPreferencesUpdateRequest
 from api.v2.dependencies import current_member
 from work.work_profile_service import WorkProfileService
 from api.v2.dependencies import get_session_factory
@@ -20,9 +22,9 @@ async def me(principal=Depends(current_member)):
     )
 
 
-@router.get("/me/preferences")
+@router.get("/me/preferences", response_model=WorkPreferencesResponse)
 async def preferences(principal=Depends(current_member)):
-    """返回用户全局成人内容偏好。"""
+    """返回完整偏好及首次设置状态，不在读取时创建记录。"""
     return await WorkProfileService(get_session_factory()).preferences(
         command=WorkCommandQo(
             actor=WorkActorDTO.from_principal(principal), values={}, operation=None
@@ -30,11 +32,15 @@ async def preferences(principal=Depends(current_member)):
     )
 
 
-@router.patch("/me/preferences")
-async def save_preferences(body: dict = Body(...), principal=Depends(current_member)):
-    """偏好存统一用户表，不随服务器覆盖。"""
+@router.patch("/me/preferences", response_model=WorkPreferencesResponse)
+async def save_preferences(
+    body: WorkPreferencesUpdateRequest, principal=Depends(current_member)
+):
+    """仅修改明确传入的字段，身份与作用域不能由请求覆盖。"""
     return await WorkProfileService(get_session_factory()).save_preferences(
         command=WorkCommandQo(
-            actor=WorkActorDTO.from_principal(principal), values=body, operation=None
+            actor=WorkActorDTO.from_principal(principal),
+            values=body.model_dump(exclude_unset=True),
+            operation=None,
         )
     )

@@ -1,8 +1,7 @@
 """账户偏好领域服务。"""
 
 from dto.work.work_command_qo import WorkCommandQo
-from fastapi import HTTPException
-from work.work_user_repository import WorkUserRepository
+from work.work_preferences_service import WorkPreferencesService
 
 
 class WorkProfileService:
@@ -15,7 +14,7 @@ class WorkProfileService:
     async def me(self, command: WorkCommandQo):
         """公开前端需要的能力，不泄漏会话凭据。"""
         principal = command.actor
-        return {
+        result = {
             key: principal[key]
             for key in (
                 "id",
@@ -28,23 +27,20 @@ class WorkProfileService:
                 "can_view_abyss",
                 "can_speak",
                 "show_nsfw",
+                "nsfw_preference_version",
+                "nsfw_eligible",
             )
         }
+        if principal.get("nsfw_preference_show_nsfw") is not None:
+            result["show_nsfw"] = principal["nsfw_preference_show_nsfw"]
+        return result
 
     async def preferences(self, command: WorkCommandQo):
-        """返回用户全局成人内容偏好。"""
-        principal = command.actor
-        return {"show_nsfw": principal["show_nsfw"]}
+        """返回同一身份及主服务器下的完整搜索偏好。"""
+        return await WorkPreferencesService(self.sessions).preferences(command.actor)
 
     async def save_preferences(self, command: WorkCommandQo):
-        """偏好存统一用户表，不随服务器覆盖。"""
-        principal = command.actor
-        body = dict(command.values)
-        if set(body) != {"show_nsfw"} or not isinstance(body["show_nsfw"], bool):
-            raise HTTPException(422, "需要 show_nsfw 布尔值")
-        async with self.sessions() as session:
-            await WorkUserRepository(session).set_nsfw_preference(
-                principal["id"], body["show_nsfw"]
-            )
-            await session.commit()
-        return body
+        """普通偏好部分更新；成人内容经 Fluxer 权威 CAS 独立保存。"""
+        return await WorkPreferencesService(self.sessions).save_preferences(
+            command.actor, command.values
+        )

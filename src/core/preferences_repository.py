@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 from sqlmodel import select
 
 from dto.preferences import UserSearchPreferencesDTO
@@ -23,7 +24,7 @@ class PreferencesRepository:
         self._redis = redis_client
 
     async def get_user_preferences(
-        self, user_id: int, guild_id: int = 0
+        self, user_id: int | str, guild_id: int = 0
     ) -> Optional[UserSearchPreferencesDTO]:
         """获取用户在指定服务器的搜索偏好设置"""
         user_id = await resolve_business_id(self.session, user_id)
@@ -37,26 +38,42 @@ class PreferencesRepository:
             UserSearchPreferences.guild_id == guild_id,
         )
         result = await self.session.execute(stmt)
-        prefs_orm = result.scalars().first()
+        prefs_orm = result.scalars().one_or_none()
         if not prefs_orm:
             return None
-        if uses_canonical_storage():
-            for field in ("include_authors", "exclude_authors"):
-                if (
-                    getattr(prefs_orm, "fluxer_" + field) is None
-                    and getattr(prefs_orm, field) is not None
-                ):
-                    mapped = await resolve_business_ids(
-                        self.session, getattr(prefs_orm, field), source="discord"
-                    )
-                    setattr(prefs_orm, "fluxer_" + field, mapped)
-        return self._to_dto(prefs_orm)
+        return await self._read_dto(prefs_orm)
+
+    async def _read_dto(self, prefs):
+        """兼容旧作者映射但不在读取时修改 ORM，避免读后提交覆盖新偏好。"""
+        if not uses_canonical_storage():
+            return self._to_dto(prefs)
+        values = prefs.model_dump()
+        for field in ("include_authors", "exclude_authors"):
+            canonical = getattr(prefs, "fluxer_" + field)
+            if canonical is None and getattr(prefs, field) is not None:
+                canonical = await resolve_business_ids(
+                    self.session, getattr(prefs, field), source="discord"
+                )
+            values[field] = canonical
+        values["user_id"] = prefs.fluxer_user_id
+        return UserSearchPreferencesDTO.model_validate(values)
+
+    async def lock_user_preferences(self, user_id, guild_id=0):
+        """同一账户与服务器串行写入，首次尚无行时也覆盖所有 worker。"""
+        user_id = await resolve_business_id(self.session, user_id)
+        if self.session.get_bind().dialect.name == "postgresql":
+            namespace = "fluxer" if uses_canonical_storage() else "discord"
+            await self.session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": f"forum:preferences:{namespace}:{user_id}:{guild_id}"},
+            )
+        return user_id
 
     async def save_user_preferences(
         self, user_id: int, prefs_data: dict, guild_id: int = 0
     ) -> UserSearchPreferencesDTO:
         """创建或更新用户在指定服务器的搜索偏好设置"""
-        user_id = await resolve_business_id(self.session, user_id)
+        user_id = await self.lock_user_preferences(user_id, guild_id)
         legacy_discord_id = await discord_id_for_business_id(self.session, user_id)
         stmt = select(UserSearchPreferences).where(
             (
@@ -68,7 +85,7 @@ class PreferencesRepository:
             UserSearchPreferences.guild_id == guild_id,
         )
         result = await self.session.execute(stmt)
-        prefs = result.scalars().first()
+        prefs = result.scalars().one_or_none()
         if uses_canonical_storage():
             prefs_data = dict(prefs_data)
             for field in ("include_authors", "exclude_authors"):
@@ -77,7 +94,7 @@ class PreferencesRepository:
                     prefs_data["fluxer_" + field] = (
                         await resolve_business_ids(self.session, value)
                         if value is not None
-                        else None
+                        else []
                     )
         if prefs:
             for key, value in prefs_data.items():
@@ -93,6 +110,8 @@ class PreferencesRepository:
         await self.session.commit()
         await self.session.refresh(prefs)
 
+        result_dto = await self._read_dto(prefs)
+
         # 写入成功后刷新 Redis 缓存
         if self._redis:
             try:
@@ -101,7 +120,6 @@ class PreferencesRepository:
                 ) + CacheKeys.USER_PREFERENCES.format(
                     user_id=user_id, guild_id=guild_id
                 )
-                result_dto = self._to_dto(prefs)
                 await self._redis.setex(
                     cache_key,
                     int(ConstantEnum.PREF_CACHE_TTL),
@@ -110,7 +128,7 @@ class PreferencesRepository:
             except Exception:
                 pass  # Redis 故障不影响主流程
 
-        return self._to_dto(prefs)
+        return result_dto
 
     @staticmethod
     def _to_dto(prefs):
