@@ -45,3 +45,14 @@ async def author_follows(principal=Depends(current_member)):
             actor=WorkActorDTO.from_principal(principal), values={}, operation=None
         )
     )
+
+
+@router.get("/authors/discord/{discord_id}")
+async def resolve_discord_author(discord_id: str, principal=Depends(current_member)):
+    """旧作者分享链接只解析当前映射，不按数字碰撞猜测作者。"""
+    return await WorkAuthorService(get_session_factory()).resolve_discord_author(
+        discord_id,
+        WorkCommandQo(
+            actor=WorkActorDTO.from_principal(principal), values={}, operation=None
+        ),
+    )

@@ -37,47 +37,14 @@ class WorkRepository:
         advanced=None,
         deleted_only=False,
         channel_platform=None,
+        extra_filters=(),
     ):
         """先执行既有 grouped AND/OR 搜索及访问过滤，再排序分页。"""
-        abyss_config = principal.get("config", {}).get("abyss")
-        abyss_channels = {
-            str(value) for value in (abyss_config or {}).get("channel_ids", [])
-        }
-        abyss_column = (
-            case(
-                (
-                    Work.source_platform == "discord",
-                    Work.source_channel_id.in_(abyss_channels),
-                ),
-                else_=Work.is_abyss,
-            )
-            if abyss_config is not None
-            else Work.is_abyss
+        filters, abyss_column, abyss_channels = self.visibility_filters(
+            principal, deleted_only
         )
-        filters = [
-            Work.deleted_at.is_not(None) if deleted_only else Work.deleted_at.is_(None)
-        ]
-        if not deleted_only:
-            filters.append(Work.source_visible.is_(True))
-        if not principal["show_nsfw"]:
-            filters.append(Work.is_nsfw.is_(False))
-        if not principal["can_view_abyss"]:
-            filters.append(abyss_column.is_(False))
-            abyss_channels = [
-                str(value)
-                for value in principal.get("config", {})
-                .get("abyss", {})
-                .get("channel_ids", [])
-            ]
-            if abyss_channels:
-                filters.append(
-                    not_(
-                        and_(
-                            Work.source_platform == "discord",
-                            Work.source_channel_id.in_(abyss_channels),
-                        )
-                    )
-                )
+        filters.extend(extra_filters)
+        abyss_config = principal.get("config", {}).get("abyss")
         if is_nsfw is not None:
             filters.append(Work.is_nsfw == is_nsfw)
         if is_abyss is not None:
@@ -205,6 +172,50 @@ class WorkRepository:
                 if work.source_platform == "discord":
                     work.is_abyss = work.source_channel_id in abyss_channels
         return rows, total
+
+    @staticmethod
+    def visibility_filters(principal, deleted_only=False):
+        """搜索、相似作品与联想共用分页前访问条件。"""
+        abyss_config = principal.get("config", {}).get("abyss")
+        abyss_channels = {
+            str(value) for value in (abyss_config or {}).get("channel_ids", [])
+        }
+        abyss_column = (
+            case(
+                (
+                    Work.source_platform == "discord",
+                    Work.source_channel_id.in_(abyss_channels),
+                ),
+                else_=Work.is_abyss,
+            )
+            if abyss_config is not None
+            else Work.is_abyss
+        )
+        filters = [
+            Work.deleted_at.is_not(None) if deleted_only else Work.deleted_at.is_(None)
+        ]
+        if not deleted_only:
+            filters.append(Work.source_visible.is_(True))
+        if not principal["show_nsfw"]:
+            filters.append(Work.is_nsfw.is_(False))
+        if not principal["can_view_abyss"]:
+            filters.append(abyss_column.is_(False))
+            abyss_channels = [
+                str(value)
+                for value in principal.get("config", {})
+                .get("abyss", {})
+                .get("channel_ids", [])
+            ]
+            if abyss_channels:
+                filters.append(
+                    not_(
+                        and_(
+                            Work.source_platform == "discord",
+                            Work.source_channel_id.in_(abyss_channels),
+                        )
+                    )
+                )
+        return filters, abyss_column, abyss_channels
 
     async def advanced_filters(
         self, principal, options, author_name, *, channel_platform=None

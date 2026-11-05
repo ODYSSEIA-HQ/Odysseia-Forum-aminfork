@@ -15,6 +15,37 @@ class WorkAuthorService:
         """复用由路由注入的会话工厂，跨表操作在服务层协调。"""
         self.sessions = sessions
 
+    async def resolve_discord_author(self, discord_id: str, command: WorkCommandQo):
+        """仅为已有可见作品解析当前作者，隐藏绑定历史及无可见内容的身份。"""
+        from models.discord_identity import DiscordIdentity
+
+        if (
+            not discord_id.isascii()
+            or not discord_id.isdecimal()
+            or len(discord_id) > 20
+        ):
+            raise HTTPException(404, "作者不存在")
+        async with self.sessions() as session:
+            author_id = (
+                await session.execute(
+                    select(User.id)
+                    .join(DiscordIdentity, DiscordIdentity.user_id == User.id)
+                    .where(
+                        DiscordIdentity.discord_user_id == discord_id,
+                        DiscordIdentity.is_current.is_(True),
+                        User.merged_into_id.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if author_id is None:
+                raise HTTPException(404, "作者不存在")
+            rows, _ = await WorkRepository(session).page(
+                command.actor, 0, 1, author_id=author_id
+            )
+            if not rows:
+                raise HTTPException(404, "作者不存在")
+            return {"id": str(author_id)}
+
     async def author_profile(self, author_id: str, command: WorkCommandQo):
         """统一作者资料取自 Fluxer 用户投影，作品数量先过滤可见性。"""
         principal = command.actor

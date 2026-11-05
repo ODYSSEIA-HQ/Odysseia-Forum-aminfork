@@ -16,5 +16,5 @@ class WorkSearchRequest(SearchRequest):
     platform: str | None = None
     """主来源平台。"""
 
-    exclude_work_ids: list[str] = Field(default_factory=list, max_length=100)
+    exclude_work_ids: list[str] = Field(default_factory=list, max_length=1000)
     """已显示的作品内部编号。"""

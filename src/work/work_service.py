@@ -4,6 +4,7 @@ import hashlib
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from fastapi import HTTPException
+from models.user import User
 from models.work import Work
 from models.work_statistics import WorkStatistics
 from models.work_reaction import WorkReaction
@@ -69,6 +70,24 @@ class WorkService:
         ids = [work.id for work in works]
         if not ids:
             return []
+        # Only hydrate authors of works already filtered by the caller. Select public
+        # profile fields explicitly: preferences and account-merge metadata stay private.
+        author_ids = {work.author_id for work in works if work.author_id is not None}
+        authors = {}
+        if author_ids:
+            authors = {
+                row.id: {
+                    "id": str(row.id),
+                    "username": row.username,
+                    "display_name": row.display_name,
+                    "avatar_url": row.avatar_url,
+                }
+                for row in await self.session.execute(
+                    select(
+                        User.id, User.username, User.display_name, User.avatar_url
+                    ).where(User.id.in_(author_ids), User.merged_into_id.is_(None))
+                )
+            }
         statistics = {
             row.work_id: row
             for row in (
@@ -142,6 +161,7 @@ class WorkService:
                 }
             )
             data["id"] = str(work.id)
+            data["author"] = authors.get(work.author_id)
             data["sync_status"] = (
                 "pending"
                 if work.source_platform == "fluxer" and not work.source_thread_id
@@ -291,15 +311,21 @@ class WorkService:
         if classification:
             # 已发送但结果未知的创建不能重绑目标，也不能让分类先越过旧请求。
             unresolved = (
-                await self.session.execute(
-                    select(WorkTask.id).where(
-                        WorkTask.work_id == work.id,
-                        WorkTask.kind == "create_child",
-                        WorkTask.dispatched_at.is_not(None),
-                        WorkTask.status != "done",
-                    ).limit(20)
+                (
+                    await self.session.execute(
+                        select(WorkTask.id)
+                        .where(
+                            WorkTask.work_id == work.id,
+                            WorkTask.kind == "create_child",
+                            WorkTask.dispatched_at.is_not(None),
+                            WorkTask.status != "done",
+                        )
+                        .limit(20)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             if unresolved:
                 raise HTTPException(
                     409,
