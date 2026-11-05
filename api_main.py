@@ -132,6 +132,7 @@ def _inject_api_dependencies(
         session_factory=AsyncSessionFactory,
         bot_token=bot_token,
         guild_id=auth_section.get("guild_id"),
+        enable_discord_refresh=False,
     )
 
     open_graph_config = config.get("integration", {}).get("open_graph", {})

@@ -29,9 +29,16 @@ class CacheService:
     目前存储的数据包括：已索引的频道、全局搜索配置 BotConfig
     """
 
-    def __init__(self, bot, session_factory: async_sessionmaker):
+    def __init__(
+        self,
+        bot,
+        session_factory: async_sessionmaker,
+        *,
+        enable_discord_channel_refresh: bool = True,
+    ):
         self.bot = bot
         self.session_factory = session_factory
+        self.enable_discord_channel_refresh = enable_discord_channel_refresh
         self.indexed_channel_ids: set[int] = set()
         self.indexed_channels: dict[int, discord.ForumChannel] = {}
         # guild_id -> {channel_id -> ForumChannel}
@@ -56,6 +63,8 @@ class CacheService:
 
     async def _refresh_indexed_channels_cache(self, *, prefer_gateway: bool = False):
         """刷新已索引频道缓存。"""
+        if not self.enable_discord_channel_refresh:
+            return
         async with self.session_factory() as session:
             thread_service = ThreadRepository(session)
             indexed_channel_ids = await thread_service.get_all_indexed_channel_ids()
