@@ -40,7 +40,7 @@ class WorkProfileService:
         return await WorkPreferencesService(self.sessions).preferences(command.actor)
 
     async def save_preferences(self, command: WorkCommandQo):
-        """普通偏好部分更新；成人内容经 Fluxer 权威 CAS 独立保存。"""
+        """普通偏好部分更新；成人内容独立双写 Forum 与 Fluxer CAS。"""
         return await WorkPreferencesService(self.sessions).save_preferences(
             command.actor, command.values
         )

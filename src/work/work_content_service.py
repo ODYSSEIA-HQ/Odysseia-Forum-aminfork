@@ -225,17 +225,15 @@ class WorkContentService:
             query = select(WorkTask).where(
                 WorkTask.work_id == work_id, WorkTask.kind != "projection"
             )
+            if work.author_id != principal["id"] and not principal["is_admin"]:
+                query = query.where(
+                    WorkTask.payload["actor_id"].as_string() == principal["id"]
+                )
             rows = (
                 (await session.execute(query.order_by(WorkTask.id.desc()).limit(100)))
                 .scalars()
                 .all()
             )
-            if work.author_id != principal["id"] and (not principal["is_admin"]):
-                rows = [
-                    row
-                    for row in rows
-                    if row.payload.get("actor_id") == principal["id"]
-                ]
             return {
                 "items": [
                     {

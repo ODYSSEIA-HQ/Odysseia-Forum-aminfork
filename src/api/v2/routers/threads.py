@@ -1,13 +1,33 @@
 """原生讨论区 HTTP 协议适配。"""
 
+from typing import Annotated
+
 from dto.work.work_actor_dto import WorkActorDTO
 from dto.work.work_command_qo import WorkCommandQo
-from fastapi import APIRouter, Depends, Body
+from fastapi import APIRouter, Depends, Body, Path
 from api.v2.dependencies import current_member
 from work.work_thread_service import WorkThreadService
 from api.v2.dependencies import get_session_factory
+from api.v2.schemas.work_cards_query import WorkCardsQuery
+from work.work_cards_service import WorkCardsService
 
 router = APIRouter(prefix="/v2", tags=["作品 V2"])
+
+
+@router.get("/works/{work_id}/cards")
+async def cards(
+    work_id: int = Path(..., ge=1, le=9223372036854775807),
+    query: WorkCardsQuery = Depends(),
+    principal=Depends(current_member),
+):
+    """子卡区在作品权限过滤后按搜索算法排序分页。"""
+    return await WorkCardsService(get_session_factory()).page(
+        work_id,
+        query,
+        WorkCommandQo(
+            actor=WorkActorDTO.from_principal(principal), values={}, operation=None
+        ),
+    )
 
 
 @router.get("/works/{work_id}/threads")
@@ -26,7 +46,9 @@ async def threads(
 
 @router.post("/works/{work_id}/threads", status_code=202)
 async def create_child(
-    work_id: int, body: dict = Body(...), principal=Depends(current_member)
+    work_id: Annotated[int, Path(ge=1, le=9223372036854775807)],
+    body: dict = Body(...),
+    principal=Depends(current_member),
 ):
     """子帖只能由 Forum 创建，主帖锁归档时拒绝新建。"""
     return await WorkThreadService(get_session_factory()).create_child(

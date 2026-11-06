@@ -38,6 +38,7 @@ class WorkRepository:
         deleted_only=False,
         channel_platform=None,
         extra_filters=(),
+        random_order=False,
     ):
         """先执行既有 grouped AND/OR 搜索及访问过滤，再排序分页。"""
         filters, abyss_column, abyss_channels = self.visibility_filters(
@@ -120,7 +121,9 @@ class WorkRepository:
             display_count=func.coalesce(WorkStatistics.display_count, 0),
             created_at=Work.created_at,
         )
-        if method == "comprehensive":
+        if random_order:
+            sort = func.random()
+        elif method == "comprehensive":
             displays = (
                 await self.session.execute(
                     select(func.coalesce(func.sum(WorkStatistics.display_count), 0))

@@ -110,9 +110,12 @@ async def current_member(request: Request):
             principal["id"], guild_id
         )
     snapshot = preferences[cache_key]
-    # 展示偏好不等于年龄资格，任何来源的 NSFW 内容都同时满足两者。
-    principal["show_nsfw"] = snapshot["show_nsfw"] and snapshot["nsfw_eligible"]
-    principal["nsfw_preference_show_nsfw"] = snapshot["show_nsfw"]
+    # Forum 使用自己的显示开关；远端只提供原有年龄资格和双写 CAS 版本。
+    # 不用 Fluxer 显示开关替代本地值，也不在年龄资格读取失败时降级放行。
+    principal["show_nsfw"] = (
+        bool(profile and profile.show_nsfw) and snapshot["nsfw_eligible"]
+    )
+    principal["nsfw_preference_show_nsfw"] = bool(profile and profile.show_nsfw)
     principal["nsfw_eligible"] = snapshot["nsfw_eligible"]
     principal["nsfw_preference_version"] = snapshot["version"]
     return principal

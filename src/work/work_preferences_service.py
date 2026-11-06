@@ -1,4 +1,4 @@
-"""V2 完整搜索偏好，普通偏好沿用旧表，NSFW 委托 Fluxer 唯一权威。"""
+"""V2 完整搜索偏好，普通偏好沿用旧表，Forum NSFW 使用本地开关并在切换时双写。"""
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -31,7 +31,7 @@ def nsfw_preference_guild(principal):
 
 
 class WorkPreferencesService:
-    """协调普通搜索偏好与 Fluxer 权威显示状态。"""
+    """协调搜索偏好、本地显示开关与远端双写。"""
 
     def __init__(self, sessions):
         """保存会话工厂，每次操作在独立事务中读取或保存偏好。"""
@@ -52,9 +52,8 @@ class WorkPreferencesService:
             nsfw_eligible=nsfw["nsfw_eligible"],
         ).model_dump(mode="json")
 
-    @staticmethod
-    async def _nsfw(principal):
-        """复用本次认证的权威状态，缺失时读取 Fluxer。"""
+    async def _nsfw(self, principal):
+        """复用本次认证的本地开关及远端年龄/CAS 状态。"""
         # 认证快照带有版本时直接使用，不创建跨请求的展示缓存。
         version = principal.get("nsfw_preference_version")
         if isinstance(version, int) and not isinstance(version, bool) and version >= 0:
@@ -70,9 +69,15 @@ class WorkPreferencesService:
             }
         from identity.fluxer_preferences_client import FluxerPreferencesClient
 
-        return await FluxerPreferencesClient().get_preferences(
+        snapshot = await FluxerPreferencesClient().get_preferences(
             principal["id"], nsfw_preference_guild(principal)
         )
+        # 没有认证快照的内部调用也读取本地行，不使用远端显示值。
+        from models.user import User
+
+        async with self.sessions() as session:
+            profile = await session.get(User, str(principal["id"]))
+            return {**snapshot, "show_nsfw": bool(profile and profile.show_nsfw)}
 
     async def preferences(self, principal):
         """读取当前成员的完整搜索偏好，不创建缺失记录。"""
@@ -105,7 +110,7 @@ class WorkPreferencesService:
                 raise HTTPException(422, "时间范围无效，请修改时间筛选") from exc
 
     async def save_preferences(self, principal, values):
-        """部分更新普通偏好，独立提交权威成人内容开关。"""
+        """部分更新普通偏好，独立双写成人内容开关。"""
         # 只解析显式提交的字段，避免省略值覆盖已保存偏好。
         try:
             update = WorkPreferencesUpdateRequest.model_validate(
@@ -120,9 +125,9 @@ class WorkPreferencesService:
                 raise HTTPException(422, "成人内容开关需与其他搜索偏好分别保存")
             # 先确认普通偏好可读，避免远端成功后又因本地旧映射失败而伪报失败。
             document = await self.preferences(principal)
-            from identity.fluxer_preferences_client import FluxerPreferencesClient
+            from work.work_nsfw_sync_service import WorkNsfwSyncService
 
-            nsfw = await FluxerPreferencesClient().update_preferences(
+            nsfw = await WorkNsfwSyncService(self.sessions).save(
                 principal["id"],
                 nsfw_preference_guild(principal),
                 update["show_nsfw"],

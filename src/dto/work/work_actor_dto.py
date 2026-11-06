@@ -43,7 +43,7 @@ class WorkActorDTO(Mapping[str, Any]):
     """Fluxer 成人内容偏好的权威 CAS 版本，缺失不冒充零。"""
 
     nsfw_preference_show_nsfw: bool | None = None
-    """权威原始成人内容开关，与实际可见权限分开。"""
+    """Forum 原始成人内容开关，与年龄资格及实际可见权限分开。"""
 
     nsfw_eligible: bool = False
     """原生年龄资格，开启偏好不能绕过。"""
