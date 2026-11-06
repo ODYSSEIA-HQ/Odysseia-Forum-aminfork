@@ -578,10 +578,174 @@ async def seed_works(session_factory, accounts: dict[str, str]) -> None:
         print(f"作品 {work_id} 版本 {version_id}，文件 {file_id}（{file_name}）")
 
 
+# ---------------- 活动（3.22）、娱乐区（/fun）：events 块 ----------------
+
+
+async def seed_events(session_factory, accounts: dict[str, str]) -> None:
+    """示例活动（参考 web 仓库 src/mock/activities.ts 的 seedEvents）。按 slug 幂等。
+
+    收稿中（demo 还能再交一件）、已结束有结果（混合分级按组）、评定中（demo 是主办人）、
+    即将开始、只对 R18 模式可见、草稿。参赛作品用 seed_works 的预置作品（作者都是 demo）。
+    """
+    from models.attachment import Attachment
+    from models.site_event import SiteEvent, SiteEventEntry, SiteEventLog
+    from models.work import Work
+    from site_v1.services.attachments import storage_key
+    from site_v1.storage import get_storage
+
+    demo, lin = accounts.get("demo"), accounts.get("lin")
+    if demo is None:
+        print("跳过示例活动：没有 demo 账号")
+        return
+    lin = lin or demo
+    now = utc_now()
+
+    def at(days: float):
+        return now + timedelta(days=days)
+
+    async with session_factory() as session:
+        works = {
+            w.title: w
+            for w in (
+                await session.execute(select(Work).where(Work.deleted_at.is_(None), Work.title.like("【示例】%")))
+            ).scalars()
+        }
+
+        async def cover(title: str, rgb) -> int:
+            data = seed_png(120, 52, rgb)
+            key = storage_key("event-cover.png")
+            await get_storage().put(key, data, "image/png")
+            att = Attachment(
+                owner_id=demo, purpose="cover", kind="image", filename="event-cover.png", mime="image/png",
+                size=len(data), storage_key=key, state="ready", rating="general", auto_rating="general",
+                review_state="auto", width=120, height=52, completed_at=now,
+            )
+            session.add(att)
+            await session.flush()
+            return att.id
+
+        general = {"resourceTypes": [], "requiredTags": [], "ratings": ["general"], "newWorksSince": None,
+                   "maxEntriesPerUser": 3, "allowNewcomers": True}
+        specs = [
+            dict(slug="autumn-2026", title="秋日物语 · 主题创作月", rgb=(214, 140, 60),
+                 summary="以「秋天」为主题创作角色卡、世界书或美化，截止前随时可以提交。",
+                 body="## 活动介绍\n\n秋天到了，来写一张关于秋天的卡吧！\n\n- 主题：秋天、丰收、落叶、告别……都可以\n- 资源类型不限\n- 截止后由主办人评定，公布获奖作品",
+                 rules="1. 只能提交自己的作品。\n2. 截止后锁定当时的最新版本参评，之后照常可以更新。\n3. 主办人可以拒绝不符合主题的作品，并写明理由。",
+                 start=-6, end=8, result=15, eligibility=general, organizers=[lin],
+                 divisions=[{"id": "ev_autumn_d1", "name": "全年龄组", "ratings": ["general"]}],
+                 awards=[{"id": "ev_autumn_a1", "divisionId": "ev_autumn_d1", "name": "金叶奖", "description": "最佳作品", "order": 1, "decorRoleId": None},
+                         {"id": "ev_autumn_a2", "divisionId": "ev_autumn_d1", "name": "银叶奖", "description": "优秀作品", "order": 2, "decorRoleId": None}],
+                 entries=[("【示例】角色卡", "ev_autumn_d1", {}), ("【示例】世界书", "ev_autumn_d1", {})]),
+            dict(slug="summer-cards-2026", title="夏日角色卡大赛", rgb=(60, 150, 210),
+                 summary="2026 年夏季角色卡比赛，分全年龄组和 R18 组评奖。",
+                 body="## 夏日角色卡大赛\n\n收稿期已经结束，结果见「结果」标签。", rules="1. 同时收全年龄和 R18 作品，按分级分组评奖。",
+                 start=-60, end=-30, result=-20, published=-20,
+                 eligibility={**general, "ratings": ["general", "r18"], "maxEntriesPerUser": 2}, organizers=[lin],
+                 divisions=[{"id": "ev_summer_general", "name": "全年龄组", "ratings": ["general"]},
+                            {"id": "ev_summer_r18", "name": "R18 组", "ratings": ["r18"]}],
+                 awards=[{"id": "ev_summer_g1", "divisionId": "ev_summer_general", "name": "一等奖", "description": "全年龄组最佳", "order": 1, "decorRoleId": None},
+                         {"id": "ev_summer_r1", "divisionId": "ev_summer_r18", "name": "一等奖", "description": "R18 组最佳", "order": 1, "decorRoleId": None}],
+                 entries=[("【示例】角色卡", "ev_summer_general", {"award_id": "ev_summer_g1", "award_note": "人设完整，开场白很有画面感。"}),
+                          ("【示例】R18 角色卡", "ev_summer_r18", {"award_id": "ev_summer_r1", "award_note": "剧情张力强。"})]),
+            dict(slug="tools-2026", title="工具与美化创意赛", rgb=(120, 90, 200),
+                 summary="给酒馆做点好用的东西：美化、插件、工具、预设都可以。",
+                 body="## 工具与美化创意赛\n\n收稿已经截止，主办人正在评定中。", rules="1. 收美化、插件、工具、预设。\n2. 截止时锁定参赛版本。",
+                 start=-25, end=-2, result=5, eligibility={**general, "allowNewcomers": False}, organizers=[demo],
+                 divisions=[{"id": "ev_tools_d1", "name": "全年龄组", "ratings": ["general"]}],
+                 awards=[{"id": "ev_tools_a1", "divisionId": "ev_tools_d1", "name": "最佳创意", "description": "", "order": 1, "decorRoleId": None}],
+                 entries=[("【示例】全年龄美化包", "ev_tools_d1", {}), ("【示例】插件", "ev_tools_d1", {}),
+                          ("【示例】工具", "ev_tools_d1", {}),
+                          ("【示例】预设", "ev_tools_d1", {"state": "rejected", "state_reason": "作品和活动主题无关"})]),
+            dict(slug="winter-2026", title="冬至世界书共创", rgb=(150, 190, 220),
+                 summary="冬至前后开放收稿，围绕「冬」写世界书。", body="## 冬至世界书共创\n\n还没开始收稿，可以先关注。",
+                 rules="1. 只收世界书。\n2. 只收活动开始后发布的新作。", start=12, end=40, result=50,
+                 eligibility={**general, "maxEntriesPerUser": 1}, organizers=[lin],
+                 divisions=[{"id": "ev_winter_d1", "name": "全年龄组", "ratings": ["general"]}],
+                 awards=[{"id": "ev_winter_a1", "divisionId": "ev_winter_d1", "name": "最佳世界书", "description": "", "order": 1, "decorRoleId": None}],
+                 entries=[]),
+            dict(slug="night-2026", title="深夜限定征集", rgb=(70, 40, 90), audience="r18",
+                 summary="只收 R18 角色卡的征集活动。", body="## 深夜限定征集\n\n只对开启 R18 模式的账号可见。", rules="1. 只收 R18 角色卡。",
+                 start=-4, end=6, result=12, eligibility={**general, "ratings": ["r18"], "maxEntriesPerUser": 1, "allowNewcomers": False},
+                 organizers=[lin], divisions=[{"id": "ev_night_d1", "name": "R18 组", "ratings": ["r18"]}],
+                 awards=[{"id": "ev_night_a1", "divisionId": "ev_night_d1", "name": "深夜之星", "description": "", "order": 1, "decorRoleId": None}],
+                 entries=[("【示例】R18 角色卡", "ev_night_d1", {})]),
+            dict(slug="spring-2027", title="新春贺岁活动（筹备中）", rgb=(200, 60, 60), manual="draft",
+                 summary="筹备中的活动，还没发布。", body="草稿", rules="", start=90, end=110, result=120,
+                 eligibility=general, organizers=[], divisions=[{"id": "ev_draft_d1", "name": "全年龄组", "ratings": ["general"]}],
+                 awards=[], entries=[]),
+        ]
+        for spec in specs:
+            exists = (await session.execute(select(SiteEvent.id).where(SiteEvent.slug == spec["slug"]))).first()
+            if exists:
+                print(f"活动 {spec['slug']} 已存在（{exists[0]}），跳过")
+                continue
+            e = SiteEvent(
+                slug=spec["slug"], title=spec["title"], summary=spec["summary"], body=spec["body"], rules=spec["rules"],
+                cover_attachment_id=await cover(spec["title"], spec["rgb"]), audience=spec.get("audience", "all"),
+                manual_state=spec.get("manual", "published"), submit_start_at=at(spec["start"]),
+                submit_end_at=at(spec["end"]), result_at=at(spec["result"]), eligibility=spec["eligibility"],
+                divisions=spec["divisions"], awards=spec["awards"], organizer_ids=spec["organizers"], results_draft=[],
+                results_published_at=at(spec["published"]) if "published" in spec else None,
+                created_at=at(min(spec["start"], 0) - 14), updated_at=at(min(spec["end"], 0)),
+            )
+            session.add(e)
+            await session.flush()
+            draft: dict[str, list[str]] = {}
+            notes: dict[str, dict[str, str]] = {}
+            for title, division, extra in spec["entries"]:
+                w = works.get(title)
+                if w is None:
+                    continue
+                en = SiteEventEntry(
+                    event_id=e.id, division_id=division, work_id=w.id, submitted_by=w.author_id,
+                    note=f"「{w.title}」参加{e.title}。", state=extra.get("state", "accepted"),
+                    state_reason=extra.get("state_reason"), award_id=extra.get("award_id"),
+                    award_note=extra.get("award_note", ""), submitted_at=max(e.submit_start_at, w.created_at) + timedelta(hours=1),
+                )
+                session.add(en)
+                await session.flush()
+                if en.award_id:
+                    draft.setdefault(en.award_id, []).append(str(en.id))
+                    notes.setdefault(en.award_id, {})[str(en.id)] = en.award_note
+            e.results_draft = [{"awardId": a, "entryIds": ids, "notes": notes[a]} for a, ids in draft.items()]
+            session.add(SiteEventLog(event_id=e.id, actor_id=demo, action="create", detail="建立活动（草稿）", at=e.created_at))
+            if e.manual_state == "published":
+                session.add(SiteEventLog(event_id=e.id, actor_id=demo, action="publish", detail="发布活动", at=e.created_at + timedelta(hours=1)))
+            if e.results_published_at:
+                session.add(SiteEventLog(event_id=e.id, actor_id=demo, action="results_publish", detail="公布结果", at=e.results_published_at))
+            print(f"活动 {spec['slug']} -> {e.id}")
+        await session.commit()
+
+
+async def seed_fun(session_factory, accounts: dict[str, str]) -> None:
+    """娱乐区：几个账号先有点类脑币（排行榜演示），股市开张并预跑 60 天历史。"""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from models.site_fun import SiteFunWallet
+    from site_v1.services.fun import stocks
+
+    balances = {"lin": 2650, "newbie": 860}
+    now = utc_now()
+    async with session_factory() as session:
+        for username, balance in balances.items():
+            user_id = accounts.get(username)
+            if user_id:
+                await session.execute(
+                    pg_insert(SiteFunWallet)
+                    .values(user_id=user_id, balance=balance, created_at=now, updated_at=now)
+                    .on_conflict_do_nothing(index_elements=[SiteFunWallet.user_id])
+                )
+        await stocks.ensure_market(session)
+        await session.commit()
+    print("娱乐区：钱包、股市已就绪")
+
+
 async def main() -> None:
     accounts = await seed_accounts(AsyncSessionFactory)
     await seed_tag_catalog(AsyncSessionFactory)
     await seed_works(AsyncSessionFactory, accounts)
+    await seed_events(AsyncSessionFactory, accounts)
+    await seed_fun(AsyncSessionFactory, accounts)
     from shared.database import async_engine
 
     await async_engine.dispose()

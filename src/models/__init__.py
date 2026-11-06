@@ -55,6 +55,19 @@ from models.site_tag import SiteTag, SiteTagGroup, SiteTagQuestion, SiteWorkTag
 from models.work_version import WorkVersion, WorkVersionFile
 from models.attachment import Attachment
 from models.site_moderation import ModerationQueueItem, Report, UserModerationRecord
+# 活动（3.22）、娱乐区（/fun）：events 块
+from models.site_event import SiteEvent, SiteEventEntry, SiteEventFollow, SiteEventLog  # noqa: F401
+from models.site_fun import (  # noqa: F401
+    SiteFunBlackjackRound,
+    SiteFunBlackjackShoe,
+    SiteFunMarket,
+    SiteFunStockAccount,
+    SiteFunStockBar,
+    SiteFunStockNews,
+    SiteFunStockPosition,
+    SiteFunStockTrade,
+    SiteFunWallet,
+)
 
 __all__ = [
     "Attachment",

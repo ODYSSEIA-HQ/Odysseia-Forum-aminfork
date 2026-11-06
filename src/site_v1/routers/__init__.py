@@ -15,6 +15,7 @@ from site_v1.routers import (
     versions,
     works,
 )
+from site_v1.routers import events, fun, share  # 活动、娱乐区、分享预览（events 块）
 
 router = APIRouter(prefix="/api/v1")
 for module in (
@@ -29,6 +30,9 @@ for module in (
     chat,
     reports,
     moderation,
+    events,
+    fun,
+    share,
 ):
     router.include_router(module.router)
 
