@@ -541,6 +541,31 @@ class WorkTaskWorker:
                     work.source_guild_id, work.source_thread_id
                 )
 
+        elif (
+            task.kind == "policy"
+            and task.payload.get("source") == "forum_initializing"
+            and task.payload.get("active") is False
+            and not task.payload.get("target_user_id")
+        ):
+            # 仅在原生开放成功后，与任务完成一起提交本地就绪状态。
+            # 不从普通快照或其他锁的解除推断初始化完成。
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:id)"), {"id": task.work_id}
+            )
+            child = (
+                await session.execute(
+                    select(Thread).where(
+                        Thread.work_id == task.work_id,
+                        Thread.platform == "fluxer",
+                        Thread.guild_id == int(task.payload["guild_id"]),
+                        Thread.thread_id == int(task.payload["thread_id"]),
+                        Thread.role == "child",
+                    ).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if child is None or task.dedupe_key != "release-child:" + str(child.id):
+                raise RuntimeError("初始化开放任务与子帖不匹配")
+            child.initializing = False
         elif task.kind == "edit_thread":
             thread = (
                 (
