@@ -164,17 +164,22 @@ async def work_mute(session, work_id: int, user_id: str) -> tuple[bool, datetime
 
 
 def attachment_url(att: Attachment) -> str | None:
-    """审核员用的可访问地址。
+    """审核员用的可访问地址：不按内容模式隐藏，未传完的不给。
 
-    地址由上传领域生成（签名、CDN）：约定它提供
-    site_v1.services.uploads.attachment_url(att, *, reviewer=True) -> str | None；
-    还没有时返回 None（见 known-gaps / README）。
+    R18/R18G 和全年龄都走存储适配器的短期签名地址（审核员视角一律签发）。
     """
-    try:
-        from site_v1.services.uploads import attachment_url as build  # type: ignore
-    except ImportError:
+    if not att.storage_key or att.state == "uploading":
         return None
-    return build(att, reviewer=True)
+    from site_v1.storage import get_storage
+
+    rating = att.rating or "general"
+    return get_storage().read_url(
+        att.storage_key,
+        mime=att.mime,
+        public=rating == "general",
+        filename=att.filename,
+        viewer_id=None,
+    )
 
 
 def reviewer_attachment(att: Attachment | None) -> dict | None:
