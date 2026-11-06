@@ -1,5 +1,3 @@
 {
-  "RL-01": "/api/v1 还没有按账号限频（1.6）；旧 RateLimitMiddleware 只管 /v1、/v2",
-  "RL-02": "/api/v1 还没有按 IP 限频（1.6）；默认不跑",
   "CHT-02": "协议 ChatTarget.kind 只有 work/dm；前端的公共聊天区要 channel（10-28 计划里记为待加进协议），后端按前端返回 channel。协议加上 channel 后删掉这一条"
 }

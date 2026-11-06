@@ -9,7 +9,9 @@
 - 权限：站务 = events.manage（site.admin 视为全部）；主办人 = organizer_ids，只在本活动有效；
   主办人不能参加自己主办的活动；收 R18 作品的活动，主办人必须有 R18 资格。
 - 服务函数只 flush，事务由路由在生成响应后统一提交（expire_on_commit=True，提交后不能再读行）。
-- 没做：获奖自动发勋章（装饰身份组是另一块，公布时只记日志）、关注者/参赛者提醒、Work.events 角标。
+- 公布结果时给挂了 decorRoleId 的奖项的获奖作者发装饰身份组（services/me_extra.grant_decoration）；
+  Work.events 角标见 work_event_refs；活动资格里的 tag 对外写成「组:名字」（见 tag_label）。
+- 没做：关注者/参赛者提醒。
 """
 
 import re
@@ -20,7 +22,7 @@ from sqlalchemy import select
 
 from models.attachment import Attachment
 from models.site_event import SiteEvent, SiteEventEntry, SiteEventFollow, SiteEventLog
-from models.site_tag import SiteWorkTag
+from models.site_tag import SiteTag, SiteWorkTag
 from models.user import User
 from models.work import Work
 from models.work_version import WorkVersion
@@ -143,6 +145,64 @@ def eligibility_dto(e: SiteEvent) -> dict:
         "maxEntriesPerUser": int(el.get("maxEntriesPerUser") or 1),
         "allowNewcomers": el.get("allowNewcomers") is not False,
     }
+
+
+def tag_label(tag: SiteTag) -> str:
+    """活动资格里 tag 的对外写法「组:名字」，和前端假后端的 tag ID（如 type:角色卡）一致。
+
+    前端活动页按 `id.split(":").pop()` 显示名字，只给数字 ID 时会显示成数字。
+    """
+    return f"{tag.group_id}:{tag.name}"
+
+
+async def eligibility_labels(session, events: list[SiteEvent]) -> dict[str, str]:
+    """活动资格里存的 tag ID（数字字符串）→「组:名字」。"""
+    raw = {
+        str(t)
+        for e in events
+        for key in ("resourceTypes", "requiredTags")
+        for t in ((e.eligibility or {}).get(key) or [])
+    }
+    ids = [int(t) for t in raw if t.isdigit()]
+    if not ids:
+        return {}
+    rows = (await session.execute(select(SiteTag).where(SiteTag.id.in_(ids)))).scalars()
+    return {str(t.id): tag_label(t) for t in rows}
+
+
+def eligibility_out(e: SiteEvent, labels: dict[str, str]) -> dict:
+    """对外的 EventEligibility：tag 写成「组:名字」（找不到的原样给）。"""
+    el = eligibility_dto(e)
+    for key in ("resourceTypes", "requiredTags"):
+        el[key] = [labels.get(str(t), str(t)) for t in el[key]]
+    return el
+
+
+async def normalize_tag_refs(session, raw, field_name: str, errors: dict) -> list[str]:
+    """管理端传来的资格 tag：接受数字 ID 和「组:名字」两种写法，统一存成数字 ID 字符串。"""
+    out: list[str] = []
+    for item in raw or []:
+        value = str(item).strip()
+        if not value:
+            continue
+        tag = None
+        if value.isdigit():
+            tag = await session.get(SiteTag, int(value))
+        elif ":" in value:
+            group, name = value.split(":", 1)
+            tag = (
+                await session.execute(
+                    select(SiteTag).where(
+                        SiteTag.group_id == group, SiteTag.name == name, SiteTag.deleted_at.is_(None)
+                    )
+                )
+            ).scalars().first()
+        if tag is None or tag.deleted_at is not None:
+            errors["eligibility"] = f"{field_name} 里有不存在的 tag：{value}"
+            continue
+        if str(tag.id) not in out:
+            out.append(str(tag.id))
+    return out
 
 
 def timeline_dto(e: SiteEvent) -> dict:
@@ -281,6 +341,7 @@ async def event_dtos(session, ctx: SiteContext, events: list[SiteEvent]) -> list
         return []
     viewer = ctx.viewer
     public = await public_entries_by_event(session, ctx, events)
+    labels = await eligibility_labels(session, events)
     organizer_ids = {uid for e in events for uid in (e.organizer_ids or [])}
     users = await load_users(session, organizer_ids)
     covers = {
@@ -339,7 +400,7 @@ async def event_dtos(session, ctx: SiteContext, events: list[SiteEvent]) -> list
                 "audience": e.audience,
                 "state": event_state(e),
                 "timeline": timeline_dto(e),
-                "eligibility": eligibility_dto(e),
+                "eligibility": eligibility_out(e, labels),
                 "divisions": [
                     {"id": d["id"], "name": d.get("name", ""), "ratings": list(d.get("ratings") or [])}
                     for d in divisions
@@ -442,6 +503,45 @@ async def entry_dtos(session, ctx: SiteContext, e_by_id: dict[int, SiteEvent], e
             }
         )
     return [o for o in out if o["work"] is not None]
+
+
+async def work_event_refs(session, ctx: SiteContext, work_ids: list[int]) -> dict[int, list[dict]]:
+    """Work.events：作品参加的活动（参赛、获奖角标），对齐假后端 workEventRefs。
+
+    只列 accepted 的条目；取消的活动、查看者看不到的活动（R18 活动、别人的草稿）和分组不出现；
+    结果公布后才带 award。作品本身的可见性由调用方（serialize_works）保证。
+    """
+    out: dict[int, list[dict]] = {}
+    if not work_ids:
+        return out
+    rows = (
+        await session.execute(
+            select(SiteEventEntry, SiteEvent)
+            .join(SiteEvent, SiteEvent.id == SiteEventEntry.event_id)
+            .where(
+                SiteEventEntry.work_id.in_(list(work_ids)),
+                SiteEventEntry.state == "accepted",
+                SiteEvent.manual_state != "cancelled",
+            )
+            .order_by(SiteEventEntry.submitted_at, SiteEventEntry.id)
+        )
+    ).all()
+    for en, e in rows:
+        if not event_visible(e, ctx):
+            continue
+        division = next((d for d in e.divisions or [] if d.get("id") == en.division_id), None)
+        if division is None or not division_visible(division, ctx):
+            continue
+        award = award_by_id(e, en.award_id) if e.results_published_at else None
+        out.setdefault(en.work_id, []).append(
+            {
+                "eventId": str(e.id),
+                "title": e.title,
+                "entryId": str(en.id),
+                "award": {"id": award["id"], "name": award.get("name", "")} if award else None,
+            }
+        )
+    return out
 
 
 async def add_log(session, e: SiteEvent, actor: Viewer | None, action: str, detail: str, work_id: int | None = None) -> None:
@@ -570,16 +670,16 @@ async def ineligible_reason(session, e: SiteEvent, work: Work, viewer: Viewer) -
         return "只能提交自己的作品"
     if work.status != "published":
         return "作品还没发布"
-    tag_ids = {
-        str(t)
-        for t in (
-            await session.execute(
-                select(SiteWorkTag.tag_id).where(
-                    SiteWorkTag.work_id == work.id, SiteWorkTag.removed_at.is_(None)
-                )
-            )
-        ).scalars()
-    }
+    # 作品上的 tag：数字 ID 和「组:名字」两种写法都认（旧数据里可能存的是后一种）
+    tag_ids: set[str] = set()
+    for tag in (
+        await session.execute(
+            select(SiteTag)
+            .join(SiteWorkTag, SiteWorkTag.tag_id == SiteTag.id)
+            .where(SiteWorkTag.work_id == work.id, SiteWorkTag.removed_at.is_(None))
+        )
+    ).scalars():
+        tag_ids.update((str(tag.id), tag_label(tag)))
     if el["resourceTypes"] and not any(str(t) in tag_ids for t in el["resourceTypes"]):
         return "资源类型不符合"
     missing = [str(t) for t in el["requiredTags"] if str(t) not in tag_ids]
@@ -900,13 +1000,32 @@ async def publish_results(session, ctx: SiteContext, raw_id) -> dict:
             en.award_id = award["id"]
             en.award_note = (d.get("notes") or {}).get(str(raw), "")
             if award.get("decorRoleId"):
-                winners.append(en.submitted_by)
+                winners.append((en.submitted_by, award))
     e.results_published_at = utc_now()
-    # 勋章（装饰身份组）在另一块：这里只记日志，发放由装饰模块接上
+    # 获奖后自动发勋章（E9）：奖项挂了装饰身份组时发给获奖作者，操作人要有 roles.grant_decor
+    # （同假后端）；发进 site_user_decoration_grant，和 /me/decorations、勋章墙是同一份数据
     detail = "公布结果"
     if winners:
-        names = await load_users(session, winners)
-        detail += f"，待发勋章：{'、'.join(names[u]['displayName'] for u in dict.fromkeys(winners) if u in names)}"
+        from site_v1.services.me_extra import grant_decoration
+
+        names = await load_users(session, [u for u, _ in winners])
+        if viewer.has_permission("roles.grant_decor"):
+            medals: list[str] = []
+            for user_id, award in winners:
+                fresh = await grant_decoration(
+                    session,
+                    user_id,
+                    str(award["decorRoleId"]),
+                    f"活动：{e.title} {award.get('name', '')}",
+                    f"{e.title}·{award.get('name', '')}",
+                )
+                if fresh and user_id in names and names[user_id]["displayName"] not in medals:
+                    medals.append(names[user_id]["displayName"])
+            if medals:
+                detail += f"，发放勋章给 {'、'.join(medals)}"
+        else:
+            pending = dict.fromkeys(names[u]["displayName"] for u, _ in winners if u in names)
+            detail += f"，没有 roles.grant_decor 权限，未发勋章：{'、'.join(pending)}"
     await add_log(session, e, viewer, "results_publish", detail)
     await session.flush()
     return await event_dto(session, ctx, e)
@@ -1000,8 +1119,8 @@ async def apply_admin_input(session, viewer: Viewer, e: SiteEvent, body: dict, c
         if since and parse_time(since) is None:
             errors["eligibility"] = "newWorksSince 时间格式不对"
         e.eligibility = {
-            "resourceTypes": [str(x) for x in el.get("resourceTypes") or []],
-            "requiredTags": [str(x) for x in el.get("requiredTags") or []],
+            "resourceTypes": await normalize_tag_refs(session, el.get("resourceTypes"), "resourceTypes", errors),
+            "requiredTags": await normalize_tag_refs(session, el.get("requiredTags"), "requiredTags", errors),
             "ratings": ratings,
             "newWorksSince": iso_utc(parse_time(since)) if since and parse_time(since) else None,
             "maxEntriesPerUser": max(1, min(20, max_entries)),

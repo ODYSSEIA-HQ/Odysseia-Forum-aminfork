@@ -418,39 +418,96 @@ async def featured_items(
     ]
 
 
+PROMOTABLE_EVENT_STATES = ("upcoming", "open", "judging")
+
+
+async def _promoted_events(
+    session, ctx, promos: list[dict], *, promotable_only: bool = False
+) -> dict[str, dict]:
+    """推广里的活动：targetId → 协议 Event（查看者看不到的不给；promotable_only 时只要还没结束的）。"""
+    from site_v1.services import events as ev
+
+    found = {}
+    for p in promos:
+        target = str(p.get("targetId") or "")
+        if not target or target in found:
+            continue
+        e = await ev.find_event(session, target)
+        if not ev.event_visible(e, ctx):
+            continue
+        if promotable_only and ev.event_state(e) not in PROMOTABLE_EVENT_STATES:
+            continue
+        found[target] = e
+    if not found:
+        return {}
+    dtos = await ev.event_dtos(session, ctx, list(found.values()))
+    return {target: dto for target, dto in zip(found, dtos)}
+
+
 async def grid_promotions(
     session, ctx, board: str | None, exclude: list[str]
 ) -> list[dict]:
-    """网格里混入的推广：作品（对查看者可见、在这个主榜里）。活动推广要等活动接口上线，先不出。"""
+    """网格里混入的推广：作品（对查看者可见、在这个主榜里）和活动（对查看者可见、还没结束）。"""
     conds = await _type_conds(session, ctx, None, board)
     candidates = [
         p
         for p in await _active_promotions(session, "grid", exclude)
-        if p.get("kind") == "work"
+        if p.get("kind") in ("work", "event")
     ]
-    ids = [parse_id(p.get("targetId")) for p in candidates]
+    ids = [parse_id(p.get("targetId")) for p in candidates if p.get("kind") == "work"]
     ids = [x for x in ids if x is not None]
-    if not ids:
-        return []
-    visible = set(
-        (
-            await session.execute(select(Work.id).where(Work.id.in_(ids), *conds))
-        ).scalars()
+    visible = (
+        set(
+            (
+                await session.execute(select(Work.id).where(Work.id.in_(ids), *conds))
+            ).scalars()
+        )
+        if ids
+        else set()
     )
-    chosen: list[tuple[int, str]] = []
+    events = await _promoted_events(
+        session,
+        ctx,
+        [p for p in candidates if p.get("kind") == "event"],
+        promotable_only=True,
+    )
+    chosen: list[tuple[str, str, str]] = []
     for p in candidates:
-        wid = parse_id(p.get("targetId"))
         pid = promotion_id(p)
-        if wid in visible and all(x != pid for _, x in chosen):
-            chosen.append((wid, pid))
+        if any(x == pid for _, _, x in chosen):
+            continue
+        if p.get("kind") == "work":
+            wid = parse_id(p.get("targetId"))
+            if wid in visible:
+                chosen.append(("work", str(wid), pid))
+        elif str(p.get("targetId") or "") in events:
+            chosen.append(("event", str(p.get("targetId")), pid))
         if len(chosen) >= GRID_PROMOTION_LIMIT:
             break
-    works = await _serialize_ids(session, ctx, [w for w, _ in chosen])
-    return [
-        {"id": f"promo:{pid}", "promotionId": pid, "kind": "work", "work": works[w]}
-        for w, pid in chosen
-        if w in works
-    ]
+    works = await _serialize_ids(
+        session, ctx, [int(t) for k, t, _ in chosen if k == "work"]
+    )
+    out = []
+    for kind, target, pid in chosen:
+        if kind == "work" and int(target) in works:
+            out.append(
+                {
+                    "id": f"promo:{pid}",
+                    "promotionId": pid,
+                    "kind": "work",
+                    "work": works[int(target)],
+                }
+            )
+        elif kind == "event":
+            out.append(
+                {
+                    "id": f"promo:{pid}",
+                    "promotionId": pid,
+                    "kind": "event",
+                    "event": events[target],
+                }
+            )
+    return out
 
 
 # ---------------- 横幅 ----------------
@@ -739,11 +796,35 @@ async def search_suggest(ctx: Ctx, q: str = ""):
                 .limit(5)
             )
         ).all()
+        # 活动：标题含关键字、查看者看得到的（R18 活动对全年龄模式不联想，草稿只给主办人和站务）
+        from models.site_event import SiteEvent
+        from site_v1.services import events as ev
+
+        event_rows = (
+            (
+                await session.execute(
+                    select(SiteEvent)
+                    .where(
+                        func.lower(SiteEvent.title).contains(needle, autoescape=True)
+                    )
+                    .order_by(SiteEvent.submit_end_at.desc(), SiteEvent.id)
+                    .limit(20)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        events = [
+            {"id": str(e.id), "title": e.title}
+            for e in event_rows
+            if ev.event_visible(e, ctx)
+        ][:5]
     return {
         **empty,
         "tags": tags[:8],
         "works": [{"id": str(i), "title": t} for i, t in works],
         "users": [{"id": str(i), "displayName": d or u} for i, d, u in users],
+        "events": events,
     }
 
 
@@ -1247,6 +1328,9 @@ async def _admin_featured(session, ctx) -> dict:
         works = {
             int(d["id"]): d for d in await svc.serialize_works(session, ctx, visible)
         }
+    event_dtos = await _promoted_events(
+        session, ctx, [p for p in promos if p.get("kind") == "event"]
+    )
     out = []
     for p in promos:
         item = {k: v for k, v in p.items() if k != "notified"}
@@ -1255,7 +1339,9 @@ async def _admin_featured(session, ctx) -> dict:
         item["work"] = (
             works.get(parse_id(p.get("targetId"))) if p.get("kind") == "work" else None
         )
-        item["event"] = None
+        item["event"] = (
+            event_dtos.get(str(p.get("targetId"))) if p.get("kind") == "event" else None
+        )
         item["state"] = promotion_state(p, now)
         item["notified"] = p.get("notified")
         out.append(item)
@@ -1307,8 +1393,10 @@ async def put_admin_featured(ctx: Ctx, body: dict = Body(...)):
             if kind == "work" and (not target or await _unpublished(session, [target])):
                 raise invalid({at: f"{n}：作品「{target or '（空）'}」不存在或没发布"})
             if kind == "event":
-                # 活动（杯赛）接口还没上线，找不到任何活动
-                raise invalid({at: f"{n}：活动「{target or '（空）'}」不存在"})
+                from site_v1.services import events as ev
+
+                if not target or await ev.find_event(session, target) is None:
+                    raise invalid({at: f"{n}：活动「{target or '（空）'}」不存在"})
             key = f"{kind}:{target}"
             if key in seen:
                 raise invalid(

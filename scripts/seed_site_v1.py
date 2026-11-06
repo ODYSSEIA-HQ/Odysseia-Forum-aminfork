@@ -681,6 +681,19 @@ async def seed_events(session_factory, accounts: dict[str, str]) -> None:
 
         general = {"resourceTypes": [], "requiredTags": [], "ratings": ["general"], "newWorksSince": None,
                    "maxEntriesPerUser": 3, "allowNewcomers": True}
+        # 资格里的 tag 存数字 ID（对外写成「组:名字」，见 services/events.tag_label）
+        type_ids = {
+            t.name: str(t.id)
+            for t in (
+                await session.execute(
+                    select(SiteTag).where(SiteTag.group_id == "type", SiteTag.deleted_at.is_(None))
+                )
+            ).scalars()
+        }
+
+        def types(*names: str) -> list[str]:
+            return [type_ids[n] for n in names if n in type_ids]
+
         specs = [
             dict(slug="autumn-2026", title="秋日物语 · 主题创作月", rgb=(214, 140, 60),
                  summary="以「秋天」为主题创作角色卡、世界书或美化，截止前随时可以提交。",
@@ -695,17 +708,20 @@ async def seed_events(session_factory, accounts: dict[str, str]) -> None:
                  summary="2026 年夏季角色卡比赛，分全年龄组和 R18 组评奖。",
                  body="## 夏日角色卡大赛\n\n收稿期已经结束，结果见「结果」标签。", rules="1. 同时收全年龄和 R18 作品，按分级分组评奖。",
                  start=-60, end=-30, result=-20, published=-20,
-                 eligibility={**general, "ratings": ["general", "r18"], "maxEntriesPerUser": 2}, organizers=[lin],
+                 eligibility={**general, "ratings": ["general", "r18"], "maxEntriesPerUser": 2, "resourceTypes": types("角色卡")},
+                 organizers=[lin],
                  divisions=[{"id": "ev_summer_general", "name": "全年龄组", "ratings": ["general"]},
                             {"id": "ev_summer_r18", "name": "R18 组", "ratings": ["r18"]}],
-                 awards=[{"id": "ev_summer_g1", "divisionId": "ev_summer_general", "name": "一等奖", "description": "全年龄组最佳", "order": 1, "decorRoleId": None},
-                         {"id": "ev_summer_r1", "divisionId": "ev_summer_r18", "name": "一等奖", "description": "R18 组最佳", "order": 1, "decorRoleId": None}],
+                 awards=[{"id": "ev_summer_g1", "divisionId": "ev_summer_general", "name": "一等奖", "description": "全年龄组最佳", "order": 1, "decorRoleId": "deco_summer_gold"},
+                         {"id": "ev_summer_r1", "divisionId": "ev_summer_r18", "name": "一等奖", "description": "R18 组最佳", "order": 1, "decorRoleId": "deco_summer_gold"}],
                  entries=[("【示例】角色卡", "ev_summer_general", {"award_id": "ev_summer_g1", "award_note": "人设完整，开场白很有画面感。"}),
                           ("【示例】R18 角色卡", "ev_summer_r18", {"award_id": "ev_summer_r1", "award_note": "剧情张力强。"})]),
             dict(slug="tools-2026", title="工具与美化创意赛", rgb=(120, 90, 200),
                  summary="给酒馆做点好用的东西：美化、插件、工具、预设都可以。",
                  body="## 工具与美化创意赛\n\n收稿已经截止，主办人正在评定中。", rules="1. 收美化、插件、工具、预设。\n2. 截止时锁定参赛版本。",
-                 start=-25, end=-2, result=5, eligibility={**general, "allowNewcomers": False}, organizers=[demo],
+                 start=-25, end=-2, result=5,
+                 eligibility={**general, "allowNewcomers": False, "resourceTypes": types("美化", "插件", "工具", "预设")},
+                 organizers=[demo],
                  divisions=[{"id": "ev_tools_d1", "name": "全年龄组", "ratings": ["general"]}],
                  awards=[{"id": "ev_tools_a1", "divisionId": "ev_tools_d1", "name": "最佳创意", "description": "", "order": 1, "decorRoleId": None}],
                  entries=[("【示例】全年龄美化包", "ev_tools_d1", {}), ("【示例】插件", "ev_tools_d1", {}),
@@ -714,13 +730,14 @@ async def seed_events(session_factory, accounts: dict[str, str]) -> None:
             dict(slug="winter-2026", title="冬至世界书共创", rgb=(150, 190, 220),
                  summary="冬至前后开放收稿，围绕「冬」写世界书。", body="## 冬至世界书共创\n\n还没开始收稿，可以先关注。",
                  rules="1. 只收世界书。\n2. 只收活动开始后发布的新作。", start=12, end=40, result=50,
-                 eligibility={**general, "maxEntriesPerUser": 1}, organizers=[lin],
+                 eligibility={**general, "maxEntriesPerUser": 1, "resourceTypes": types("世界书")}, organizers=[lin],
                  divisions=[{"id": "ev_winter_d1", "name": "全年龄组", "ratings": ["general"]}],
                  awards=[{"id": "ev_winter_a1", "divisionId": "ev_winter_d1", "name": "最佳世界书", "description": "", "order": 1, "decorRoleId": None}],
                  entries=[]),
             dict(slug="night-2026", title="深夜限定征集", rgb=(70, 40, 90), audience="r18",
                  summary="只收 R18 角色卡的征集活动。", body="## 深夜限定征集\n\n只对开启 R18 模式的账号可见。", rules="1. 只收 R18 角色卡。",
-                 start=-4, end=6, result=12, eligibility={**general, "ratings": ["r18"], "maxEntriesPerUser": 1, "allowNewcomers": False},
+                 start=-4, end=6, result=12,
+                 eligibility={**general, "ratings": ["r18"], "maxEntriesPerUser": 1, "allowNewcomers": False, "resourceTypes": types("角色卡")},
                  organizers=[lin], divisions=[{"id": "ev_night_d1", "name": "R18 组", "ratings": ["r18"]}],
                  awards=[{"id": "ev_night_a1", "divisionId": "ev_night_d1", "name": "深夜之星", "description": "", "order": 1, "decorRoleId": None}],
                  entries=[("【示例】R18 角色卡", "ev_night_d1", {})]),
@@ -1000,7 +1017,19 @@ DECORATION_ROLES = [
         20,
     ),
     ("deco_helper", "热心答疑", "在交流区帮助了很多人", "#2e9d6a", "rare", [], 10),
+    (
+        "deco_summer_gold",
+        "夏日大赛·一等奖",
+        "夏日角色卡大赛各组的最佳作品。",
+        "#f97316",
+        "legendary",
+        ["frame"],
+        25,
+    ),
 ]
+
+# 只发给 demo 的示例勋章（活动获奖的勋章按示例活动的获奖条目发，见下面）
+EVENT_DECORATION_ROLES = {"deco_summer_gold"}
 
 
 async def seed_me_block(session_factory, accounts: dict[str, str]) -> None:
@@ -1075,10 +1104,41 @@ async def seed_me_block(session_factory, accounts: dict[str, str]) -> None:
         demo, lin = accounts.get("demo"), accounts.get("lin")
         if demo:
             for rid, *_ in DECORATION_ROLES:
+                if rid in EVENT_DECORATION_ROLES:
+                    continue
                 await session.execute(
                     insert(SiteUserDecorationGrant)
                     .values(
                         user_id=demo, role_id=rid, granted_at=now, source="示例数据"
+                    )
+                    .on_conflict_do_nothing()
+                )
+        # 已公布结果的示例活动：挂了装饰身份组的奖项发给获奖作者（同 POST /events/{id}/results/publish）
+        from models.site_event import SiteEvent, SiteEventEntry
+
+        for e in (
+            await session.execute(select(SiteEvent).where(SiteEvent.results_published_at.is_not(None)))
+        ).scalars():
+            awards = {a["id"]: a for a in e.awards or [] if a.get("decorRoleId")}
+            if not awards:
+                continue
+            for en in (
+                await session.execute(
+                    select(SiteEventEntry).where(
+                        SiteEventEntry.event_id == e.id,
+                        SiteEventEntry.state == "accepted",
+                        SiteEventEntry.award_id.in_(list(awards)),
+                    )
+                )
+            ).scalars():
+                award = awards[en.award_id]
+                await session.execute(
+                    insert(SiteUserDecorationGrant)
+                    .values(
+                        user_id=en.submitted_by,
+                        role_id=award["decorRoleId"],
+                        granted_at=e.results_published_at,
+                        source=f"活动：{e.title} {award['name']}",
                     )
                     .on_conflict_do_nothing()
                 )

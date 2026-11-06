@@ -412,7 +412,10 @@ async def serialize_works(session, ctx, works: list[Work]) -> list[dict]:
             ).scalars()
         )
     hot = await hot_ids(session)
+    from site_v1.services.events import work_event_refs
     from site_v1.services.work_extras import needs_ack_map
+
+    event_refs = await work_event_refs(session, ctx, ids)
 
     acks = await needs_ack_map(
         session,
@@ -466,6 +469,8 @@ async def serialize_works(session, ctx, works: list[Work]) -> list[dict]:
                 },
                 "layout": w.layout,
                 "badges": ["hot"] if w.id in hot else [],
+                # 参加的活动（参赛、获奖角标），v0.4 草案 L
+                "events": event_refs.get(w.id, []),
                 "createdAt": iso_utc(w.created_at),
                 "updatedAt": iso_utc(w.updated_at or w.created_at),
                 "viewer": {
