@@ -255,7 +255,9 @@ async def main():
 
     from identity.runtime import is_fluxer_mode
     from identity.auth_runtime import get_auth_service
-    if is_fluxer_mode():
+    # FLUXER_FAKE=1 时 /api/v1 用假 Fluxer，不连 NATS
+    fluxer_fake = os.environ.get("FLUXER_FAKE", "").lower() in {"1", "true", "yes"}
+    if is_fluxer_mode() and not fluxer_fake:
         await get_auth_service().start()
 
     # 启动 uvicorn API 服务器
@@ -279,7 +281,7 @@ async def main():
         await server.serve()
     finally:
         # 清理
-        if is_fluxer_mode():
+        if is_fluxer_mode() and not fluxer_fake:
             await get_auth_service().close()
         await similar_threads_cache_service.close()
         await impression_cache_service.stop()

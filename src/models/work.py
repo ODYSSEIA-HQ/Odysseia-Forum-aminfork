@@ -1,7 +1,7 @@
 """跨平台作品的统一内容投影。"""
 
 from datetime import datetime
-from sqlalchemy import BigInteger, Column, JSON, Index, event, inspect, func
+from sqlalchemy import BigInteger, Column, JSON, Index, event, inspect, func, text, String, Boolean, DateTime
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from shared.text_utils import build_search_vector_text
 from sqlmodel import SQLModel, Field
@@ -84,6 +84,74 @@ class Work(SQLModel, table=True):
 
     deletion_reason: str | None = None
     """原生主帖删除不可恢复，其余为可管理恢复的隐藏。"""
+
+    # ---- 以下是协议 /api/v1 层（site_v1）加的字段，V1/V2 不读不写 ----
+    # 全部带 server_default：thread 投影触发器 project_thread_work 按列名插入 work，
+    # 不认识这些列，靠数据库默认值补齐。
+
+    status: str = Field(
+        default="published",
+        sa_column=Column(String, nullable=False, server_default="published", index=True
+        ),
+    )
+    """协议 WorkStatus：draft / published / archived / unclaimed / removed。
+    V2 和 DC 来的作品一律视为 published；/api/v1 新建的草稿显式写 draft。"""
+
+    summary: str = Field(
+        default="", sa_column=Column(String, nullable=False, server_default="")
+    )
+    """一句话简介（协议 Work.summary），和 description（正文）分开。"""
+
+    layout: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    """作者自定义的介绍页布局，后端原样存。"""
+
+    cover_attachment_id: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    """封面附件 attachment.id；V2 作品仍用 images 首图。"""
+
+    gallery_attachment_ids: list[int] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
+    """图库附件 ID（有序）。"""
+
+    declarations: list[dict] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
+    """必答问题的回答记录 [{question, answer, versionId, at}]。"""
+
+    rating_lock: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+    """站务锁定分级 {by, at, reason}。"""
+
+    moderation_state: str = Field(
+        default="ok",
+        sa_column=Column(String, nullable=False, server_default="ok"),
+    )
+    """ok / pending_review / hidden / removed。"""
+
+    tag_locked: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+    """作者是否锁定了 tag。"""
+
+    published_at: datetime | None = None
+    """首次发布时间。"""
+
+    updated_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime, nullable=False, server_default=func.now()),
+    )
+    """协议 Work.updatedAt：作品资料最近一次修改时间。"""
+
+    visibility: str = Field(
+        default="public",
+        sa_column=Column(String, nullable=False, server_default="public", index=True
+        ),
+    )
+    """public / restricted 的冗余列，方便列表过滤；由分级和限制 tag 算出。"""
 
 
 @event.listens_for(Work, "before_insert")

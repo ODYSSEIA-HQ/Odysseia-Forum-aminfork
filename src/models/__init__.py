@@ -43,8 +43,109 @@ from models.work_user_mute import WorkUserMute
 from models.work_source_state import WorkSourceState
 from models.work_native_tag_source import WorkNativeTagSource
 from models.work_native_tag_binding import WorkNativeTagBinding
+from models.site_account import (
+    SiteAccount,
+    SiteFakeCredential,
+    SiteRestrictedAccess,
+    SiteSetting,
+    SiteUserBlock,
+    SiteUserPrefs,
+)
+from models.site_tag import SiteTag, SiteTagGroup, SiteTagQuestion, SiteWorkTag
+from models.site_tag_migration import SiteTagMigrationRecord
+from models.work_version import WorkVersion, WorkVersionFile
+from models.attachment import Attachment
+from models.site_moderation import ModerationQueueItem, Report, UserModerationRecord
+from models.site_nav import (
+    SiteBannerMeta,
+    SitePublicChannel,
+    SiteTagAlias,
+    SiteTagDisabled,
+)
+# 活动（3.22）、娱乐区（/fun）：events 块
+from models.site_event import SiteEvent, SiteEventEntry, SiteEventFollow, SiteEventLog  # noqa: F401
+from models.site_fun import (  # noqa: F401
+    SiteFunBlackjackRound,
+    SiteFunBlackjackShoe,
+    SiteFunMarket,
+    SiteFunStockAccount,
+    SiteFunStockBar,
+    SiteFunStockNews,
+    SiteFunStockPosition,
+    SiteFunStockTrade,
+    SiteFunWallet,
+)
+from models.site_chat import (
+    SiteChatDmChannel,
+    SiteChatMessage,
+    SiteChatMessageMeta,
+    SiteChatReadState,
+)
+from models.site_me import (
+    SiteAnnouncement,
+    SiteAnnouncementAck,
+    SiteCollectionMeta,
+    SiteDcArchivePost,
+    SiteDecorationRole,
+    SiteFriend,
+    SiteFriendRequest,
+    SiteNotification,
+    SitePinnedWorks,
+    SitePluginToken,
+    SiteRuleDoc,
+    SiteTagHabits,
+    SiteUserDecorationGrant,
+    SiteUserDecorationPref,
+    SiteUserPreferencesDoc,
+    SiteWorkAck,
+    SiteWorkPin,
+    SiteWorkRules,
+)
 
 __all__ = [
+    "SiteTagMigrationRecord",
+    "SiteBannerMeta",
+    "SitePublicChannel",
+    "SiteTagAlias",
+    "SiteTagDisabled",
+    "SiteChatDmChannel",
+    "SiteChatMessage",
+    "SiteChatMessageMeta",
+    "SiteChatReadState",
+    "SiteAnnouncement",
+    "SiteAnnouncementAck",
+    "SiteCollectionMeta",
+    "SiteDcArchivePost",
+    "SiteDecorationRole",
+    "SiteFriend",
+    "SiteFriendRequest",
+    "SiteNotification",
+    "SitePinnedWorks",
+    "SitePluginToken",
+    "SiteRuleDoc",
+    "SiteTagHabits",
+    "SiteUserDecorationGrant",
+    "SiteUserDecorationPref",
+    "SiteUserPreferencesDoc",
+    "SiteWorkAck",
+    "SiteWorkPin",
+    "SiteWorkRules",
+    "Attachment",
+    "ModerationQueueItem",
+    "Report",
+    "SiteAccount",
+    "SiteFakeCredential",
+    "SiteRestrictedAccess",
+    "SiteSetting",
+    "SiteTag",
+    "SiteTagGroup",
+    "SiteTagQuestion",
+    "SiteUserBlock",
+    "SiteUserPrefs",
+    "SiteWorkTag",
+    "UserModerationRecord",
+    "WorkVersion",
+    "WorkVersionFile",
     "Author",
     "AuthorFollow",
     "BannerApplication",
