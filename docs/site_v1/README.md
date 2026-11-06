@@ -193,10 +193,12 @@ uv run pytest tests/site_v1
 
 - **不走 Fluxer 附件**（Fluxer 会剥 PNG tEXt，角色卡会坏）：`POST /uploads` 建 `attachment` 行（`state=uploading`，uploadId = 附件 ID），签发直传地址；浏览器原样 PUT；`complete` 检查对象到了、大小一致（否则 409），置 `processing`，排分级任务。
 - **本地存储**：直传地址 `PUT /api/storage/upload/{token}`、读取地址 `GET /api/storage/files/{token}`（HMAC 签名，带过期时间；不在 `/api/v1` 下，不要会话和 CSRF）。用 R2 时这两个端点 404，地址是 R2 预签名地址。
-- **分级**（`services/attachments.classify_attachment`）：图片过分级器、记宽高；非图片按作品当前分级。已发布作品的封面/图库/版本文件分级高于作品分级 → `rejected` + `rating_conflict`；草稿不拦（发布时检查）；头像只能全年龄。违禁 → `rejected` + `blocked`。拿不准（suspect）→ `ready`，`rating` 取保守值（至少 r18），`review_state=pending_review`。
+- **分级**（`services/attachments.classify_attachment`）：先算 sha256、记宽高；同一张图（按 sha256）人工复核过的直接用复核结论（`review_state=reviewed`，违禁的照样拦），不再调分级服务（01 号文档 5.1）；否则图片过分级器，非图片按作品当前分级。已发布作品的封面/图库/版本文件分级高于作品分级 → `rejected` + `rating_conflict`；草稿不拦（发布时检查）；头像只能全年龄。违禁 → `rejected` + `blocked`。拿不准（suspect）→ `ready`，`review_state=pending_review`，`rating` 按 01 号文档 5.1 的表取保守值：全年龄作品（或不属于作品）→ r18，R18/R18G 作品 → r18g（模型偏向更高时取更高）；封面/图库/聊天/讨论区图片同一事务里直接进图片审核队列，所属作品 `moderation_state` 置 `pending_review`（审核处理完、作品没有别的待审图片时回到 ok）。
+- **过期清理**（`services/attachments.purge_stale_uploads()`）：申请了直传却一直没 `complete` 的附件（`state=uploading`，创建超过 `SITE_UPLOAD_TICKET_TTL` + 1 小时），删存储里的对象（传了一半或传完没确认的），行标 `deleted_at`。幂等，要由定时任务调用（每小时一次即可；还没接进调度）。
 - **附件对象**（`services/attachments.attachment_dto(att, ctx)`）：有效模式看不到 → `url=null`、`placeholder=true`；全年龄图给公开或长效签名地址；R18 图给按账号签发的 10 分钟签名地址。
 - **版本**：`GET /works/{id}/versions`（keyset 分页，新的在前）、`POST`（作者或 `works.manage_any`；草稿也能发；不传 `fileIds`/`dependencies`/`license` 时沿用上一版）。`fileIds` 必须是本作品 `purpose=version_file`、`ready` 的附件。版本文件的 `url` 是下载接口地址。
 - **下载**：要登录；作品看不到、版本/文件不匹配都 404；`work_statistics.download_count +1`，302 到 10 分钟签名地址。
+- **S3 / R2**（`storage/s3.py`）：直传是预签名 PUT，`Content-Type` 和 `Content-Length` 都签进地址——字节数和 `POST /uploads` 声明的 `size` 不一样，R2 直接 403（不签的话拿到地址就能往桶里塞任意大的文件）。`ticket.headers` 只有 `Content-Type`，`Content-Length` 浏览器按实际字节自动带（脚本不能设）。读取、下载是预签名 GET（`ResponseContentType`、下载时 `ResponseContentDisposition: attachment; filename*=UTF-8''...`），R18 和下载 10 分钟；配了 `SITE_S3_PUBLIC_BASE` 的全年龄图给公开地址。对象原样存取，角色卡 PNG 的 tEXt 块不动（集成测试按字节比对）。`sha256` 流式读整个对象算。
 - **审核接口**：待审图片 = `attachment WHERE review_state='pending_review' AND deleted_at IS NULL`（`auto_rating`、`model_scores`、`purpose`、`work_id`、`owner_id` 都在附件行上）；人工结论用 `attachments.apply_review(att, rating=..., blocked=...)`（不提交事务）。审核员看到的地址由 `moderation_common.reviewer_attachment` 经存储适配器签发。
 
 ## 聊天外层、举报审核（3.5、3.10）
@@ -272,7 +274,29 @@ uv run pytest tests/site_v1
 | `moderation_queue_item` | 审核队列（image / report），同一对象只有一个待处理项 | 审核 |
 | `user_moderation_record` | 警告、全站禁言（mute）、作品调整记录 | 审核 |
 
-tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source`/`category` 约束、自定义标签治理和 DC 同步逻辑，新 tag 混进去会出现在旧接口的标签列表和治理里。旧自定义标签迁成自由 tag（协议 7.3）是后续的数据任务。新表都没有挂 thread/booklist 投影触发器；`work` 新列都有数据库默认值，`project_thread_work` 触发器按列名插入时由默认值补齐。
+| `site_tag_migration_record` | 旧标签迁移记录（`kind` = tag / work / prefs，按 `(kind, legacy_key)` 唯一，重跑覆盖）：旧标签迁成了什么、原分类；作品加了哪些 tag、超额丢了哪些；屏蔽偏好换成了哪些 ID | `scripts/migrate_legacy_tags.py` |
+| `ix_attachment_sha256_reviewed` | `attachment(sha256)` 部分索引（`review_state='reviewed'`），按内容哈希找复核过的同一张图 | 上传分级 |
+
+tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source`/`category` 约束、自定义标签治理和 DC 同步逻辑，新 tag 混进去会出现在旧接口的标签列表和治理里。旧标签迁成协议 tag 见下一节。
+
+## 旧标签迁成协议 tag（协议 7.3）
+
+`scripts/migrate_legacy_tags.py`（逻辑在 `site_v1/legacy_tag_migration.py`，对照表 `scripts/legacy_tag_map.yaml`）：
+
+```bash
+DATABASE_URL=... uv run python scripts/migrate_legacy_tags.py --dry-run --json /tmp/tags-dry.json   # 算完回滚
+DATABASE_URL=... uv run python scripts/migrate_legacy_tags.py --json /tmp/tags.json                # 正式跑，可重跑
+```
+
+- 前提：`alembic upgrade head`（迁移记录表 `site_v1_storage_tag_migration`），官方 tag 目录已 seed。
+- **DC 原生标签**（`tag.source` = discord / fluxer，以及 DC 转过来还没分类的 custom）：按对照表归入题材、功能、内容提示、属性（和形态「纯文字」）；「A/B/C」按表一拆多，拆出来目录里没有的部分变自由 tag；「其他」「其它」丢弃。对不上的：原名清洗后变自由 tag，作品打「待分类」（官方 tag，默认在题材组，没有时脚本建）。对照表来自「DC旧帖迁移完整方案」5.2 和 tag 方案「现有频道和 DC tag 怎么改」，【待定 D12】的拆法先按 5.2 写；最终版由管理员在导出的原标签清单上逐行填，改 YAML 重跑即可。
+- **自定义标签 7 类**（癖好、作品、角色、特质、情节、背景、玩法）和深渊向标签：全部变自由 tag（`group=free`），原分类、是否深渊向记在迁移记录 `detail.legacyCategory` / `isAbyss`。
+- **清洗**：NFKC；分隔符（`/ 、 ， | + & _ -` 等）换成 `·`；去空白、emoji 和其他符号；最长 20 字；清洗后为空或是禁用名的丢弃。**撞名合并**：清洗后和已有官方 tag、自由 tag、同义词不分大小写同名的直接用已有的；几个旧标签清洗成同一个名字的合成一个。
+- **作品上的 tag**（`tag_binding` 当前轮次 + `work_native_tag_binding`）：已有的协议 tag 不动、先占名额；再加官方 tag（DC 原顺序），再加自由 tag（原赞数从高到低，一样的按添加时间早的）；超过 15 个（`SITE_MAX_TAGS`）和组上限（题材 3、形态 1）的丢弃，写进迁移记录。官方 tag 和原生标签来的自由 tag `addedBy` = 作者；自定义标签来的为空（系统）。已删除作品、已结束的绑定、书单上的绑定不迁。
+- **屏蔽标签**：`user_search_preferences.exclude_tags`（名字）按同一映射换成新 tag ID，并进 `site_user_prefs.blocked_tag_ids`；用户按 `fluxer_user_id`，再按 DC ID（`discord_identity`）找，找不到的记 `user_not_found`（用户注册后重跑即可补上）；已关注的 tag 不屏蔽；「待分类」不进屏蔽。
+- **不迁**：赞踩、提议、包含/互斥关系、操作记录；也不删旧表里的任何东西。
+- **幂等**：只增不删；迁移记录按 `(kind, legacy_key)` 覆盖成最新一次（`run_id`）。整个迁移一个事务（加了 advisory lock，不会两个同时跑）。
+- 没做：频道 → 分级/受众/形态/资源类型（7.1，频道对照表还没定）；子服虚拟标签（7.4）；`forTypes` 不检查（作品还没有资源类型 tag）。新表都没有挂 thread/booklist 投影触发器；`work` 新列都有数据库默认值，`project_thread_work` 触发器按列名插入时由默认值补齐。
 
 ## 加新接口的约定
 
@@ -335,6 +359,10 @@ CHT-04、MOD-05、R18-05、R18-17 是「不存在 / 看不到 → 404」的用�
 
 pytest：`uv run pytest tests/site_v1` 全过；全量和接入前基线相比没有新增失败。
 
+- `test_site_v1_s3_integration.py`：真的起一个 S3 兼容服务跑上传、complete、下载 302、图片地址、角色卡 PNG 字节比对、CORS 预检、过期清理。没设 `SITE_S3_IT_ENDPOINT` 或连不上时整个文件跳过。MinIO 官方已停止分发二进制（dl.min.io 返回 410），本地可以用 moto（`pip install 'moto[server]'; moto_server -p 9100`）；moto 不校验签名和过期，相关两条断言会自动跳过，换 MinIO / R2 时会跑。
+- `test_site_v1_classifier_http.py`：站点和假分级服务（`scripts/fake_classifier.py`）都用 uvicorn 在测试进程里起（端口 8834/8835，`SITE_IT_SITE_PORT` / `SITE_IT_CLASSIFIER_PORT` 可改），分级服务真的按签名地址回来拉图。
+- `test_site_v1_legacy_tag_migration.py`：造旧数据跑 dry-run、正式迁移、重跑。
+
 ## 上线前需要的外部配合
 
 **Fluxer**（细节见 [fluxer-rpc.md](./fluxer-rpc.md)；没实现之前对应接口返回 503 `temporarily_unavailable`）：
@@ -346,12 +374,64 @@ pytest：`uv run pytest tests/site_v1` 全过；全量和接入前基线相比�
 
 **对象存储（Cloudflare R2）**：
 
-- 建桶，配 `SITE_S3_ENDPOINT`、`SITE_S3_BUCKET`、`SITE_S3_ACCESS_KEY_ID`、`SITE_S3_SECRET_ACCESS_KEY`（`SITE_STORAGE_BACKEND` 会自动是 `s3`）。
-- 桶 CORS 允许前端域名的 `PUT`、`GET` 和 `Content-Type` 头（浏览器直传）。
+- 建桶，配 `SITE_S3_ENDPOINT`（`https://<account_id>.r2.cloudflarestorage.com`）、`SITE_S3_BUCKET`、`SITE_S3_ACCESS_KEY_ID`、`SITE_S3_SECRET_ACCESS_KEY`（R2 API 令牌，权限「对象读和写」，只限这个桶；`SITE_STORAGE_BACKEND` 会自动是 `s3`，`SITE_S3_REGION` 保持 `auto`）。
+- **桶 CORS（必须配，否则浏览器直传和跨域读图都会被拦）**：R2 控制台 → 桶 → 设置 → CORS 策略，填 [`r2-cors.json`](./r2-cors.json) 的内容（把 `AllowedOrigins` 换成前端的正式域名，本地开发再加 `http://localhost:5173`；不要写 `*`）：
+
+  ```json
+  [
+    {
+      "AllowedOrigins": ["https://forum.example.com", "http://localhost:5173"],
+      "AllowedMethods": ["GET", "HEAD", "PUT"],
+      "AllowedHeaders": ["Content-Type"],
+      "ExposeHeaders": ["ETag", "Content-Length", "Content-Type", "Content-Disposition"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+  ```
+
+  也可以用 `wrangler r2 bucket cors set <桶名> --file docs/site_v1/r2-cors.json`，或任何 S3 客户端 `put-bucket-cors`（格式同上，外面包一层 `{"CORSRules": [...]}`）。要点：`PUT` + `Content-Type` 头给直传（预检请求带 `Access-Control-Request-Headers: content-type`）；`GET`/`HEAD` 给前端 `fetch` 读图、读角色卡 PNG 元数据（`<img>` 不需要 CORS，`fetch`/canvas 需要）；`ExposeHeaders` 里的 `Content-Disposition` 让前端拿到下载文件名。下载走 302 到签名地址是浏览器导航，不受 CORS 限制。`AllowedMethods` 不要加 `DELETE`/`POST`（删除只在服务端用 API 令牌做）。集成测试 `test_s3_cors_preflight_with_documented_rules` 按这份配置测预检。
+- 自定义域名（`SITE_S3_PUBLIC_BASE`）上的公开读取同样受这份 CORS 约束；R2 自定义域名开缓存后，CSAM 扫描工具才会覆盖（01 号文档第六节）。
 - 全年龄图想走公开地址：给桶绑自定义域名，填 `SITE_S3_PUBLIC_BASE`；不填则全年龄图也用签名地址（`SITE_PUBLIC_URL_TTL`）。R18/R18G 和下载始终是 10 分钟签名地址，**不要**把整个桶公开。
 - 现有本地文件（如果用过本地存储）要迁进桶，`storage_key` 不变。
 
-**图片分级服务**：配 `SITE_CLASSIFIER_URL`（和 `SITE_CLASSIFIER_TOKEN`），请求/响应格式见 `classifier.HttpClassifier`；没配时是 `manual`（一律「拿不准」，按 R18 处理并进人工审核队列）。阈值按服务的分数分布调 `SITE_CLASSIFIER_*`。
+**图片分级服务**：配 `SITE_CLASSIFIER_URL`（和 `SITE_CLASSIFIER_TOKEN`），接口约定见下一节；没配时是 `manual`（一律「拿不准」，按 R18 处理并进人工审核队列）。阈值按服务的分数分布调 `SITE_CLASSIFIER_*`。用本地存储时必须配 `SITE_PUBLIC_BASE`（分级服务按绝对地址拉图，否则启动报错）。
+
+### 图片分级服务接口
+
+后端是调用方（`classifier.HttpClassifier`），分级服务实现下面这一个接口。本地假服务 `scripts/fake_classifier.py`（`uv run python scripts/fake_classifier.py --port 8835 --token secret`）照这个形状实现，集成测试 `tests/site_v1/test_site_v1_classifier_http.py` 用它跑通全链路。
+
+请求：`POST {SITE_CLASSIFIER_URL}`，`Content-Type: application/json`，配了 `SITE_CLASSIFIER_TOKEN` 时带 `Authorization: Bearer <token>`。
+
+```json
+{
+  "attachmentId": "123",
+  "url": "https://<R2 预签名地址或 SITE_PUBLIC_BASE/api/storage/files/...>",
+  "mime": "image/png",
+  "filename": "cover.png",
+  "size": 182044,
+  "sha256": "9f86d0…",
+  "width": 512,
+  "height": 768
+}
+```
+
+- `url` 是 10 分钟有效的签名读取地址（绝对地址），服务自己去拉原图；`size`、`sha256` 可用来校验和做哈希库比对；`width`/`height` 认不出时为 null。
+- 超时 `SITE_CLASSIFIER_TIMEOUT` 秒（默认 15），同一张图只调一次（复核过的同图不再调）。`complete` 最多等 `SITE_CLASSIFY_INLINE_WAIT` 秒，等不到先返回 `processing`，分级在后台继续。
+
+响应：HTTP 200，JSON：
+
+```json
+{
+  "scores": {"general": 0.91, "r18": 0.07, "r18g": 0.02},
+  "blocked": false,
+  "rating": "general"
+}
+```
+
+- `scores`：必填，三个键都是 0–1 的数（缺的键按 0）；原样存进 `attachment.model_scores`，审核队列里给审核员看。
+- `blocked`：可选，`true` = 命中违法内容（哈希库等），附件 `rejected` + `blocked`。
+- `rating`：可选，服务自己的结论 `general` / `r18` / `r18g` / `suspect` / `blocked`（例如 WD tagger 按幼态、无码标签组合判出来的），给了就优先用它；不给就按阈值：`r18g ≥ SITE_CLASSIFIER_R18G_THRESHOLD` → r18g，`r18 ≥ SITE_CLASSIFIER_R18_THRESHOLD` → r18，否则 general；最高分低于 `SITE_CLASSIFIER_CONFIDENCE` → suspect（拿不准）。
+- 出错一律按「拿不准」处理（不会因为服务挂了把图当全年龄放出去）：超时、连不上、非 2xx（包括 401 令牌不对）、不是 JSON、`scores` 缺失或不是对象、分数不是数 / NaN / 不在 [0,1]。拿不准 → 保守分级 + 进人工审核队列（见上文「分级」）。
 
 **Discord OAuth**：在 Discord 开发者后台给应用加回调地址 `https://<站点>/api/v1/auth/discord/callback`（或 `SITE_DISCORD_REDIRECT_URI` 指定的地址），配 `SITE_DISCORD_CLIENT_ID` / `_SECRET`（不配回退 config.json `auth`）；前后端不同源时配 `SITE_FRONTEND_BASE`。正式成员身份组 `SITE_DISCORD_ROLE_IDS`（R18 资格的 `discord_role` 条件）。
 
