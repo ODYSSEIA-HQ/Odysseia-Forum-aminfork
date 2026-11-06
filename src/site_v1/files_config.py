@@ -120,6 +120,16 @@ def get_files_config() -> FilesConfig:
         raise RuntimeError("SITE_CLASSIFIER 只能是 stub、http 或 manual")
     if classifier == "http" and not os.environ.get("SITE_CLASSIFIER_URL"):
         raise RuntimeError("SITE_CLASSIFIER=http 需要 SITE_CLASSIFIER_URL")
+    if (
+        classifier == "http"
+        and backend == "local"
+        and not os.environ.get("SITE_PUBLIC_BASE", "").strip()
+    ):
+        # 本地存储的读取地址是本服务的相对路径 /api/storage/...，外部分级服务拉不到图，
+        # 结果是每张图都「服务出错 → 拿不准」进人工队列
+        raise RuntimeError(
+            "SITE_CLASSIFIER=http 配本地存储时需要 SITE_PUBLIC_BASE（分级服务要按绝对地址拉图）"
+        )
 
     return FilesConfig(
         storage_backend=backend,

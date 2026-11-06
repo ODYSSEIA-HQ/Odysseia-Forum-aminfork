@@ -19,6 +19,7 @@ import asyncio
 import logging
 import re
 import secrets
+from datetime import timedelta
 
 from sqlalchemy import select
 
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 PURPOSES = ("cover", "gallery", "version_file", "chat", "avatar", "discussion")
 WORK_PURPOSES = ("cover", "gallery", "version_file")
 IMAGE_ONLY_PURPOSES = ("cover", "gallery", "avatar")
+QUEUE_PURPOSES = ("cover", "gallery", "chat", "discussion")
+"""拿不准的图片进人工队列的用途（和 moderation.IMAGE_USAGES 一致）。"""
 FILENAME_MAX = 200
 HEAD_BYTES = 64 * 1024
 STALE_PROCESSING_SECONDS = 120
@@ -321,6 +324,35 @@ def rating_ceiling(att: Attachment, work: Work | None) -> str | None:
     return None
 
 
+def conservative_rating(result_rating: str | None, work: Work | None) -> str:
+    """拿不准（suspect）时先按什么分级处理（01 号文档 5.1 表格）：
+    全年龄作品（或不属于作品）→ r18；R18 作品 → r18g；R18G 作品 → r18g（通过，可抽查）。
+    模型偏向的分级更高时取更高的。"""
+    base = work_rating(work) if work is not None else modes.GENERAL
+    above = modes.R18 if base == modes.GENERAL else modes.R18G
+    lean = result_rating or modes.R18
+    return lean if modes.rating_rank(lean) > modes.rating_rank(above) else above
+
+
+async def reviewed_by_hash(session, sha: str | None, exclude_id: int) -> Attachment | None:
+    """同一张图（按内容哈希）人工复核过：再上传直接用复核结果（01 号文档 5.1）。"""
+    if not sha:
+        return None
+    return (
+        await session.execute(
+            select(Attachment)
+            .where(
+                Attachment.sha256 == sha,
+                Attachment.kind == "image",
+                Attachment.review_state == "reviewed",
+                Attachment.id != exclude_id,
+            )
+            .order_by(Attachment.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
 async def classify_attachment(attachment_id: int) -> None:
     storage = get_storage()
     factory = get_session_factory()
@@ -328,34 +360,36 @@ async def classify_attachment(attachment_id: int) -> None:
         att = await session.get(Attachment, attachment_id)
         if att is None or att.state != "processing":
             return
-        work = await session.get(Work, att.work_id) if att.work_id else None
-        snapshot = (att.storage_key, att.mime, att.filename, att.size, att.purpose)
-    key, mime, filename, size, _purpose = snapshot
+        snapshot = (att.storage_key, att.mime, att.filename, att.size, att.purpose, att.kind)
+    key, mime, filename, size, _purpose, kind = snapshot
 
     width = height = None
-    sha = None
-    result: Classification | None
-    if is_image(mime):
+    sha = await storage.sha256(key) if hasattr(storage, "sha256") else None
+    result: Classification | None = None
+    prior: Attachment | None = None
+    image = is_image(mime)
+    if image:
         head = await storage.read_head(key, HEAD_BYTES)
         dims = image_size(head)
         if dims:
             width, height = dims
-        result = await get_classifier().classify(
-            ClassifyInput(
-                attachment_id=attachment_id,
-                filename=filename,
-                mime=mime,
-                size=size,
-                width=width,
-                height=height,
-                url=storage.read_url(key, mime=mime, public=False),
-                head=head,
+        if kind == "image":
+            async with factory() as session:
+                prior = await reviewed_by_hash(session, sha, attachment_id)
+        if prior is None:
+            result = await get_classifier().classify(
+                ClassifyInput(
+                    attachment_id=attachment_id,
+                    filename=filename,
+                    mime=mime,
+                    size=size,
+                    width=width,
+                    height=height,
+                    url=storage.read_url(key, mime=mime, public=False),
+                    sha256=sha,
+                    head=head,
+                )
             )
-        )
-    else:
-        result = None
-    if hasattr(storage, "sha256"):
-        sha = await storage.sha256(key)
 
     async with factory() as session:
         att = await session.get(Attachment, attachment_id, with_for_update=True)
@@ -364,7 +398,19 @@ async def classify_attachment(attachment_id: int) -> None:
         work = await session.get(Work, att.work_id) if att.work_id else None
         att.width, att.height = width, height
         att.sha256 = sha
-        if result is None:
+        ceiling = rating_ceiling(att, work)
+        if prior is not None:
+            # 复核过的同一张图：沿用人工结论，不再过模型、不再进队列
+            att.auto_rating = prior.auto_rating
+            att.model_scores = prior.model_scores
+            att.review_state = "reviewed"
+            if prior.state == "rejected" and prior.reject_reason == "blocked":
+                att.state = "rejected"
+                att.reject_reason = "blocked"
+            else:
+                att.rating = prior.rating or modes.GENERAL
+                _ready_or_conflict(att, ceiling)
+        elif result is None:
             # 非图片不过模型：按作品当前分级记
             att.rating = work_rating(work) if work is not None else modes.GENERAL
             att.state = "ready"
@@ -375,19 +421,37 @@ async def classify_attachment(attachment_id: int) -> None:
             if result.blocked:
                 att.state = "rejected"
                 att.reject_reason = "blocked"
+            elif result.needs_review:
+                # 拿不准：先按保守分级放行（只在更高的模式下可见），进人工队列，不拦上传
+                att.rating = conservative_rating(result.rating, work)
+                att.state = "ready"
             else:
                 att.rating = result.rating or modes.GENERAL
-                ceiling = rating_ceiling(att, work)
-                if (
-                    not result.needs_review
-                    and ceiling is not None
-                    and modes.rating_rank(att.rating) > modes.rating_rank(ceiling)
-                ):
-                    att.state = "rejected"
-                    att.reject_reason = "rating_conflict"
-                else:
-                    att.state = "ready"
+                _ready_or_conflict(att, ceiling)
+        needs_queue = (
+            att.review_state == "pending_review"
+            and att.kind == "image"
+            and att.state == "ready"
+            and att.purpose in QUEUE_PURPOSES
+        )
+        if needs_queue and work is not None and (work.moderation_state or "ok") == "ok":
+            work.moderation_state = "pending_review"
+        if needs_queue:
+            # 同一个事务里入队：拿不准的图和它的队列项一起出现
+            from site_v1.services.moderation import enqueue_image
+
+            await session.flush()
+            await enqueue_image(session, att)
         await session.commit()
+
+
+def _ready_or_conflict(att: Attachment, ceiling: str | None) -> None:
+    if ceiling is not None and modes.rating_rank(att.rating) > modes.rating_rank(ceiling):
+        att.state = "rejected"
+        att.reject_reason = "rating_conflict"
+    else:
+        att.state = "ready"
+        att.reject_reason = None
 
 
 async def get_upload(viewer: Viewer, raw_id, ctx: SiteContext) -> dict:
@@ -422,3 +486,47 @@ def apply_review(
         att.state = "ready"
         att.reject_reason = None
     att.review_state = "reviewed"
+
+
+# ---------------- 过期清理 ----------------
+
+STALE_UPLOAD_GRACE_SECONDS = 3600
+
+
+async def purge_stale_uploads(*, limit: int = 500) -> int:
+    """清理申请了直传却一直没 complete 的附件（state=uploading）：直传地址过期
+    （SITE_UPLOAD_TICKET_TTL）再加 1 小时宽限后，删存储里的对象（传了一半或传完没确认的），
+    行标记 deleted_at。返回这次清理的条数；幂等。由定时任务调用（见 docs/site_v1/README.md）。"""
+    cutoff = utc_now() - timedelta(
+        seconds=get_files_config().ticket_ttl + STALE_UPLOAD_GRACE_SECONDS
+    )
+    storage = get_storage()
+    factory = get_session_factory()
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                select(Attachment.id, Attachment.storage_key)
+                .where(
+                    Attachment.state == "uploading",
+                    Attachment.deleted_at.is_(None),
+                    Attachment.created_at < cutoff,
+                )
+                .order_by(Attachment.id)
+                .limit(limit)
+            )
+        ).all()
+    purged = 0
+    for att_id, key in rows:
+        try:
+            await storage.delete(key)
+        except Exception:
+            logger.exception("删除过期直传对象 %s 失败，下次再试", key)
+            continue
+        async with factory() as session:
+            att = await session.get(Attachment, att_id, with_for_update=True)
+            if att is None or att.state != "uploading" or att.deleted_at is not None:
+                continue
+            att.deleted_at = utc_now()
+            await session.commit()
+            purged += 1
+    return purged
