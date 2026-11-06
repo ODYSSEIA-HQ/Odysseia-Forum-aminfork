@@ -61,6 +61,19 @@ from models.site_nav import (
     SiteTagAlias,
     SiteTagDisabled,
 )
+# 活动（3.22）、娱乐区（/fun）：events 块
+from models.site_event import SiteEvent, SiteEventEntry, SiteEventFollow, SiteEventLog  # noqa: F401
+from models.site_fun import (  # noqa: F401
+    SiteFunBlackjackRound,
+    SiteFunBlackjackShoe,
+    SiteFunMarket,
+    SiteFunStockAccount,
+    SiteFunStockBar,
+    SiteFunStockNews,
+    SiteFunStockPosition,
+    SiteFunStockTrade,
+    SiteFunWallet,
+)
 
 __all__ = [
     "SiteBannerMeta",
