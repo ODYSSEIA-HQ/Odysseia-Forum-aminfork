@@ -1168,4 +1168,5 @@ async def admin_organizers(session, ctx: SiteContext, raw_id, body: dict) -> dic
     names = "、".join(users[i]["displayName"] for i in ids if i in users) or "无"
     await add_log(session, e, viewer, "organizers", f"指定主办人：{names}")
     await session.flush()
-    return {"organizers": [users[i] for i in ids if i in users]}
+    # 协议 0.5.0：返回整个 Event（里面也有 organizers，前端只读 .organizers 不受影响）
+    return await event_dto(session, ctx, e)
