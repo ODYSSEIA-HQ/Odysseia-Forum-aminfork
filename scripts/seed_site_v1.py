@@ -7,7 +7,7 @@
 - 幂等：重复跑会更新已有行，不会重复插入。
 - 账号只在 FLUXER_FAKE=1 时建（真实环境的账号在 Fluxer 里，密码 Forum 不持有）；
   真实环境下只给已存在的同名账号补站内状态（资格、权限、新人期）。
-- 已发布作品、版本文件、主榜等等作品/上传/榜单领域做好后在 seed_works() 里补。
+- 预置作品（seed_works）：已发布全年龄作品（最新版本带文件）、R18 作品（R18 封面）。
 """
 
 import asyncio
@@ -357,12 +357,179 @@ async def seed_tag_catalog(session_factory) -> None:
     )
 
 
-async def seed_works(session_factory, accounts: dict[str, str]) -> None:
-    """入口：已发布的全年龄作品（最新版本带文件）、R18 作品（R18 封面）、主榜。
+# 预置作品：(标题, 简介, 分级 tag 名, 资源类型, 其他 tag, 封面分级或 None, 版本文件名或 None, 统计)
+SEED_WORKS = [
+    (
+        "【示例】全年龄美化包",
+        "预置的全年龄作品，最新版本带一个文件（契约测试 WRK-15/16 用）",
+        "全年龄",
+        "美化",
+        [("form", "轻前端·美化"), ("attribute", "原创")],
+        "general",
+        "seed-theme-v1.zip",
+        {"collection_count": 12, "reaction_count": 30, "download_count": 5},
+    ),
+    (
+        "【示例】R18 角色卡",
+        "预置的 R18 作品，封面是 R18 图（契约测试 R18-15 用）",
+        "R18",
+        "角色卡",
+        [("audience", "男性向"), ("attribute", "原创")],
+        "r18",
+        "seed-card-v1.png",
+        {"collection_count": 8, "reaction_count": 20, "download_count": 3},
+    ),
+    # 每个资源类型一个全年龄作品：列表能翻页（COM-14）、tag 联想有可见作品数（TAG-17）、主榜不空
+    *(
+        (
+            f"【示例】{type_name}",
+            f"预置的全年龄{type_name}",
+            "全年龄",
+            type_name,
+            [("audience", "全性向")] if type_name == "角色卡" else [],
+            None,
+            None,
+            {"collection_count": 1, "reaction_count": i + 1},
+        )
+        for i, type_name in enumerate(RESOURCE_TYPES)
+    ),
+]
 
-    作品、上传、榜单领域做好后在这里补（契约测试 WRK-15/16、R18-15、05 的榜单用例要用）。
+
+async def seed_works(session_factory, accounts: dict[str, str]) -> None:
+    """已发布的全年龄作品（最新版本带文件）、R18 作品（R18 封面）。
+
+    主榜（GET /boards）按 tag 目录生成（全站 + 类型/受众/形态/题材各 tag），不需要单独的数据。
+    文件只插 attachment 记录（storage_key 在 seed/ 下），对象存储里的内容由上传领域决定怎么放。
+    幂等：按标题找已有作品，存在就跳过。
     """
-    return None
+    from models.attachment import Attachment
+    from models.site_tag import SiteWorkTag
+    from models.work import Work
+    from models.work_statistics import WorkStatistics
+    from models.work_version import WorkVersion, WorkVersionFile
+    from site_v1 import mode as modes
+
+    author = accounts.get("demo")
+    if author is None:
+        print("跳过预置作品：没有 demo 账号")
+        return
+    now = utc_now()
+    async with session_factory() as session:
+        tags = {
+            (t.group_id, t.name): t
+            for t in (
+                await session.execute(
+                    select(SiteTag).where(SiteTag.deleted_at.is_(None))
+                )
+            ).scalars()
+        }
+        for index, (
+            title,
+            summary,
+            rating_name,
+            type_name,
+            extra,
+            cover_rating,
+            file_name,
+            stats,
+        ) in enumerate(SEED_WORKS):
+            exists = (
+                await session.execute(
+                    select(Work.id).where(
+                        Work.title == title, Work.deleted_at.is_(None)
+                    )
+                )
+            ).first()
+            if exists:
+                print(f"作品 {title} 已存在（{exists[0]}），跳过")
+                continue
+            rating_tag = tags[("rating", rating_name)]
+            rating = rating_tag.rating or "general"
+            is_nsfw, is_abyss = modes.rating_flags(rating)
+            work = Work(
+                title=title,
+                summary=summary,
+                description=f"## {title}\n\n{summary}",
+                images=[],
+                metadata_overrides=[],
+                author_id=author,
+                source_platform="fluxer",
+                source_visible=True,
+                status="published",
+                is_nsfw=is_nsfw,
+                is_abyss=is_abyss,
+                visibility=modes.work_visibility(rating, bool(rating_tag.restricts)),
+                created_at=now - timedelta(hours=index + 1),
+                published_at=now - timedelta(hours=index + 1),
+                updated_at=now - timedelta(hours=index + 1),
+                last_active_at=now - timedelta(hours=index + 1),
+            )
+            session.add(work)
+            await session.flush()
+            for key in [("rating", rating_name), ("type", type_name), *extra]:
+                session.add(
+                    SiteWorkTag(work_id=work.id, tag_id=tags[key].id, added_by=author)
+                )
+            if cover_rating:
+                cover = Attachment(
+                    owner_id=author,
+                    purpose="cover",
+                    work_id=work.id,
+                    kind="image",
+                    filename="cover.png",
+                    mime="image/png",
+                    size=2048,
+                    storage_key=f"seed/works/{work.id}/cover.png",
+                    state="ready",
+                    rating=cover_rating,
+                    auto_rating=cover_rating,
+                    review_state="auto",
+                    width=600,
+                    height=800,
+                    completed_at=now,
+                )
+                session.add(cover)
+                await session.flush()
+                work.cover_attachment_id = cover.id
+            if file_name:
+                version = WorkVersion(
+                    work_id=work.id,
+                    name="v1.0",
+                    changelog="首个版本",
+                    license="仅供示例",
+                    dependencies=[],
+                    created_by=author,
+                    created_at=now - timedelta(hours=index + 1),
+                )
+                session.add(version)
+                image = file_name.endswith(".png")
+                file = Attachment(
+                    owner_id=author,
+                    purpose="version_file",
+                    work_id=work.id,
+                    kind="image" if image else "file",
+                    filename=file_name,
+                    mime="image/png" if image else "application/zip",
+                    size=4096,
+                    storage_key=f"seed/works/{work.id}/{file_name}",
+                    state="ready",
+                    rating=rating if image else "general",
+                    review_state="auto",
+                    completed_at=now,
+                )
+                session.add(file)
+                await session.flush()
+                session.add(
+                    WorkVersionFile(version_id=version.id, attachment_id=file.id)
+                )
+            await session.execute(
+                insert(WorkStatistics)
+                .values(work_id=work.id, **stats)
+                .on_conflict_do_update(index_elements=[WorkStatistics.work_id], set_=stats)
+            )
+            print(f"作品 {title} -> {work.id}（{rating}）")
+        await session.commit()
 
 
 async def main() -> None:

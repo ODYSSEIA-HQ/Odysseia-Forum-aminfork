@@ -16,6 +16,12 @@ from models.booklist import Booklist
 from models.booklist_item import BooklistItem
 
 
+def _discord_owner(principal):
+    """旧 Discord 用户 ID 列；没有绑定 Discord 的站内账号（/api/v1）留空。"""
+    value = principal.get("discord_user_id")
+    return int(value) if value else None
+
+
 class WorkService:
     """协调多表业务，并在事务内持久化任务。"""
 
@@ -211,7 +217,7 @@ class WorkService:
                 is_default=True,
                 is_public=False,
                 fluxer_owner_id=principal["id"],
-                owner_id=int(principal["discord_user_id"]),
+                owner_id=_discord_owner(principal),
             )
             self.session.add(booklist)
             await self.session.flush()
@@ -247,7 +253,7 @@ class WorkService:
                     work_id=work.id,
                     thread_id=main.thread_id if main else None,
                     fluxer_owner_id=principal["id"],
-                    owner_id=int(principal["discord_user_id"]),
+                    owner_id=_discord_owner(principal),
                 )
             )
             booklist.item_count += 1

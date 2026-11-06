@@ -26,7 +26,8 @@ src/site_v1/
   dto.py             camelCase、ID、ISO UTC、User/Me/附件 DTO、load_users 批量取作者
   membership.py      Discord 正式成员身份组检查（真实环境）
   fluxer/            FluxerPort（port.py）、RealFluxer（real.py）、FakeFluxer（fake.py）
-  services/          accounts.py（账号行、资格条件）、social.py（关注/屏蔽）、user_works.py（占位）
+  services/          accounts.py（账号行、资格条件）、social.py（关注/屏蔽）、works.py（作品可见性/列表/序列化/分级同步）、
+                     tag_rules.py（tag 目录和打 tag 规则）、work_media.py（附件/最新版本 DTO）、user_works.py（他人作品）
   routers/           site auth me users works versions uploads tags chat reports moderation
   test_hooks.py      /__test__（SITE_TEST_HOOKS=1 才挂）
 src/models/          site_account.py site_tag.py work_version.py attachment.py site_moderation.py；work.py 加了协议字段
@@ -149,6 +150,21 @@ uv run pytest tests/site_v1
 
 tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source`/`category` 约束、自定义标签治理和 DC 同步逻辑，新 tag 混进去会出现在旧接口的标签列表和治理里。旧自定义标签迁成自由 tag（协议 7.3）是后续的数据任务。新表都没有挂 thread/booklist 投影触发器；`work` 新列都有数据库默认值，`project_thread_work` 触发器按列名插入时由默认值补齐。
 
+## 作品、收藏、tag（已做）
+
+接口：`GET/POST /works`、`GET/PATCH/DELETE /works/{id}`、`POST /works/{id}/publish`、`POST/DELETE /works/{id}/favorite`、`POST /works/{id}/tags`、`DELETE /works/{id}/tags/{tagId}`、`GET /tags/catalog`、`GET /users/{id}/works`；第二期最简实现：`GET /works/random`、`GET /works/{id}/similar`（按共有 tag）、`GET /tags/suggest`、`GET /boards`、`GET /boards/{id}`、`GET /search`（关键词包含匹配）。
+
+- **生命周期**：`POST /works` 建 `status=draft`、`source_platform=fluxer`、`source_visible=false` 的作品，不调 Fluxer（V2 列表因为 source_visible=false 看不到草稿）。发布时：真实环境排 V2 的 `create_main` 任务（论坛取 config.json `work_forums`，未配置只记日志），主帖投影触发器把 source_visible 置真；`FLUXER_FAKE=1` 直接置真。可见性只看本地 status：Fluxer 作品还没主帖（`source_thread_id=''`）也照常可见。
+- **软删除**：`deleted_at` + `deletion_reason=moderation`（同 V2），真实环境再排 `forum_soft_delete` 策略任务。作者或 `works.manage_any` / `moderation.content`。
+- **可见性**（`services/works.py`）：列表条件 `listable_conditions`（已发布、没删、moderation 不是 hidden/removed、来源可见、rating 收窄、非 r18 模式排除绑了 restricts tag 的、屏蔽 tag/用户），详情 `visible_to`（草稿和隐藏的只有作者/`works.manage_any`）。restricted 按 is_nsfw/is_abyss 和 restricts tag 现算，不依赖 `work.visibility` 冗余列（V2 改分级不会同步那一列）；写操作仍会同步它。
+- **tag**：规则在 `tag_rules.py`，照搬 web 仓库 `src/shared/tags/rules.ts`。作品 tag 在 `site_work_tag`（移除留记录），自由 tag 是 `site_tag` 里 `group_id=free` 的行（`{name}` 先按名字不分大小写匹配官方 tag）。已发布作品降分级、去掉 restricts tag → 403 `forbidden`（`details.reason=review_required`）；必选组不能删空 → 422。非作者：官方 tag 403、新人 403 `onboarding_required`、tag 锁定 403、只能删自己加的。没做：同义词、每日次数、作者删过的不能加回、tag 日志接口。
+- **分级同步**：分级 tag 决定 is_nsfw/is_abyss（r18g → 两个都真）；作品从来没有分级 tag（V2/DC 作品）就保持原分级。有 Fluxer 帖子且非 fake 时走 `WorkService.update`（排 move 任务，4 个论坛间移动），否则直接改字段。
+- **图片分级**：发布时读 attachment 表（封面、图库、最新版本文件里的图），高于作品分级 → 422 `rating_conflict`；已发布作品 PATCH 换封面/图库同样检查。附件必须本人或作者上传、`state=ready`、是图片。
+- **附件地址**：`work_media.set_url_resolver()` 是给上传领域的钩子，默认 `SITE_MEDIA_BASE/{storage_key}` 或 `/api/v1/media/{storage_key}`；有效模式不允许的分级 url=null、placeholder=true。`latestVersion` 从 work_version/work_version_file 读（`work_media.latest_versions`、`version_dto`，版本领域可复用）。
+- **收藏**：复用 V2 默认书单（`WorkService.collect`）；`stats.favorites` 是 `work_statistics.collection_count`（触发器维护）。改了 V2 的 `collect`：没绑 Discord 的账号 `owner_id` 留空（原来 `int(None)` 报错）。
+- **排序**：`latest` 按 updated_at、`new` 按发布时间（keyset 游标）；`hot_*`/`rising` 按「互动加权 × 半衰期衰减」（offset 游标），`hall` 发布满 90 天按收藏；热度分数不下发，只给 `badges: ["hot"]`（周热度前 15%，5 分钟缓存）。`needsAck` 恒为 false（ack 是第二期）。
+- **种子**：`seed_works()` 插 2 个示例作品（全年龄美化包，最新版本带一个 zip 文件；R18 角色卡，R18 封面）+ 每个资源类型一个全年龄作品；附件只插记录（`storage_key=seed/works/{id}/...`），文件内容由上传领域决定放哪。主榜按目录生成（全站 + 类型/受众/形态/题材各 tag），不需要数据。
+
 ## 后面领域怎么接
 
 1. **路由**：往 `src/site_v1/routers/<领域>.py` 的 `router` 里加（已注册到 `/api/v1`，路径写协议里 `/api/v1` 之后的部分）。
@@ -185,10 +201,10 @@ tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source
    ```
 
    `limit` 超过 100 按 100，坏游标 422。
-6. **列表过滤**（3.12）：`status=published`、`ctx.visible_ratings()` / visibility、`viewer.prefs.blocked_tags`、`social.blocked_user_ids()`。`services/user_works.list_user_works` 是 `GET /users/{id}/works` 的占位，作品领域实现它即可。
+6. **列表过滤**（3.12）：`status=published`、`ctx.visible_ratings()` / visibility、`viewer.prefs.blocked_tags`、`social.blocked_user_ids()`。直接用 `services/works.listable_conditions` + `query_page`（`GET /users/{id}/works` 就是这样实现的）。
 7. **种子和契约测试**：已发布作品、版本文件、主榜补在 `scripts/seed_site_v1.py` 的 `seed_works()`；做完一个领域就把 `docs/site_v1/known-gaps.json` 里对应用例删掉（意外通过会报红）。
 8. **fake 模式和异步任务**：`FLUXER_FAKE=1` 时不启动 `WorkTaskWorker` 和事件消费者；发布作品如果要排 V2 的 `create_main` 任务，fake 模式下直接跳过或同步视为成功，作品可见性不依赖它。
 
 ## 契约测试现状
 
-`scripts/run_contract_tests.sh`：00-spec、01-common、02-session、09-dm、99-rate-limit 全绿（01 里依赖 `/works` 的 COM-01、12–15，09 的 `POST /conversations`，99 的限频按 known-gaps 记为预期失败）。03–08 在 `beforeAll` 就失败（要 `GET /tags/catalog`、`POST /works`），对应领域做好后才会真正跑起来。
+`scripts/run_contract_tests.sh`（`CT_DB`、`PORT`、`REDIS_URL`、`LOG` 都可用环境变量覆盖）：00–05、09、99 全绿。03 里版本/下载（WRK-13–16）、ack/钉选（WRK-19/20），05 的聊天目标（R18-16），以及上传、聊天外层、举报审核各用例按 known-gaps 记为预期失败。07 的 CHT-04、08 的 MOD-05、05 的 R18-05/R18-17 现在因为路由不存在返回 404 而「通过」，已从清单删掉，对应领域实现时要保持 404。
