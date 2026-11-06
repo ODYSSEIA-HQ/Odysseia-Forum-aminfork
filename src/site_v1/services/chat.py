@@ -17,14 +17,21 @@ from site_v1.fluxer import FluxerUnavailable, get_fluxer
 from site_v1.services.work_access import work_visible
 from site_v1.services.moderation_common import (
     native_thread_id,
+    parse_int_id,
     site_muted_until,
     visible_work,
     work_mute,
     works_by_native_thread,
 )
 from site_v1.dto import iso_utc, load_users
+from models.work import Work
+from site_v1.services.chat_channels import (
+    fluxer_channel_of,
+    get_public_channel,
+    list_public_channels,
+)
 
-CHAT_KINDS = ("work", "dm")
+CHAT_KINDS = ("work", "dm", "channel")
 
 
 def _count(value) -> int:
@@ -53,9 +60,14 @@ async def unread_summary(session, ctx) -> list[dict]:
         summary = await get_fluxer().unread_summary(ctx.fluxer_token or "", viewer.user_id)
     except FluxerUnavailable as exc:
         raise unavailable("未读汇总暂时不可用") from exc
-    works = await works_by_native_thread(
-        session, [str(w.get("thread_id") or "") for w in summary.works]
-    )
+    thread_ids = [str(w.get("thread_id") or "") for w in summary.works]
+    works = await works_by_native_thread(session, thread_ids)
+    # FLUXER_FAKE=1：没有原生主帖的作品用假频道 work-{id}
+    for thread in thread_ids:
+        if thread.startswith("work-") and thread not in works:
+            work = await session.get(Work, parse_int_id(thread[5:]) or 0)
+            if work is not None:
+                works[thread] = work
     items: list[dict] = []
     for entry in summary.works:
         work = works.get(str(entry.get("thread_id") or ""))
@@ -65,6 +77,20 @@ async def unread_summary(session, ctx) -> list[dict]:
         items.append(
             {
                 "target": {"kind": "work", "id": str(work.id)},
+                "count": _count(entry.get("unread")),
+                "mentions": _count(entry.get("mentions")),
+                "lastMessageAt": _iso_or_none(entry.get("last_message_at")),
+            }
+        )
+    # 公共聊天区：当前模式下能看到的都返回（侧栏要列出来），没进过的未读是 0
+    by_channel = {str(c.get("channel_id") or ""): c for c in summary.channels}
+    for channel in await list_public_channels(session):
+        if channel.rating not in ctx.visible_ratings():
+            continue
+        entry = by_channel.get(fluxer_channel_of(channel) or "") or {}
+        items.append(
+            {
+                "target": {"kind": "channel", "id": channel.id},
                 "count": _count(entry.get("unread")),
                 "mentions": _count(entry.get("mentions")),
                 "lastMessageAt": _iso_or_none(entry.get("last_message_at")),
@@ -116,6 +142,23 @@ async def target_info(session, ctx, kind: str, raw_id: str) -> dict:
             "title": title or "私信",
             "memberCount": _count(info.get("member_count")) or 2,
             "canPost": site_until is None,
+            "mutedUntil": iso_utc(site_until),
+        }
+
+    if kind == "channel":
+        channel = await get_public_channel(session, raw_id)
+        if channel is None or channel.rating not in ctx.visible_ratings():
+            raise not_found()
+        fluxer_id = fluxer_channel_of(channel)
+        info = await _channel_info(ctx, "channel", fluxer_id) if fluxer_id else None
+        viewer = ctx.viewer
+        site_until = await site_muted_until(session, viewer.user_id) if viewer else None
+        return {
+            "target": {"kind": "channel", "id": channel.id},
+            "canOpen": bool(info),
+            "title": channel.name,
+            "memberCount": _count(info.get("member_count")) if info else 0,
+            "canPost": bool(info) and viewer is not None and site_until is None,
             "mutedUntil": iso_utc(site_until),
         }
 

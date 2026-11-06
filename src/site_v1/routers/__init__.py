@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from site_v1.routers import (
     auth,
     chat,
+    chat_messages,
     me,
     moderation,
     reports,
@@ -27,6 +28,7 @@ for module in (
     uploads,
     tags,
     chat,
+    chat_messages,
     reports,
     moderation,
 ):

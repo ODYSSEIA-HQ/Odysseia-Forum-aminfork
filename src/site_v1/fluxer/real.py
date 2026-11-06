@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 
 from identity.integration_rpc_error import IntegrationRpcError
+from site_v1.fluxer.native_http import NativeChat
 from site_v1.fluxer.port import (
     AccountExists,
     AccountUnavailable,
@@ -78,8 +79,8 @@ def _session(data: dict) -> FluxerSession:
     return FluxerSession(token=token, identity=_identity(data))
 
 
-class RealFluxer:
-    """FluxerPort 的真实实现。"""
+class RealFluxer(NativeChat):
+    """FluxerPort 的真实实现。聊天消息代转（chat_*）走 Fluxer 原生 HTTP 接口，见 native_http.py。"""
 
     def __init__(self, auth_service=None, session_factory=None):
         self._auth_service = auth_service
@@ -314,7 +315,9 @@ class RealFluxer:
         except (IntegrationRpcError, HTTPException) as exc:
             raise FluxerUnavailable("未读汇总暂不可用") from exc
         return UnreadSummary(
-            works=list(data.get("works") or []), dms=list(data.get("dms") or [])
+            works=list(data.get("works") or []),
+            dms=list(data.get("dms") or []),
+            channels=list(data.get("channels") or []),
         )
 
     async def chat_target_info(

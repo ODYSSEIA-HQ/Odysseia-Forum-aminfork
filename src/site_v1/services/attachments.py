@@ -192,8 +192,8 @@ async def create_upload(viewer: Viewer, body: dict, *, base: str | None) -> dict
     channel_id = body.get("channelId")
     if channel_id is not None and (not isinstance(channel_id, str) or not channel_id):
         fields["channelId"] = "频道 ID 不对"
-    if purpose == "chat" and not channel_id and "channelId" not in fields:
-        fields["channelId"] = "聊天附件要带频道 ID"
+    # 聊天附件：私信带 channelId（会话 ID），作品交流区带 workId，公共聊天区两个都可以不带
+    # （前端 chat-nodebb/api.ts 的 uploadChatFile）；发送时再按目标检查分级
     work_id = None
     if purpose in WORK_PURPOSES:
         work_id = parse_id(body.get("workId"))
@@ -213,7 +213,12 @@ async def create_upload(viewer: Viewer, body: dict, *, base: str | None) -> dict
             owner_id=viewer.user_id,
             purpose=purpose,
             work_id=work_id,
-            channel_id=channel_id if purpose in ("chat", "discussion") else None,
+            channel_id=(
+                channel_id
+                or (f"work-{str(body.get('workId'))[:40]}" if purpose == "chat" and body.get("workId") else None)
+                if purpose in ("chat", "discussion")
+                else None
+            ),
             kind="image" if is_image(mime) and purpose != "version_file" else "file",
             filename=filename,
             mime=mime,

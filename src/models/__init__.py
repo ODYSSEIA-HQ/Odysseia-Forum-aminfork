@@ -55,8 +55,18 @@ from models.site_tag import SiteTag, SiteTagGroup, SiteTagQuestion, SiteWorkTag
 from models.work_version import WorkVersion, WorkVersionFile
 from models.attachment import Attachment
 from models.site_moderation import ModerationQueueItem, Report, UserModerationRecord
+from models.site_chat import (
+    SiteChatDmChannel,
+    SiteChatMessage,
+    SiteChatMessageMeta,
+    SiteChatReadState,
+)
 
 __all__ = [
+    "SiteChatDmChannel",
+    "SiteChatMessage",
+    "SiteChatMessageMeta",
+    "SiteChatReadState",
     "Attachment",
     "ModerationQueueItem",
     "Report",

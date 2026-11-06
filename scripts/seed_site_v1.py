@@ -578,10 +578,72 @@ async def seed_works(session_factory, accounts: dict[str, str]) -> None:
         print(f"作品 {work_id} 版本 {version_id}，文件 {file_id}（{file_name}）")
 
 
+async def seed_chat(session_factory, accounts: dict[str, str]) -> None:
+    """聊天示例（只在 FLUXER_FAKE=1：消息存假 Fluxer 的 site_chat_message）：
+    demo 和 lin 的私信、demo 第一个全年龄作品交流区里几条消息（参考 web 的 src/mock/chatSeed.ts）。
+    幂等：频道里已有消息就不再加。真实环境消息在 Fluxer，这里跳过。
+    """
+    if not get_config().fluxer_fake:
+        return
+    from models.site_chat import SiteChatMessage
+    from models.work import Work
+    from site_v1.fluxer.fake import FakeFluxer
+
+    demo, lin = accounts.get("demo"), accounts.get("lin")
+    if not demo or not lin:
+        return
+    fake = FakeFluxer(session_factory=session_factory)
+    dm = await fake.chat_open_dm("", demo, lin)
+    async with session_factory() as session:
+        work = (
+            await session.execute(
+                select(Work)
+                .where(
+                    Work.author_id == demo,
+                    Work.is_nsfw.is_(False),
+                    Work.deleted_at.is_(None),
+                    Work.status == "published",
+                )
+                .order_by(Work.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        work_id = work.id if work is not None else None
+        channels = {dm: [(lin, "你好～最近的角色卡更新了吗？"), (demo, "更新了，晚点发版本")]}
+        if work is not None:
+            channel = work.source_thread_id or f"work-{work.id}"
+            channels[channel] = [
+                (lin, "开场白写得很好！"),
+                (demo, "谢谢～有问题随时在这里说"),
+                (lin, f"<@{demo}> 世界书的触发词能讲讲吗？"),
+            ]
+        now = utc_now()
+        for channel, lines in channels.items():
+            exists = (
+                await session.execute(
+                    select(SiteChatMessage.id).where(SiteChatMessage.channel_id == channel).limit(1)
+                )
+            ).first()
+            if exists:
+                continue
+            for i, (author, text) in enumerate(lines):
+                session.add(
+                    SiteChatMessage(
+                        channel_id=channel,
+                        author_id=author,
+                        content=text,
+                        created_at=now - timedelta(minutes=10 * (len(lines) - i)),
+                    )
+                )
+        await session.commit()
+    print(f"聊天示例：私信 {dm}" + (f"，作品 {work_id} 交流区" if work_id else ""))
+
+
 async def main() -> None:
     accounts = await seed_accounts(AsyncSessionFactory)
     await seed_tag_catalog(AsyncSessionFactory)
     await seed_works(AsyncSessionFactory, accounts)
+    await seed_chat(AsyncSessionFactory, accounts)
     from shared.database import async_engine
 
     await async_engine.dispose()

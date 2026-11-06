@@ -110,3 +110,40 @@ Forum 侧：作品可见性（有效模式、status、下架）先在本地判�
 
 - **给已登录账号绑定 Discord**（`GET /auth/discord/start?intent=link`）：`rpc.identity.v1.discord.link_service {token, discord_user_id, verified_at, profile}`。现在回调里 `intent=link` 返回 `/login?error=link_unsupported`。
 - **DC 联动注册**（10-31 设计的 `/auth/register/*` 七个接口）：注册票据、设密码（服务端可调的 `rpc.auth.v1.password.set_service`，替代现在发给浏览器的 `external.prove` 凭证）、2FA。
+
+## 7. 聊天消息代转：Fluxer 原生 HTTP 接口
+
+前端的聊天面板（`VITE_CHAT_PANEL=nodebb`）调 Forum 的 `/api/v1/works/{id}/chat/*`、`/conversations/*`、`/channels/{id}/chat/*`（见 README「聊天面板」），Forum 用会话里的 Fluxer 令牌**在服务端**调 Fluxer 原生 HTTP 接口（Discord 兼容形状，同微雨前端 `src/features/works/nativeApi.ts`），Fluxer 令牌不进浏览器。实现在 `site_v1/fluxer/native_http.py`（`RealFluxer` 的 `chat_*` 方法）。
+
+配置：
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `FLUXER_API_URL` | Fluxer 原生接口基地址（同前端 auth config 的 `fluxer_api_url`，例如 `https://api.fluxer.app/v1`）。没配时聊天接口 503 |
+| `FLUXER_BOT_TOKEN` | 删别人消息（作品作者 / 卡贴管理员 / 站务删言）用的管理身份，`Authorization: Bot <token>`，需要在作品论坛、公共频道有 MANAGE_MESSAGES。没配时退回用户令牌 |
+| `FLUXER_API_TIMEOUT` | 秒，默认 10 |
+
+请求头：`Authorization: <用户令牌>`（不带 Bearer，同 nativeApi.ts）、`X-Fluxer-Features: channel_threads`。
+
+| FluxerPort 方法 | 原生接口 | 说明 |
+| --- | --- | --- |
+| `chat_messages` | `GET /channels/{id}/messages?limit=&before=&after=&around=` | 返回按新到旧，Forum 统一成正序 |
+| `chat_message` | `GET /channels/{id}/messages/{mid}` | 404 / `10008` → 不存在 |
+| `chat_send` | `POST /channels/{id}/messages` `{content, nonce, enforce_nonce: true, message_reference?: {message_id, fail_if_not_exists: false}, allowed_mentions}` | 本站附件不经过 Fluxer（会剥 PNG tEXt），挂在 Forum 的 `site_chat_message_meta`；只有附件时 content 发「[图片]」 |
+| `chat_edit` | `PATCH /channels/{id}/messages/{mid}` `{content}` | |
+| `chat_delete` | `DELETE /channels/{id}/messages/{mid}` | 删别人的用 `FLUXER_BOT_TOKEN` |
+| `chat_react` | `PUT` / `DELETE /channels/{id}/messages/{mid}/reactions/{emoji}/@me` | 自定义表情是 `name:id` |
+| `chat_ack` | `POST /channels/{id}/messages/{mid}/ack` `{}` | Forum 自己也记已读（`site_chat_read_state`），这里只是同步给 Fluxer 客户端 |
+| `chat_typing` | `POST /channels/{id}/typing` | 失败忽略 |
+| `chat_dm_channels` | `GET /users/@me/channels` | 只取 `type=1`（私信，不做群组）；对方 = `recipients` 里不是自己的那个 |
+| `chat_open_dm` | `POST /users/@me/channels` `{recipient_id}` | 已有时 Fluxer 返回原频道；隐私、屏蔽 Forum 先判断 |
+
+错误映射：401 → 401 `unauthenticated`（下一个请求会话降为匿名）；404、403 `50001 Missing Access`、`10003 Unknown Channel`、`10008 Unknown Message` → 404；其他 403 → 403 `forbidden`；超时、5xx、429 → 503。
+
+还需要 Fluxer 配合的：
+
+- 第 5 节 `channel.info_service` 要支持 `kind: "channel"`（公共聊天区频道 ID → `{channel_id, member_count}`）。
+- 第 4 节 `read_states.summary_service` 加 `channels`（公共聊天区，形状同 `dms`，只列进过的）。
+- 原生 Message 带 `referenced_message.author.id`（回复我的算 @我）和创建响应里回显 `nonce`。
+- 本站上传的图片在 Fluxer 客户端里看不到（只有「[图片]」）；要互通需要 Fluxer 支持外链附件 / embed。
+- 实时：见 README「聊天面板」的实时方案，需要 Fluxer 网关事件（MESSAGE_CREATE/UPDATE/DELETE、MESSAGE_REACTION_*）经 NATS 发给 Forum。
