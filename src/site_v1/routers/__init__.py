@@ -5,7 +5,12 @@ from fastapi import APIRouter
 from site_v1.routers import (
     auth,
     chat,
+    collections,
+    friends,
     me,
+    me_extra,
+    notifications,
+    work_extras,
     moderation,
     reports,
     site,
@@ -29,6 +34,12 @@ for module in (
     chat,
     reports,
     moderation,
+    # 「我的」、提醒、公告规则、作品内、书单、好友（第二期 me 块）
+    me_extra,
+    notifications,
+    work_extras,
+    collections,
+    friends,
 ):
     router.include_router(module.router)
 

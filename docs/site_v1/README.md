@@ -181,7 +181,7 @@ uv run pytest tests/site_v1
 - **图片分级冲突**：发布时检查封面、图库、最新版本文件里的图，高于作品分级 → 422 `rating_conflict`；已发布作品 PATCH 换封面/图库同样检查。`coverId`/`galleryIds` 必须是为这个作品上传的（`POST /uploads` 带 `workId`，purpose=cover/gallery）、`state=ready` 的图片。
 - **封面、图库、latestVersion**：用 `attachments.attachment_dto`（有效模式看不到 → `url=null`、`placeholder=true`；全年龄图公开或长效签名地址；R18 图按账号签发 10 分钟签名地址）和 `versions.latest_versions`。
 - **收藏**：复用 V2 默认书单（`WorkService.collect`）；`stats.favorites` 是 `work_statistics.collection_count`（触发器维护）。改了 V2 的 `collect`：没绑 Discord 的账号 `owner_id` 留空（原来 `int(None)` 报错）。
-- **排序**：`latest` 按 updated_at、`new` 按发布时间（keyset 游标）；`hot_*`/`rising` 按「互动加权 × 半衰期衰减」（offset 游标），`hall` 发布满 90 天按收藏；热度分数不下发，只给 `badges: ["hot"]`（周热度前 15%，5 分钟缓存）。`needsAck` 恒为 false（ack 是第二期）。
+- **排序**：`latest` 按 updated_at、`new` 按发布时间（keyset 游标）；`hot_*`/`rising` 按「互动加权 × 半衰期衰减」（offset 游标），`hall` 发布满 90 天按收藏；热度分数不下发，只给 `badges: ["hot"]`（周热度前 15%，5 分钟缓存）。`needsAck` 按最新公告序号 / 规则版本 / 最新版本 ID 和本人确认记录（`site_work_ack`）比对，作者和管理员恒为 false（`services/work_extras.needs_ack_map`）。
 
 ## 上传、附件、版本、下载（3.3、3.2）
 
@@ -218,6 +218,18 @@ uv run pytest tests/site_v1
   - 举报 `dismiss` / `adjust`（只对作品：改分级会写 `rating_lock`；增删 tag 只能是目录里非分级、非资源类型的 tag）/ `remove`（作品：`status=removed`、`moderation_state=removed`，并复用 V2 `WorkModerationService.soft_delete`——站务没绑 Discord 时按同样步骤做、`OperationLog.actor_id` 留空；tag：软删 tag 并从所有作品摘掉；upload：同图片拦截；消息/帖子：只记录）/ `penalize`。`penalty` 可附在 adjust/remove 上，禁言写 `user_moderation_record(kind=mute, until)`，警告 `kind=warning`。
   - 调整记录 `user_moderation_record(kind=adjustment)`，`strike=true` 的计入 `authorStrikes90d`。
 - 改作品分级（`services.moderation.set_work_rating`）：分级字段走统一入口 `works.set_classification`（有 Fluxer 帖子时排 V2 分类移动任务），再换分级组 tag、重算 `visibility`。
+
+## 我的、提醒、公告规则、作品内、书单、好友（第二期 me 块）
+
+路由：`routers/me_extra.py notifications.py work_extras.py collections.py friends.py`；迁移 `site_v1_me_tables`（表结构见 `models/site_me.py`）。
+
+- **作品内**：公告复用 V2 `work_announcement`（`version` = 作品内按发布时间的行号，撤回的不列出但占号），发公告按 V2 同样方式给关注者写 `notification(work_announcement)`；关注复用 `thread_follow`（没绑 Discord 时 `user_id` 留空）（作品内禁言 `/works/{id}/mutes` 在聊天块）。确认、规则、钉选、DC 存档是新表 `site_work_ack / site_work_rules / site_work_pin / site_dc_archive_post`（存档数据由迁移任务导入，现在为空；非 DC 来源作品 404）。
+- **提醒**：V2 `notification`（公告、旧作品更新 → `work_update`；作者新作 → `followed_author_new_work`；`tag_review` 不出）和新表 `site_notification`（好友申请、规则更新……）合并分页，ID 分别是 `v<id>`、`n<id>`；已读和 V1/V2 共用 `read_at`。其他块写提醒用 `services.notifications.create_notification(session, recipient_id, notification)`（协议 Notification 形状，只 add 不 commit）。来源作品不在 `listable_conditions` 里的不返回、不计数、不在「全部已读」里改。`category` 接受逗号分隔多个。
+- **站务公告、规则中心**：`site_announcement`（只存一份，`audience=r18` 只给有效模式 r18）、`site_announcement_ack`（按版本号比对）、`site_rule_doc`。发布公告的后台接口（`/admin/announcements`）不在本块。
+- **书单**：复用 V2 `booklist / booklist_item / user_collection`，加删条目走 V2 `WorkService.collect`；默认收藏书单和赛事书单不算书单；`itemId` 是作品 ID。协议多出来的 tag、上传封面、`defaultSort=updated` 在 `site_collection_meta`。
+- **我的**：`/me/preferences`（带版本号，409 带 `details.current`）、`/me/tag-habits`、`/me/pinned-works`（`GET /users/{id}` 带 `pinnedWorks`）、`/me/decorations`（装饰身份组 `site_decoration_role`，拥有关系 `site_user_decoration_grant`；协议 User.decorations 还没接上）、`/me/plugin-tokens`（只存 sha256 和末 4 位；`/plugin/v1/*` 没做）。
+- **好友**：`site_friend`（a<b 一行）、`site_friend_request`；`GET /users/{id}` 的 `viewer.friend / friendRequest / dm` 按好友关系算。
+- 种子 `seed_me_block`（只在 `FLUXER_FAKE=1`）：规则中心 4 篇、站内公告 6 条、3 个装饰身份组发给 demo、lin→demo 好友申请、第一个预置作品的规则/公告/钉选。
 
 ## 迁移里的新表和字段
 
@@ -294,8 +306,6 @@ tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source
 
 | 用例 | 原因 |
 | --- | --- |
-| WRK-19 | `POST /works/{id}/ack` 是第二期，`needsAck` 恒为 false |
-| WRK-20 | 作品钉选 `/works/{id}/pins` 是第二期 |
 | DM-01～03 | 用例要 `POST /conversations` 发起私信（第二期，且要 Fluxer 私信 RPC）；`GET /users/{id}` 的 `viewer.dm` 已按隐私设置给出 |
 | RL-01 | `/api/v1` 还没有按账号限频（1.6）；旧 `RateLimitMiddleware` 只管 `/v1`、`/v2` |
 | RL-02 | 按 IP 限频同上；契约测试默认不跑 |

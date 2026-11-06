@@ -527,7 +527,11 @@ async def seed_works(session_factory, accounts: dict[str, str]) -> None:
                     SiteWorkTag(work_id=work.id, tag_id=tags[key].id, added_by=author)
                 )
             if cover_rating:
-                data = seed_png(60, 80, (200, 80, 120) if cover_rating != "general" else (90, 140, 200))
+                data = seed_png(
+                    60,
+                    80,
+                    (200, 80, 120) if cover_rating != "general" else (90, 140, 200),
+                )
                 key = storage_key("cover.png")
                 await get_storage().put(key, data, "image/png")
                 cover = Attachment(
@@ -555,7 +559,9 @@ async def seed_works(session_factory, accounts: dict[str, str]) -> None:
             await session.execute(
                 insert(WorkStatistics)
                 .values(work_id=work.id, **stats)
-                .on_conflict_do_update(index_elements=[WorkStatistics.work_id], set_=stats)
+                .on_conflict_do_update(
+                    index_elements=[WorkStatistics.work_id], set_=stats
+                )
             )
             print(f"作品 {title} -> {work.id}（{rating}）")
         await session.commit()
@@ -578,10 +584,312 @@ async def seed_works(session_factory, accounts: dict[str, str]) -> None:
         print(f"作品 {work_id} 版本 {version_id}，文件 {file_id}（{file_name}）")
 
 
+# ---------------- 「我的」、公告规则、作品内、好友、勋章（me 块） ----------------
+
+COMMUNITY_RULES = """## 一、基本原则
+
+1. 友善交流，不人身攻击、不引战、不刷屏。
+2. 尊重原创：转载、二创请注明出处，作者明确不允许的不要搬运。
+3. 不发布违法内容和侵犯他人隐私的内容。
+
+## 二、发布作品
+
+- 分级 tag 必须如实选择。**R18 内容只对开启了 R18 模式的账号可见**，全年龄模式下看不到、也看不出它存在。
+- 封面和图库图片会经过自动分级；图片分级高于作品分级时，需要换图或提高作品分级。
+- 作品说明里写清楚适用的模型和使用方法，方便大家反馈。
+
+## 三、交流区
+
+- 交流区是作品的主体，作者和卡贴管理员可以删言、在本作品禁言，被处理的人可以申诉。
+- @全体 只有作者和管理员能用，请不要滥用。
+
+## 四、处罚
+
+| 情况 | 处理 |
+|---|---|
+| 首次轻微违规 | 提醒 |
+| 多次违规 | 本作品或全站禁言 |
+| 严重违规 | 封禁账号 |
+"""
+
+R18_RULES = """## R18 内容规则
+
+- 只有满 18 岁、确认了条款、并在设置里打开 R18 模式的账号才能看到 R18 内容。
+- R18G 默认不显示，需要在「内容」设置里单独打开。
+- 交流区里发的 R18 图片只能出现在受限作品的交流区。
+- 发现分级不实，可以在作品页举报，或在下载后帮忙标记。
+"""
+
+IMAGE_POLICY = """## 图片保留政策
+
+- 上传的图片原样保存，角色卡 PNG 不会被重新编码。
+- 被自动分级拦截的图片保留 30 天供申诉，之后删除。
+- 删除作品后，图片在 7 天后从存储里清除。
+"""
+
+FAQ = """## 常见问题
+
+**为什么我看不到某些作品？**
+可能是 R18 作品，而你现在在全年龄模式；或者作品带了你屏蔽的 tag、作者被你屏蔽了。
+
+**怎么认领我在 DC 发过的作品？**
+在「设置 → 账号」里绑定 Discord，迁移过来的作品会自动转到你的账号下。
+
+**私信收不到？**
+对方可能设置了只接收好友的私信，先加好友试试。
+"""
+
+RULE_DOCS = [
+    ("community", "社区规则", "发布、交流和处罚的基本约定。", COMMUNITY_RULES, 1),
+    ("r18", "R18 内容规则", "谁能看到 R18 内容、R18G 和图片的规则。", R18_RULES, 1),
+    ("images", "图片保留政策", "图片怎么存、被拦截的图片留多久。", IMAGE_POLICY, 1),
+    ("faq", "常见问题", "看不到作品、认领 DC 作品、收不到私信……", FAQ, 2),
+]
+
+# (标题, audience, kind, requiresAck, 置顶, ruleSlug, 几天前, 正文)
+SITE_ANNOUNCEMENTS = [
+    (
+        "社区规则（2026-10 版）",
+        "all",
+        "rule",
+        True,
+        True,
+        "community",
+        20,
+        "欢迎来到类脑资源平台。发布作品请如实打分级 tag，R18 内容只对开启 R18 模式的账号可见。",
+    ),
+    (
+        "新平台测试中",
+        "all",
+        "banner",
+        False,
+        False,
+        None,
+        15,
+        "这是新前端的预览站，数据都是示例。",
+    ),
+    (
+        "私信和好友上线",
+        "all",
+        "normal",
+        False,
+        False,
+        None,
+        1,
+        "现在可以给其他用户发私信了。不做群组，只有一对一私信；可以在「设置 → 隐私 → 谁可以给我发私信」里改成「只有好友」。",
+    ),
+    (
+        "本周六凌晨维护",
+        "all",
+        "normal",
+        False,
+        False,
+        None,
+        2,
+        "周六 02:00–04:00 维护数据库，期间不能发布作品和发言，浏览不受影响。",
+    ),
+    (
+        "R18 内容规则调整",
+        "r18",
+        "rule",
+        True,
+        False,
+        "r18",
+        4,
+        "R18G 改为默认不显示，需要在「内容」设置里单独打开。交流区里的 R18 图片只能发在受限作品的交流区。",
+    ),
+    (
+        "索引页功能迁移进度",
+        "all",
+        "normal",
+        False,
+        False,
+        None,
+        6,
+        "收藏、关注、作者页、提醒、私信已经迁到新平台。书单、抽卡、活动正在迁移。",
+    ),
+]
+
+DECORATION_ROLES = [
+    (
+        "deco_founder",
+        "元老",
+        "平台内测期就在的老朋友",
+        "#d4a017",
+        "legendary",
+        ["nameColor", "frame"],
+        30,
+    ),
+    (
+        "deco_event_2026",
+        "十月活动获奖",
+        "活动：十月角色卡大赛 获奖",
+        "#7c5cff",
+        "epic",
+        ["frame"],
+        20,
+    ),
+    ("deco_helper", "热心答疑", "在交流区帮助了很多人", "#2e9d6a", "rare", [], 10),
+]
+
+
+async def seed_me_block(session_factory, accounts: dict[str, str]) -> None:
+    """规则中心、站内公告、勋章、示例好友申请、作品规则/公告/钉选（只在 FLUXER_FAKE=1 的开发/测试环境）。
+
+    幂等：规则按 slug、公告按标题、勋章按 ID，已有的不重复建。
+    """
+    from models.site_me import (
+        SiteAnnouncement,
+        SiteDecorationRole,
+        SiteFriendRequest,
+        SiteRuleDoc,
+        SiteUserDecorationGrant,
+        SiteWorkPin,
+        SiteWorkRules,
+    )
+    from models.work import Work
+    from models.work_announcement import WorkAnnouncement
+
+    if not get_config().fluxer_fake:
+        print("跳过公告、规则等示例数据：只在 FLUXER_FAKE=1 时建")
+        return
+    now = utc_now()
+    async with session_factory() as session:
+        for i, (slug, title, summary, body, version) in enumerate(RULE_DOCS):
+            await session.execute(
+                insert(SiteRuleDoc)
+                .values(
+                    slug=slug,
+                    title=title,
+                    summary=summary,
+                    body=body,
+                    version=version,
+                    sort=i,
+                    updated_at=now - timedelta(days=10 - i),
+                )
+                .on_conflict_do_nothing()
+            )
+        existing = set(
+            (await session.execute(select(SiteAnnouncement.title))).scalars().all()
+        )
+        for title, audience, kind, ack, pinned, slug, days, body in SITE_ANNOUNCEMENTS:
+            if title in existing:
+                continue
+            session.add(
+                SiteAnnouncement(
+                    title=title,
+                    audience=audience,
+                    kind=kind,
+                    requires_ack=ack,
+                    pinned=pinned,
+                    rule_slug=slug,
+                    body=body,
+                    version=1,
+                    published_at=now - timedelta(days=days),
+                )
+            )
+        for rid, name, desc, color, rarity, slots, sort in DECORATION_ROLES:
+            await session.execute(
+                insert(SiteDecorationRole)
+                .values(
+                    id=rid,
+                    name=name,
+                    description=desc,
+                    color=color,
+                    rarity=rarity,
+                    slots=slots,
+                    sort=sort,
+                )
+                .on_conflict_do_nothing()
+            )
+        demo, lin = accounts.get("demo"), accounts.get("lin")
+        if demo:
+            for rid, *_ in DECORATION_ROLES:
+                await session.execute(
+                    insert(SiteUserDecorationGrant)
+                    .values(
+                        user_id=demo, role_id=rid, granted_at=now, source="示例数据"
+                    )
+                    .on_conflict_do_nothing()
+                )
+        if demo and lin:
+            await session.execute(
+                insert(SiteFriendRequest)
+                .values(from_id=lin, to_id=demo, created_at=now)
+                .on_conflict_do_nothing()
+            )
+        # 第一个预置作品：交流区规则、一条公告、两条钉选
+        work = (
+            (
+                await session.execute(
+                    select(Work)
+                    .where(Work.author_id == demo, Work.deleted_at.is_(None))
+                    .order_by(Work.id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if demo
+            else None
+        )
+        if work is not None:
+            await session.execute(
+                insert(SiteWorkRules)
+                .values(
+                    work_id=work.id,
+                    version=1,
+                    updated_at=work.created_at,
+                    body="1. 友善交流，不引战。\n2. 反馈问题请附上使用的模型和设置。\n3. 二创请注明出处。",
+                )
+                .on_conflict_do_nothing()
+            )
+            has_ann = (
+                await session.execute(
+                    select(WorkAnnouncement.id).where(
+                        WorkAnnouncement.work_id == work.id
+                    )
+                )
+            ).first()
+            if not has_ann:
+                session.add(
+                    WorkAnnouncement(
+                        work_id=work.id,
+                        author_id=demo,
+                        title="更新预告",
+                        body="下个版本会加入新的开场白，欢迎在交流区提建议。",
+                        created_at=work.created_at,
+                    )
+                )
+            has_pin = (
+                await session.execute(
+                    select(SiteWorkPin.id).where(SiteWorkPin.work_id == work.id)
+                )
+            ).first()
+            if not has_pin:
+                session.add(
+                    SiteWorkPin(
+                        work_id=work.id,
+                        author_id=demo,
+                        pinned_by=demo,
+                        excerpt="常见问题：开场白不触发时，先检查世界书是否已启用，再看模型上下文是否够长。",
+                    )
+                )
+                session.add(
+                    SiteWorkPin(
+                        work_id=work.id,
+                        author_id=lin,
+                        pinned_by=demo,
+                        excerpt="推荐设置：温度 0.9，上下文 16k 以上效果最好。",
+                    )
+                )
+        await session.commit()
+    print("公告、规则、勋章、示例好友申请、作品规则/公告/钉选已就绪")
+
+
 async def main() -> None:
     accounts = await seed_accounts(AsyncSessionFactory)
     await seed_tag_catalog(AsyncSessionFactory)
     await seed_works(AsyncSessionFactory, accounts)
+    await seed_me_block(AsyncSessionFactory, accounts)
     from shared.database import async_engine
 
     await async_engine.dispose()

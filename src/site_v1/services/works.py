@@ -412,6 +412,14 @@ async def serialize_works(session, ctx, works: list[Work]) -> list[dict]:
             ).scalars()
         )
     hot = await hot_ids(session)
+    from site_v1.services.work_extras import needs_ack_map
+
+    acks = await needs_ack_map(
+        session,
+        viewer,
+        works,
+        {wid: (v or {}).get("id") for wid, v in versions.items()},
+    )
     result = []
     for w in works:
         rating = rating_of(w)
@@ -466,12 +474,8 @@ async def serialize_works(session, ctx, works: list[Work]) -> list[dict]:
                     "role": role,
                     "canEdit": manage,
                     "canModerate": manage,
-                    # 公告、规则、版本确认是第二期（/works/{id}/ack），先恒为 false
-                    "needsAck": {
-                        "announcement": False,
-                        "rules": False,
-                        "version": False,
-                    },
+                    # 公告、规则、版本确认（POST /works/{id}/ack），见 work_extras.needs_ack_map
+                    "needsAck": acks[w.id],
                 },
             }
         )
@@ -542,7 +546,8 @@ async def change_classification(session, ctx, work: Work, rating: str) -> None:
         rating,
         actor=ctx.viewer,
         mode=ctx.effective_mode,
-        is_admin=ctx.viewer is not None and ctx.viewer.has_permission("works.manage_any"),
+        is_admin=ctx.viewer is not None
+        and ctx.viewer.has_permission("works.manage_any"),
     )
 
 
@@ -794,4 +799,3 @@ def enqueue_create_main(session, work: Work, actor_id: str) -> None:
             },
         )
     )
-

@@ -1,6 +1,4 @@
 {
-  "WRK-19": "POST /works/{id}/ack（第二期）没做；needsAck 先恒为 false",
-  "WRK-20": "作品钉选 /works/{id}/pins（第二期）没做",
   "DM-01": "GET /users/{id} 的 viewer.dm 已按隐私设置给出；用例还要 POST /conversations（私信，第二期）",
   "DM-02": "GET /users/{id} 的 viewer.dm 已按隐私设置给出；用例还要 POST /conversations（私信，第二期）",
   "DM-03": "GET /users/{id} 的 viewer.dm 已按隐私设置给出；用例还要 POST /conversations（私信，第二期）",

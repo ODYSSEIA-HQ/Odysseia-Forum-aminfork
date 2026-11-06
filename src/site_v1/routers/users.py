@@ -9,7 +9,7 @@ from site_v1.deps import Ctx, CurrentUser, get_session_factory
 from site_v1.dto import load_users
 from site_v1.errors import invalid, not_found
 from site_v1.paging import PageRequest, pagination
-from site_v1.services import social, user_works
+from site_v1.services import friends, me_extra, social, user_works
 
 router = APIRouter(prefix="/users", tags=["账号"])
 
@@ -24,7 +24,7 @@ async def _existing_user(session, user_id: str) -> User:
 
 
 def _dm_state(target_prefs: SiteUserPrefs | None, friends: bool) -> str:
-    """和私信创建（POST /conversations）同一套规则（好友是第二期，先恒为非好友）。"""
+    """和私信创建（POST /conversations）同一套规则。"""
     privacy = target_prefs.dm_privacy if target_prefs else "everyone"
     if privacy == "nobody":
         return "closed"
@@ -38,15 +38,25 @@ async def get_user(id: str, ctx: Ctx):
     async with get_session_factory()() as session:
         await _existing_user(session, id)
         profile = (await load_users(session, [id]))[id]
+        profile["pinnedWorks"] = await me_extra.pinned_works_of(session, ctx, id)
         viewer = ctx.viewer
         if viewer is not None and viewer.user_id != id:
             target_prefs = await session.get(SiteUserPrefs, id)
+            friend = await friends.are_friends(session, viewer.user_id, id)
+            request = await friends.request_between(session, viewer.user_id, id)
             profile["viewer"] = {
                 "followed": await social.is_following(session, viewer.user_id, id),
                 "blocked": await social.is_blocked(session, viewer.user_id, id),
-                "friend": False,
-                "friendRequest": None,
-                "dm": _dm_state(target_prefs, False),
+                "friend": friend,
+                "friendRequest": {
+                    "id": str(request.id),
+                    "direction": "outgoing"
+                    if request.from_id == viewer.user_id
+                    else "incoming",
+                }
+                if request is not None
+                else None,
+                "dm": _dm_state(target_prefs, friend),
             }
     return profile
 
