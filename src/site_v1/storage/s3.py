@@ -2,8 +2,9 @@
 
 - 预签名用 botocore（纯本地计算，不发请求）；
 - stat / read_head / put / delete 用 aioboto3（依赖里已有，备份模块也在用）。
-- 直传是预签名 PUT，Content-Type 参与签名，浏览器必须带上 ticket.headers 里的 Content-Type。
-- R2 要在桶的 CORS 里允许前端域名 PUT/GET 和 Content-Type 头。
+- 直传是预签名 PUT，Content-Type 和 Content-Length 参与签名：浏览器必须带上 ticket.headers 里的
+  Content-Type，字节数必须和 POST /uploads 时声明的 size 一样（Content-Length 浏览器自动带）。
+- R2 要在桶的 CORS 里允许前端域名 PUT/GET/HEAD 和 Content-Type 头，见 docs/site_v1/README.md。
 """
 
 from functools import cached_property
@@ -51,9 +52,17 @@ class S3Storage:
     def upload_ticket(
         self, key: str, mime: str, size: int, *, base: str | None
     ) -> dict:
+        # Content-Length 也签进去：S3 / R2 会拒绝字节数和申请时不一样的直传，
+        # 不然拿到地址就能往桶里塞任意大的文件（complete 时才发现大小不对，对象已经占了空间）。
+        # 不放进 ticket.headers：浏览器不允许脚本设置 Content-Length，会按实际字节数自动带上。
         url = self._signer.generate_presigned_url(
             "put_object",
-            Params={"Bucket": self.config.s3_bucket, "Key": key, "ContentType": mime},
+            Params={
+                "Bucket": self.config.s3_bucket,
+                "Key": key,
+                "ContentType": mime,
+                "ContentLength": size,
+            },
             ExpiresIn=self.config.ticket_ttl,
         )
         return {"method": "PUT", "url": url, "headers": {"Content-Type": mime}}
@@ -107,6 +116,21 @@ class S3Storage:
             )
             async with obj["Body"] as body:
                 return await body.read()
+
+    async def sha256(self, key: str) -> str:
+        """流式读整个对象算 SHA-256（分级完成时记进 attachment.sha256，和本地存储一致）。"""
+        import hashlib
+
+        h = hashlib.sha256()
+        async with self._client() as s3:
+            obj = await s3.get_object(Bucket=self.config.s3_bucket, Key=key)
+            body = obj["Body"]
+            try:
+                async for chunk in body.iter_chunks(1 << 20):
+                    h.update(chunk)
+            finally:
+                body.close()
+        return h.hexdigest()
 
     async def put(self, key: str, data: bytes, mime: str) -> None:
         async with self._client() as s3:

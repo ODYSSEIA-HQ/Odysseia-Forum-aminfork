@@ -14,6 +14,7 @@
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -39,6 +40,7 @@ class ClassifyInput:
     height: int | None = None
     url: str | None = None
     """短期签名读取地址（外部服务自己去拉文件）。"""
+    sha256: str | None = None
     head: bytes = field(default=b"", repr=False)
     """文件开头的一段字节（桩分级器可以看）。"""
 
@@ -91,13 +93,15 @@ class ManualClassifier:
 class HttpClassifier:
     """外部分级服务。
 
+    接口约定（docs/site_v1/README.md「图片分级服务接口」有完整说明；假服务 scripts/fake_classifier.py）：
     请求：POST {SITE_CLASSIFIER_URL}，Authorization: Bearer {SITE_CLASSIFIER_TOKEN}（配置了才带）
-        {"attachmentId": "123", "url": "<短期签名地址>", "mime": "image/png", "filename": "...",
-         "width": 512, "height": 768}
-    响应：{"scores": {"general": 0.9, "r18": 0.08, "r18g": 0.02}, "blocked": false}
-    映射：blocked → 拦截；r18g ≥ 阈值 → r18g；r18 ≥ 阈值 → r18；否则 general；
-         最高分低于 SITE_CLASSIFIER_CONFIDENCE → suspect（保守分级 + 待审核）。
-    服务出错 → suspect（不会因为分级服务挂了把图放出去）。
+        {"attachmentId": "123", "url": "<短期签名地址，绝对地址>", "mime": "image/png",
+         "filename": "...", "size": 12345, "sha256": "<hex>|null", "width": 512, "height": 768}
+    响应：{"scores": {"general": 0.9, "r18": 0.08, "r18g": 0.02}, "blocked": false,
+          "rating": "general|r18|r18g|suspect|blocked"（可选，服务自己的结论，优先于阈值）}
+    映射：blocked → 拦截；给了 rating 用 rating；否则 r18g ≥ 阈值 → r18g；r18 ≥ 阈值 → r18；
+         否则 general；最高分低于 SITE_CLASSIFIER_CONFIDENCE → suspect（保守分级 + 待审核）。
+    服务出错（超时、非 2xx、不是 JSON、分数缺失或不在 [0,1]）→ suspect（不会因为分级服务挂了把图放出去）。
     """
 
     def __init__(self, config):
@@ -114,6 +118,8 @@ class HttpClassifier:
             "url": item.url,
             "mime": item.mime,
             "filename": item.filename,
+            "size": item.size,
+            "sha256": item.sha256,
             "width": item.width,
             "height": item.height,
         }
@@ -134,18 +140,31 @@ class HttpClassifier:
     def map_result(self, data: dict) -> Classification:
         if not isinstance(data, dict):
             return suspect()
-        if data.get("blocked"):
+        if data.get("blocked") is True or data.get("rating") == "blocked":
+            scores = data.get("scores")
             return Classification(
                 auto_rating="blocked",
                 rating=None,
                 blocked=True,
-                scores=data.get("scores"),
+                scores=scores if isinstance(scores, dict) else None,
             )
-        raw = data.get("scores") or {}
+        raw = data.get("scores")
+        if not isinstance(raw, dict):
+            return suspect()
         try:
             scores = {k: float(raw.get(k, 0.0)) for k in ("general", "r18", "r18g")}
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError):
             return suspect()
+        # NaN、无穷、超出 [0, 1] 的分数一律当作服务出错（NaN 和任何数比较都是假，会被当成全年龄放行）
+        if not all(math.isfinite(v) and 0.0 <= v <= 1.0 for v in scores.values()):
+            return suspect()
+        # 服务自己给了结论（例如 WD tagger 按标签组合判出幼态、无码），优先用它；分数照样记下
+        given = data.get("rating")
+        if given in ("general", "r18", "r18g"):
+            return Classification(auto_rating=given, rating=given, scores=scores)
+        if given == "suspect":
+            leaning = "r18g" if scores["r18g"] >= self.config.classifier_r18g_threshold else "r18"
+            return suspect(scores, leaning)
         if scores["r18g"] >= self.config.classifier_r18g_threshold:
             rating = "r18g"
         elif scores["r18"] >= self.config.classifier_r18_threshold:

@@ -52,6 +52,7 @@ from models.site_account import (
     SiteUserPrefs,
 )
 from models.site_tag import SiteTag, SiteTagGroup, SiteTagQuestion, SiteWorkTag
+from models.site_tag_migration import SiteTagMigrationRecord
 from models.work_version import WorkVersion, WorkVersionFile
 from models.attachment import Attachment
 from models.site_moderation import ModerationQueueItem, Report, UserModerationRecord
@@ -102,6 +103,7 @@ from models.site_me import (
 )
 
 __all__ = [
+    "SiteTagMigrationRecord",
     "SiteBannerMeta",
     "SitePublicChannel",
     "SiteTagAlias",

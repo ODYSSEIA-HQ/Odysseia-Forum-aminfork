@@ -1,0 +1,99 @@
+# DC 原生标签 → 协议官方 tag 对照表（scripts/migrate_legacy_tags.py 读，协议 7.3）。
+#
+# 来源：/mnt/project-files/方案/DC旧帖迁移/DC旧帖迁移完整方案.md「5.2 DC 原生标签 → 当前官方 tag 目录」
+#       和 作品区Tag与热度榜综合方案_DC版.md「现有频道和 DC tag 怎么改」，按 scripts/seed_site_v1.py
+#       的官方 tag 目录（内容提示单独成组 warning，同人在属性组）落到具体的组。
+# 方案里标了【待定 D12】的拆分写法（群像/多角色/后宫、系统/工具）先按 5.2 表格写；amin 定了再改这里重跑，脚本幂等。
+# 最终版应由管理员在导出的全部原标签清单上逐行填（列：guild_id、channel_id、dc_tag_id、dc_tag_name、平台 tag、组、备注），
+# 到时把逐行表转成下面的 map 即可。
+#
+# 每个原名映射到一个列表，每项是：
+#   "组/名字"      官方 tag（组 ID：theme 题材、function 功能、warning 内容提示、attribute 属性、form 形态 ……）
+#   "free/名字"    自由 tag（不在官方目录里的拆分部分）
+#   "drop"         丢弃
+# 对不上（不在表里）的原生标签：按 unmatched 处理。
+
+# 原名匹配时忽略首尾空白、全角半角（NFKC）和大小写
+unmatched:
+  # 对不上的原名清洗后变自由 tag（原名照搬），并给作品打「待分类」
+  as_free: true
+  mark_pending: true
+
+# 「待分类」tag：不存在时脚本按这里建一个官方 tag
+pending_tag:
+  group: theme
+  name: 待分类
+
+# 作品 tag 总数上限（协议：15；以 SITE_MAX_TAGS 为准时脚本会取两者较小值）
+max_tags: 15
+
+map:
+  # ---- 题材 ----
+  纯爱: [theme/纯爱]
+  百合: [theme/百合]
+  人外: [theme/人外]
+  古风: [theme/古风]
+  现代: [theme/现代]
+  幻想: [theme/幻想]
+  系统流: [theme/系统流]
+  数据删除: [theme/数据删除]
+  数据删除（SCP、后室等）: [theme/数据删除]
+  群像/多角色/后宫: [theme/后宫, attribute/多角色]   # 【待定 D12】
+  神人: [theme/神人]
+
+  # ---- 属性 ----
+  同人/二创: [attribute/同人]
+  系统/工具: [attribute/工具卡]                     # 【待定 D12】
+  女性视角: [attribute/女性视角]
+  多路线: [attribute/多路线]
+  原创: [attribute/原创]
+  搬运: [attribute/搬运]
+  授权搬运/汉化: [attribute/搬运, attribute/汉化]
+  御姐/人妻/熟女/母系: [attribute/御姐, free/人妻, free/熟女, free/母系]
+  御姐/人妻/熟女: [attribute/御姐, free/人妻, free/熟女]
+  母系/妈妈: [free/母系, free/妈妈]
+  病娇/黑化/恶堕: [attribute/病娇, free/黑化, free/恶堕]
+
+  # ---- 内容提示 ----
+  NTR: [warning/NTR]
+  NTL: [warning/NTL]
+  乱伦: [warning/乱伦]
+  调教: [warning/调教]
+  昆虫/密集: [warning/昆虫, warning/密集]
+  支配/调教/束缚/SM: [warning/支配, warning/调教, warning/SM]
+
+  # ---- 形态（和形态频道同名，直接对上）----
+  纯文字: [form/纯文字]
+
+  # ---- 功能（目录里有的对上，没有的按 unmatched 变自由 tag）----
+  世界观: [function/世界观]
+  功能性: [function/功能性]
+  金手指: [function/金手指]
+  规则系: [function/规则系]
+  文风: [function/文风]
+  反向代理: [function/反向代理]
+  脚本工具: [function/脚本工具]
+  Discord BOT: [function/Discord BOT]
+  写卡工具: [function/写卡工具]
+  正则: [function/正则]
+  酒馆扩展: [function/酒馆扩展]
+  QuickReplies: [function/QuickReplies]
+  游戏: [function/游戏]
+  前端: [function/前端]
+  开发记录: [function/开发记录]
+
+  # ---- 神人区特有 tag：原名变自由 tag（不算对不上，不打「待分类」）----
+  宇宙恐怖: [free/宇宙恐怖]
+  禁忌之恋: [free/禁忌之恋]
+  大脑破坏: [free/大脑破坏]
+  何意味: [free/何意味]
+  模因污染: [free/模因污染]
+  童年破坏: [free/童年破坏]
+  我为什么在这里: [free/我为什么在这里]
+  猎奇搞笑: [free/猎奇搞笑]
+  轮回之终末: [free/轮回之终末]
+  人类禁区: [free/人类禁区]
+
+  # ---- 取消 ----
+  其他: [drop]
+  其它: [drop]
