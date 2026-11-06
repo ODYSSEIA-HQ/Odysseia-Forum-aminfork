@@ -2,7 +2,7 @@
 
 三种目标同一组接口（前端 src/features/chat-nodebb/api.ts）：
   作品交流区 /works/{id}/chat/...、私信 /conversations/{id}/...、公共聊天区 /channels/{id}/chat/...
-  GET/POST  .../messages                      历史（before/after/around/limit）、发送
+  GET/POST  .../messages                      历史（before/after/around/limit；updatedAfter 另给改过的消息）、发送
   PATCH/DELETE .../messages/{mid}             编辑、删除（软删除留占位）
   PUT/DELETE .../messages/{mid}/reactions/{emoji}
   GET .../state、POST .../read、POST .../typing
@@ -43,6 +43,7 @@ def _register(kind: str, base: str) -> None:
         after: str | None = Query(None),
         around: str | None = Query(None),
         limit: str | None = Query(None),
+        updatedAfter: str | None = Query(None),
     ):
         async with get_session_factory()() as session:
             return await svc.list_messages(
@@ -54,6 +55,7 @@ def _register(kind: str, base: str) -> None:
                 after=after,
                 around=around,
                 limit=limit,
+                updated_after=updatedAfter,
             )
 
     async def post_message(

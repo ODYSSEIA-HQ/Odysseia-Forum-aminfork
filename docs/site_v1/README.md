@@ -42,9 +42,11 @@ src/site_v1/
     chat_messages.py     聊天面板消息代转（作品交流区、私信、公共聊天区）、会话列表
     chat_channels.py     公共聊天区频道的读取约定（fluxer_channel_id）
     chat_notify.py       聊天 @ 提醒的写入点
+    chat_realtime.py     聊天面板的实时推送（Centrifugo）和轮询用的改动记录
     moderation.py        举报、审核队列、处理
     moderation_common.py 禁言、原生主帖定位、审核员看到的附件、作品摘要
-  routers/           site auth me users works versions uploads tags chat reports moderation；
+  realtime/          实时推送（Centrifugo）：config jwt channels publisher events hooks，见「实时推送」
+  routers/           site auth me users works versions uploads tags chat reports moderation realtime；
                      storage.py（/api/storage 本地存储签名端点，不在协议里）
   test_hooks.py      /__test__（SITE_TEST_HOOKS=1 才挂）
 src/models/          site_account.py site_tag.py work_version.py attachment.py site_moderation.py；work.py 加了协议字段
@@ -103,6 +105,7 @@ uv run pytest tests/site_v1
 | `SITE_IMAGE_MAX_BYTES` / `SITE_FILE_MAX_BYTES` / `SITE_ALLOWED_MIMES` / `SITE_MAX_TAGS` | 10 MB / 50 MB / 常见类型 / 15 | `/site.uploadLimits`、tag 上限 |
 | `FLUXER_API_URL` / `FLUXER_BOT_TOKEN` / `FLUXER_API_TIMEOUT` | 空 / 空 / `10` | 聊天消息代转用的 Fluxer 原生接口（fluxer-rpc.md 第 7 节） |
 | `SITE_CHAT_CACHE_TTL` | `15` | 每个聊天频道最新 50 条缓存的秒数（写操作会清） |
+| `CENTRIFUGO_*` | 空 | 实时推送，见「实时推送（Centrifugo）」 |
 | `REDIS_URL` | `redis://localhost:6379/0` | 只在独立用 uvicorn 启动时用（api_main.py 已经初始化 Redis 时不读） |
 
 上传、存储、分级（`site_v1/files_config.py`）：
@@ -219,8 +222,9 @@ uv run pytest tests/site_v1
 - 假 Fluxer：消息 `site_chat_message`（软删除留占位）、私信频道 `site_chat_dm_channel`。Forum 自己的叠加：`site_chat_message_meta`（本站附件、删除记录）、`site_chat_read_state`（已读位置，只往后走；没进过的交流区和公共频道不算未读，私信算）。
 - 规则：看不到的作品 / 分级不可见的公共频道 404；附件按查看者有效模式给占位（私信里 Fluxer 原生附件分级未知按 R18）；public 作品交流区不能发 R18 图、公共频道不能发高于频道分级的图（422 `rating_conflict`）；作品内禁言 / 全站禁言 403 `muted`（`details.until`，永久为 null）；私信每条消息都按对方 `dmPrivacy` 和屏蔽检查（403）；删言：本人 `by_author`，作品作者 / 卡贴管理员（`can_manage_work`）`by_manager`，`moderation.content`、公共频道里 `channels.manage` 的站务 `by_staff`；`nonce` 10 分钟内去重（Redis）。
 - @ 提醒：消息里的 `<@userId>` 经 `chat_notify.deliver_notification(session, recipient_id, notification)` 写提醒（协议 Notification 形状，`category=mention`、`context.{workId|conversationId|channelId, messageId}`）；提醒领域实现 `site_v1.services.notifications.create_notification` 后自动接上，之前只记日志。
+- 实时推送和轮询拿编辑、删除（`updatedAfter`）见「实时推送（Centrifugo）」。
 - 读性能：每个频道最新 50 条缓存在 Redis `site:chat:latest:{channel}`，写操作清缓存，另有 `SITE_CHAT_CACHE_TTL`（默认 15 秒）兜住从 Fluxer 客户端直接发的消息；前端 8 秒轮询（`after=最后一条`）直接从缓存给。真实环境的 `reactions.me` 用本站记下的点击（Redis `site:chat:rx:*`），不用缓存里取消息那个人的。
-- 实时（没做，建议）：Forum 订阅 Fluxer 网关事件（NATS `events.content.v1.message.*`），按频道 → 目标映射后发到 Centrifugo 频道 `chat:{kind}:{id}`（前端 `ChatChannelEvent`：`message.created/updated`、`subscription.closed`），按每个订阅者的有效模式序列化（R18 图占位），切到全年龄模式 / 作品转受限时由 Forum 调 Centrifugo `unsubscribe` 并推 `subscription.closed`；订阅令牌由 Forum 签发（`/realtime/token` 带频道权限），未读走外层 `unread.updated`。有了实时后可以把缓存 TTL 调长、写时更新缓存而不是删除。
+- 实时：已接 Centrifugo，见「实时推送（Centrifugo）」（聊天消息只推经本站接口发、改、删的；直接从 Fluxer 客户端发的消息要等 Forum 订阅 Fluxer 网关事件 `events.content.v1.message.*` 后再转发，还没做）。
 
 **举报**（`POST /reports`）
 - 理由按对象类型限定（同假后端），`other` 要写 note，note ≤ 500，不能举报自己。
@@ -236,6 +240,123 @@ uv run pytest tests/site_v1
   - 举报 `dismiss` / `adjust`（只对作品：改分级会写 `rating_lock`；增删 tag 只能是目录里非分级、非资源类型的 tag）/ `remove`（作品：`status=removed`、`moderation_state=removed`，并复用 V2 `WorkModerationService.soft_delete`——站务没绑 Discord 时按同样步骤做、`OperationLog.actor_id` 留空；tag：软删 tag 并从所有作品摘掉；upload：同图片拦截；消息/帖子：只记录）/ `penalize`。`penalty` 可附在 adjust/remove 上，禁言写 `user_moderation_record(kind=mute, until)`，警告 `kind=warning`。
   - 调整记录 `user_moderation_record(kind=adjustment)`，`strike=true` 的计入 `authorStrikes90d`。
 - 改作品分级（`services.moderation.set_work_rating`）：分级字段走统一入口 `works.set_classification`（有 Fluxer 帖子时排 V2 分类移动任务），再换分级组 tag、重算 `visibility`。
+
+## 实时推送（Centrifugo）
+
+给前端 `src/shared/realtime/centrifugo.ts`（`VITE_REALTIME=centrifugo`）用：浏览器用 centrifuge-js 连 Centrifugo，后端签令牌、调 Centrifugo 的 HTTP server API 发布。代码在 `src/site_v1/realtime/`、`routers/realtime.py`、`services/chat_realtime.py`。
+
+### 配置项
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `CENTRIFUGO_TOKEN_SECRET` | 空 | 连接令牌、订阅令牌的 HMAC 密钥（HS256），和 Centrifugo `client.token.hmac_secret_key`（v5：`token_hmac_secret_key`）相同 |
+| `CENTRIFUGO_PUBLIC_URL` | 空 | 浏览器连的地址，放进 `/realtime/token` 响应的 `url`，如 `wss://rt.example.com/connection/websocket` |
+| `CENTRIFUGO_API_URL` | 空 | Centrifugo HTTP API 根地址（后端到 Centrifugo，内网），发布打 `{CENTRIFUGO_API_URL}/api/publish` |
+| `CENTRIFUGO_API_KEY` | 空 | HTTP API 密钥，放在 `X-API-Key` 头；和 Centrifugo `http_api.key`（v5：`api_key`）相同 |
+| `CENTRIFUGO_TOKEN_TTL` | `600` | 连接令牌有效期（秒），到期前 centrifuge-js 自己调 `/realtime/token` 续 |
+| `CENTRIFUGO_SUB_TOKEN_TTL` | `300` | 订阅令牌有效期（秒）；续签时重新按可见性校验，是权限变化的兜底 |
+| `CENTRIFUGO_PUBLISH_TIMEOUT` | `3` | 调 HTTP API 的超时（秒） |
+
+- `CENTRIFUGO_TOKEN_SECRET` 和 `CENTRIFUGO_PUBLIC_URL` 缺一个：`GET /realtime/token`、`/realtime/subscribe-token` 返回 503 `temporarily_unavailable`。前端拿令牌失败按随机退避（1～30 秒）重试，期间聊天面板 8 秒轮询兜底，所以没开推送时前端照常可用；但没开时前端应保持 `VITE_REALTIME` 不是 `centrifugo`，免得一直重试。
+- `CENTRIFUGO_API_URL` 和 `CENTRIFUGO_API_KEY` 缺一个：发布全是空操作（ORM 钩子也不收集变化），现有行为和测试不受影响。
+- 前端：`VITE_REALTIME=centrifugo`（地址不用配，从 `/realtime/token` 的 `url` 来）。
+
+### 接口
+
+- `GET /api/v1/realtime/token` → `{url, token}`（`Cache-Control: no-store`）。令牌声明：`sub`（用户 ID；未登录为空串，Centrifugo 当匿名连接）、`iat`、`exp`、`channels`（服务端订阅）= `personal:{me}`（登录时）、`site`、`site_r18`（**有效模式**为 r18 时，协议 1.1：登录 + `contentMode=r18` + 资格 granted）。
+- `GET /api/v1/realtime/subscribe-token?channel=` → `{token}`，声明 `sub`、`channel`、`iat`、`exp`。权限复用现有规则：
+  - `work:{id}`：`moderation_common.visible_work`（即 `work_access.work_visible`：下架、草稿、全年龄模式下的受限作品、没开 showR18G 的 R18G 都 404）；
+  - `chat:work.{id}`、`chat:channel.{id}`：`chat_messages.resolve`（和聊天接口同一判断，公共频道按分级）；
+  - `personal:{id}`：只能是自己（否则 403）；`site_r18`：有效模式不是 r18 时 403；`site`：谁都行；
+  - 其它（含 `chat:dm.*`，私信走本人频道）404。前端把 404 / 403 当「看不到了」，不再重试，面板收到 `subscription.closed`。
+
+### 频道和事件
+
+| 频道 | 内容 |
+| --- | --- |
+| `personal:{userId}` | 外层事件：`notification.created`、`unread.updated`、`access.changed`、`moderation.muted`、`upload.updated`；私信的面板事件（`message.created` / `message.updated` / `typing`，`target={kind:"dm",id:会话ID}`） |
+| `site` / `site_r18` | `announcement.published`（`audience=all` / `r18`） |
+| `work:{id}` | `work.updated {workId, fields}`、`work.visibility.changed {workId, visibility}` |
+| `chat:work.{id}`、`chat:channel.{id}` | 面板事件 `message.created` / `message.updated` / `typing`（`target={kind,id}`） |
+
+外层事件是协议 4.3 的信封 `{type, id, ts, data}`（`realtime-events.schema.json`）；面板事件是前端 `ChatChannelEvent` 的扁平对象 `{type, target, message}`。**删除**按面板约定推 `message.updated`：整条消息，`deletedState`（by_author / by_manager / by_staff）有值、`body` 为空串、附件和表情清空；编辑、表情变化也推整条 `message.updated`。
+
+在哪里发布（全部在事务提交之后；失败只记日志，不影响请求）：
+
+- 聊天（`services/chat_messages.py` commit 之后调 `services/chat_realtime.py`）：发、改、删、表情 → 交流区 / 公共聊天区频道，私信推给双方的 `personal:`；`POST .../typing` → `typing`；私信发出后对方 `unread.updated {scope:"conv"}`；`POST .../read` 后自己 `unread.updated {scope: chat|conv|channel}`。
+  - 频道广播按「这个频道最低的可见范围」序列化：受限作品按 r18、其它按全年龄、公共频道按频道分级，都不开 R18G（附件给占位）；`reactions.me` 一律 false（自己点的以接口响应为准）。私信按每个收件人自己的有效模式分别序列化，`nonce` 只给发送者。
+- 其余外层事件用 ORM 钩子（`realtime/hooks.py`，挂在 SQLAlchemy `Session` 的 `after_flush` / `after_commit`），不用改各个路由：
+  - 新 `site_notification`、有 `fluxer_user_id` 的 V2 `notification` → 收件人 `notification.created` + `unread.updated {scope:"notifications", id: 分类, count}`；来源作品对收件人**当前**有效模式不可见时不推（和提醒列表同一个 `union_query` 过滤）；
+  - 新 `site_announcement`（已到发布时间）→ `announcement.published`；
+  - `work` 的标题、简介、说明、封面、图库、布局、状态、分级、tag 锁、声明变化，新版本、作品公告、tag、规则、钉选 → `work.updated`（只改 `updated_at` 之类不推）；`work.visibility` 变了 → `work.visibility.changed`；
+  - `site_restricted_access.state`、`site_user_prefs.content_mode / show_r18g` 变了 → `access.changed`，**并断开这个用户的连接**（`/api/disconnect`，code 3014：前端丢掉旧令牌重新取，`site_r18` 和受限作品的订阅重新校验）；
+  - 新 `work_user_mute`、`user_moderation_record(kind=mute)` → `moderation.muted`；
+  - `attachment.state` 变成 ready / rejected 或分级变了 → 上传者 `upload.updated`（附件对象，`id` = uploadId）。
+- 作品转为受限、下架、删除：签订阅令牌时把登录用户记在 Redis `site:rt:subs:{channel}`（一天），这时对其中已经看不到这个作品的人调 `/api/unsubscribe` 踢出 `work:{id}`、`chat:work.{id}`。
+
+### 轮询拿编辑、删除
+
+聊天消息列表加了可选参数 `updatedAfter`（ISO 时间）：`GET .../messages?after=最后一条&updatedAfter=上次的serverTime` 的响应多两个字段 `updates`（这之后编辑、删除、表情变过的消息，整条，按 ID 正序，已经在 `items` 里的不重复给）和 `serverTime`（下次原样传回）。来源是 Redis 有序集合 `site:chat:changes:{fluxer 频道}`（每次改、删、表情记一笔，留最近 200 条、一天）。不带 `updatedAfter` 时响应形状不变。现在的前端轮询（`useTimeline.ts`）只取 `after` 之后的新消息、不传 `updatedAfter`，要看到别处的编辑、删除需要前端在轮询里带上它并把 `updates` 按 `updated` 合并（前端改动，不在本仓库）。
+
+### Centrifugo 配置示例
+
+v6（`config.json`）：
+
+```json
+{
+  "client": {
+    "token": { "hmac_secret_key": "<同 CENTRIFUGO_TOKEN_SECRET>" },
+    "allowed_origins": ["https://site.example.com"]
+  },
+  "http_api": { "key": "<同 CENTRIFUGO_API_KEY>" },
+  "channel": {
+    "without_namespace": {
+      "history_size": 20,
+      "history_ttl": "300s",
+      "force_recovery": true
+    },
+    "namespaces": [
+      { "name": "personal", "history_size": 100, "history_ttl": "600s", "force_recovery": true },
+      { "name": "work", "history_size": 20, "history_ttl": "300s", "force_recovery": true },
+      { "name": "chat", "history_size": 100, "history_ttl": "300s", "force_recovery": true }
+    ]
+  }
+}
+```
+
+v5（扁平字段）：
+
+```json
+{
+  "token_hmac_secret_key": "<同 CENTRIFUGO_TOKEN_SECRET>",
+  "api_key": "<同 CENTRIFUGO_API_KEY>",
+  "allowed_origins": ["https://site.example.com"],
+  "history_size": 20,
+  "history_ttl": "300s",
+  "force_recovery": true,
+  "namespaces": [
+    { "name": "personal", "history_size": 100, "history_ttl": "600s", "force_recovery": true },
+    { "name": "work", "history_size": 20, "history_ttl": "300s", "force_recovery": true },
+    { "name": "chat", "history_size": 100, "history_ttl": "300s", "force_recovery": true }
+  ]
+}
+```
+
+- `site`、`site_r18` 没有冒号，属于不带命名空间的频道（v6 `channel.without_namespace`，v5 顶层的频道选项）。
+- 不要开 `allow_subscribe_for_client` / `allow_subscribe_for_anonymous`：`work`、`chat` 只能拿后端签的订阅令牌订，`personal`、`site`、`site_r18` 只经连接令牌的 `channels` 做服务端订阅。客户端也不能发布（不开 `allow_publish_for_*`），`typing` 由后端 `POST .../typing` 代发。
+- `force_recovery` + 历史：断线重连后补上断开期间的推送；补不上时前端（`recovered=false`）让面板补拉一次。
+- 匿名连接：令牌 `sub` 为空串，Centrifugo 按匿名用户处理，不需要另开选项。
+- `allowed_origins` 填前端的源；本地开发如 `http://localhost:5173`。
+- `CENTRIFUGO_PUBLIC_URL` 用 `wss://<域名>/connection/websocket`；`CENTRIFUGO_API_URL` 指向内网的 Centrifugo（如 `http://centrifugo:8000`），API 端口不要暴露到公网。
+
+### 没做到的
+
+- 作品对**匿名**订阅者转为受限、下架时没法按用户踢（匿名连接没有用户 ID）：靠 `work.visibility.changed`（前端在全年龄模式下收到 restricted 会关页面、给面板发 `chat.close`）和订阅令牌短有效期（`CENTRIFUGO_SUB_TOKEN_TTL`）兜底。
+- 断开连接后能否立刻丢掉旧连接令牌取决于前端对 3014 的处理；旧令牌在 `CENTRIFUGO_TOKEN_TTL` 内仍然有效，所以有效期不宜设长。
+- 作品交流区、公共聊天区的其他读者的 `unread.updated` 不推（每条消息要给所有读过的人算未读，量大）；侧栏红点靠面板的 `chat.unread` 和 `/chat/unread-summary`。
+- 直接从 Fluxer 客户端发的消息（不经本站接口）不推。
+- 定时发布的站务公告（`published_at` 在未来）到时间不会补推；`event.updated`、`event.results.published`（第二期活动）没接。
+- 退出登录不主动断开连接（前端 `refresh()` 自己重连）；全站禁言、封号不断开连接（禁言只推 `moderation.muted`）。
 
 ## 我的、提醒、公告规则、作品内、书单、好友（第二期 me 块）
 

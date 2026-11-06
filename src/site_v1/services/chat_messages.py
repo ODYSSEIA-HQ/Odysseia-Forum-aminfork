@@ -26,6 +26,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -57,7 +58,7 @@ from site_v1.fluxer import (
     FluxerUnavailable,
     get_fluxer,
 )
-from site_v1.services import chat_notify
+from site_v1.services import chat_notify, chat_realtime
 from site_v1.services.attachments import attachment_dto, load_attachments
 from site_v1.services.chat_channels import (
     PublicChannelRef,
@@ -408,10 +409,72 @@ def _limit(raw) -> int:
     return max(1, min(value, MAX_LIMIT))
 
 
+def _since_ms(raw) -> int | None:
+    """updatedAfter（ISO 8601）→ 毫秒时间戳；没带返回 None，格式不对 422。"""
+    if raw is None or raw == "":
+        return None
+    try:
+        at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        raise invalid({"updatedAfter": "时间格式不对"})
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return int(at.timestamp() * 1000)
+
+
+async def _updates(
+    session, ctx, chan: Chan, since_ms: int, skip: set[str]
+) -> list[dict]:
+    """since_ms 之后编辑、删除、表情变过的消息（整条，按 ID 正序）；已经在 items 里的不重复给。"""
+    ids = [
+        i
+        for i in await chat_realtime.changed_since(chan.channel_id, since_ms, MAX_LIMIT)
+        if i not in skip and _MSG_ID.fullmatch(i)
+    ]
+    if not ids:
+        return []
+    cached, _ = await latest(ctx, chan)
+    by_id = {m.id: m for m in cached}
+    viewer = ctx.viewer
+    found = []
+    for message_id in ids:
+        m = by_id.get(message_id)
+        if m is None:
+            m = await call(
+                get_fluxer().chat_message(
+                    ctx.fluxer_token,
+                    viewer.user_id if viewer else None,
+                    chan.channel_id,
+                    message_id,
+                )
+            )
+        if m is not None:
+            found.append(m)
+    found.sort(key=lambda m: _num(m.id))
+    return await to_dtos(session, ctx, chan, found)
+
+
 async def list_messages(
-    session, ctx, kind, raw_id, *, before, after, around, limit
+    session, ctx, kind, raw_id, *, before, after, around, limit, updated_after=None
 ) -> dict:
+    """历史消息；带 updatedAfter 时另给 updates（这之后改过的消息）和 serverTime（服务器当前时间，
+    下次轮询原样当 updatedAfter 传回），轮询据此看到编辑、删除、表情。不带时响应形状不变。
+    """
     chan = await resolve(session, ctx, kind, raw_id)
+    since_ms = _since_ms(updated_after)
+    server_time = iso_utc(utc_now())
+    page = await _list_page(
+        session, ctx, chan, before=before, after=after, around=around, limit=limit
+    )
+    if since_ms is not None:
+        page["serverTime"] = server_time
+        page["updates"] = await _updates(
+            session, ctx, chan, since_ms, {m["id"] for m in page["items"]}
+        )
+    return page
+
+
+async def _list_page(session, ctx, chan: Chan, *, before, after, around, limit) -> dict:
     before, after, around = _cursor(before), _cursor(after), _cursor(around)
     if sum(x is not None for x in (before, after, around)) > 1:
         raise invalid({"before": "before、after、around 只能带一个"})
@@ -726,6 +789,10 @@ async def send_message(session, ctx, kind, raw_id, body: dict) -> tuple[int, dic
             await port.chat_ack(token, viewer.user_id, chan.channel_id, message.id)
         except Exception:
             pass
+    await chat_realtime.push_message(
+        session, ctx, chan, message, "message.created", dto
+    )
+    await chat_realtime.push_peer_unread(session, ctx, chan)
     return 201, dto
 
 
@@ -783,7 +850,12 @@ async def edit_message(session, ctx, kind, raw_id, message_id, body: dict) -> di
     if not text:
         updated.content = ""
     await invalidate(chan.channel_id)
-    return (await to_dtos(session, ctx, chan, [updated]))[0]
+    await chat_realtime.record_change(chan.channel_id, updated.id)
+    dto = (await to_dtos(session, ctx, chan, [updated]))[0]
+    await chat_realtime.push_message(
+        session, ctx, chan, updated, "message.updated", dto
+    )
+    return dto
 
 
 async def delete_message(session, ctx, kind, raw_id, message_id) -> dict:
@@ -843,7 +915,11 @@ async def delete_message(session, ctx, kind, raw_id, message_id) -> dict:
     await session.commit()
     await invalidate(chan.channel_id)
     m.deleted_state = state
-    return (await to_dtos(session, ctx, chan, [m]))[0]
+    await chat_realtime.record_change(chan.channel_id, m.id)
+    dto = (await to_dtos(session, ctx, chan, [m]))[0]
+    # 删除 = message.updated：整条消息，deletedState 有值、body 为空串
+    await chat_realtime.push_message(session, ctx, chan, m, "message.updated", dto)
+    return dto
 
 
 async def react(session, ctx, kind, raw_id, message_id, emoji: str, on: bool) -> dict:
@@ -879,7 +955,10 @@ async def react(session, ctx, kind, raw_id, message_id, emoji: str, on: bool) ->
             pass
     await invalidate(chan.channel_id)
     fresh = await _message(ctx, chan, m.id)
-    return (await to_dtos(session, ctx, chan, [fresh]))[0]
+    await chat_realtime.record_change(chan.channel_id, fresh.id)
+    dto = (await to_dtos(session, ctx, chan, [fresh]))[0]
+    await chat_realtime.push_message(session, ctx, chan, fresh, "message.updated", dto)
+    return dto
 
 
 # ---------------- 已读、状态 ----------------
@@ -985,7 +1064,11 @@ async def mark_read(session, ctx, kind, raw_id, body) -> dict:
             )
         except Exception:
             logger.info("同步已读到 Fluxer 失败：%s", chan.channel_id)
-    return await state_of(session, ctx, chan)
+    state = await state_of(session, ctx, chan)
+    if moved:
+        # 别的标签页、设备上的侧栏红点跟着变
+        chat_realtime.push_unread(chan, viewer.user_id, state["unread"])
+    return state
 
 
 async def typing(session, ctx, kind, raw_id) -> None:
@@ -997,6 +1080,7 @@ async def typing(session, ctx, kind, raw_id) -> None:
         )
     except Exception:
         pass
+    chat_realtime.push_typing(ctx, chan)
 
 
 # ---------------- 会话列表（3.8） ----------------

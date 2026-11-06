@@ -20,6 +20,7 @@ id 由提醒领域生成。可见性（受限作品在全年龄模式下不出�
 这里不知道收件人以后用什么模式看。
 """
 
+import inspect
 import logging
 import re
 
@@ -47,7 +48,10 @@ async def deliver_notification(session, recipient_id: str, notification: dict) -
             recipient_id,
         )
         return
-    await create_notification(session, recipient_id, notification)
+    # create_notification 是同步的（只 session.add）；以后改成协程也兼容
+    result = create_notification(session, recipient_id, notification)
+    if inspect.isawaitable(result):
+        await result
 
 
 async def notify_mentions(

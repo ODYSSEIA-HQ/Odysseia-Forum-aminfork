@@ -16,6 +16,10 @@ def install(app) -> None:
     from site_v1.routers import router
 
     install_exception_handlers(app)
+    # 实时推送：事务提交后按 ORM 变化发布外层事件（没配 Centrifugo 时什么也不做）
+    from site_v1.realtime.hooks import install as install_realtime_hooks
+
+    install_realtime_hooks()
     app.add_middleware(SiteV1Middleware)
     app.include_router(router)
     # 本地存储的签名上传/读取端点（/api/storage，不在协议里；用 S3/R2 时一律 404）

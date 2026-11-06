@@ -13,6 +13,7 @@ from site_v1.routers import (
     me,
     me_extra,
     notifications,
+    realtime,
     work_extras,
     moderation,
     reports,
@@ -52,6 +53,7 @@ for module in (
     work_extras,
     collections,
     friends,
+    realtime,  # 实时推送令牌（Centrifugo）
 ):
     router.include_router(module.router)
 
