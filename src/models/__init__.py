@@ -43,8 +43,36 @@ from models.work_user_mute import WorkUserMute
 from models.work_source_state import WorkSourceState
 from models.work_native_tag_source import WorkNativeTagSource
 from models.work_native_tag_binding import WorkNativeTagBinding
+from models.site_account import (
+    SiteAccount,
+    SiteFakeCredential,
+    SiteRestrictedAccess,
+    SiteSetting,
+    SiteUserBlock,
+    SiteUserPrefs,
+)
+from models.site_tag import SiteTag, SiteTagGroup, SiteTagQuestion, SiteWorkTag
+from models.work_version import WorkVersion, WorkVersionFile
+from models.attachment import Attachment
+from models.site_moderation import ModerationQueueItem, Report, UserModerationRecord
 
 __all__ = [
+    "Attachment",
+    "ModerationQueueItem",
+    "Report",
+    "SiteAccount",
+    "SiteFakeCredential",
+    "SiteRestrictedAccess",
+    "SiteSetting",
+    "SiteTag",
+    "SiteTagGroup",
+    "SiteTagQuestion",
+    "SiteUserBlock",
+    "SiteUserPrefs",
+    "SiteWorkTag",
+    "UserModerationRecord",
+    "WorkVersion",
+    "WorkVersionFile",
     "Author",
     "AuthorFollow",
     "BannerApplication",
