@@ -8,7 +8,12 @@ from site_v1.routers import (
     chat,
     home,
     chat_messages,
+    collections,
+    friends,
     me,
+    me_extra,
+    notifications,
+    work_extras,
     moderation,
     reports,
     site,
@@ -41,6 +46,12 @@ for module in (
     events,
     fun,
     share,
+    # 「我的」、提醒、公告规则、作品内、书单、好友（第二期 me 块）
+    me_extra,
+    notifications,
+    work_extras,
+    collections,
+    friends,
 ):
     router.include_router(module.router)
 
