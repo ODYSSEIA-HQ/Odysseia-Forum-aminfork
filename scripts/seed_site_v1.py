@@ -357,6 +357,34 @@ async def seed_tag_catalog(session_factory) -> None:
     )
 
 
+async def seed_work_version(
+    session_factory,
+    work_id: int,
+    owner_id: str,
+    *,
+    name: str = "v1.0",
+    filename: str = "character-card.json",
+    data: bytes | None = None,
+    mime: str = "application/json",
+) -> tuple[int, int]:
+    """给种子作品建「最新版本 + 一个真实文件」（文件落到当前存储，本地是 SITE_STORAGE_LOCAL_DIR）。
+
+    幂等（同名版本已存在就跳过）；返回 (version_id, attachment_id)。契约测试 WRK-15/16 要用。
+    实现在 site_v1/services/versions.seed_version_with_file。
+    """
+    from site_v1.services.versions import seed_version_with_file
+
+    return await seed_version_with_file(
+        session_factory,
+        work_id=work_id,
+        owner_id=owner_id,
+        name=name,
+        filename=filename,
+        data=data,
+        mime=mime,
+    )
+
+
 async def seed_works(session_factory, accounts: dict[str, str]) -> None:
     """入口：已发布的全年龄作品（最新版本带文件）、R18 作品（R18 封面）、主榜。
 
