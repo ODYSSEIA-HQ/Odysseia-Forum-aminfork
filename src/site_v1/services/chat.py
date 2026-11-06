@@ -14,12 +14,12 @@ from datetime import UTC, datetime
 from site_v1.config import get_config
 from site_v1.errors import not_found, unauthenticated, unavailable
 from site_v1.fluxer import FluxerUnavailable, get_fluxer
+from site_v1.services.work_access import work_visible
 from site_v1.services.moderation_common import (
     native_thread_id,
     site_muted_until,
     visible_work,
     work_mute,
-    work_visible_to,
     works_by_native_thread,
 )
 from site_v1.dto import iso_utc, load_users
@@ -60,7 +60,7 @@ async def unread_summary(session, ctx) -> list[dict]:
     for entry in summary.works:
         work = works.get(str(entry.get("thread_id") or ""))
         # 受限作品在全年龄模式下不返回、不计入；下架、删除的作品同样不返回
-        if not work_visible_to(ctx, work):
+        if not await work_visible(session, ctx, work):
             continue
         items.append(
             {

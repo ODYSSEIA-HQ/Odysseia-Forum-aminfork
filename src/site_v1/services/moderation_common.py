@@ -1,8 +1,8 @@
 """聊天外层、举报、审核队列共用的小工具：作品可见性、全站禁言、作品内禁言、
 审核员看到的附件、作品摘要（ModerationWorkSummary）、用户占位。
 
-作品可见性只看本地状态（README「已定的语义」）：status=published、未软删、
-没被站务隐藏或下架，并且有效模式允许它的分级和 visibility。看不到一律按不存在处理。
+作品可见性统一用 services/work_access.work_visible（和作品详情同一份判断）。
+看不到一律按不存在处理。
 """
 
 import re
@@ -19,11 +19,9 @@ from models.work_user_mute import WorkUserMute
 from shared.time_utils import utc_now
 from site_v1 import mode as modes
 from site_v1.dto import iso_utc, user_dto
+from site_v1.services.work_access import work_rating, work_visible
 
 _INT_ID = re.compile(r"[1-9][0-9]{0,17}")
-
-# 对外不展示的作品审核状态
-HIDDEN_MODERATION_STATES = ("hidden", "removed")
 
 
 def parse_int_id(raw) -> int | None:
@@ -33,32 +31,16 @@ def parse_int_id(raw) -> int | None:
 
 
 def rating_of(work: Work) -> str:
-    return modes.work_rating(bool(work.is_nsfw), bool(work.is_abyss))
-
-
-def work_is_public_state(work: Work | None) -> bool:
-    """作品本身处于对外可见的状态（不看查看者）。"""
-    return (
-        work is not None
-        and work.deleted_at is None
-        and work.status == "published"
-        and work.moderation_state not in HIDDEN_MODERATION_STATES
-    )
-
-
-def work_visible_to(ctx, work: Work | None) -> bool:
-    """作品对当前查看者可见：状态对外可见，且有效模式允许它的分级和 visibility。"""
-    return work_is_public_state(work) and ctx.can_view(
-        rating_of(work), work.visibility or "public"
-    )
+    return work_rating(work)
 
 
 async def visible_work(session, ctx, raw_id) -> Work | None:
+    """当前查看者能看到的作品（统一规则见 services/work_access）；看不到返回 None。"""
     work_id = parse_int_id(raw_id)
     if work_id is None:
         return None
     work = await session.get(Work, work_id)
-    return work if work_visible_to(ctx, work) else None
+    return work if await work_visible(session, ctx, work) else None
 
 
 async def native_thread_id(session, work: Work) -> str | None:

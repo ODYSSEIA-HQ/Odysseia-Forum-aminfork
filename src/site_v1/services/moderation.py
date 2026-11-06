@@ -33,6 +33,7 @@ from shared.time_utils import utc_now
 from site_v1 import mode as modes
 from site_v1.dto import iso_utc, load_users
 from site_v1.errors import SiteError, conflict, forbidden, invalid, not_found
+from site_v1.services.work_access import work_visible
 from site_v1.services.moderation_common import (
     missing_user,
     parse_int_id,
@@ -40,7 +41,6 @@ from site_v1.services.moderation_common import (
     reviewer_attachment,
     tag_refs,
     work_summary,
-    work_visible_to,
 )
 
 # ---------------- 举报规则 ----------------
@@ -129,7 +129,7 @@ async def _attachment_visible(session, ctx, att: Attachment) -> bool:
     if not ctx.can_view(rating, "public" if rating == modes.GENERAL else "restricted"):
         return False
     if att.work_id is not None:
-        return work_visible_to(ctx, await session.get(Work, att.work_id))
+        return await work_visible(session, ctx, await session.get(Work, att.work_id))
     return True
 
 
@@ -138,7 +138,7 @@ async def target_snapshot(session, ctx, target_type: str, target_id: str) -> dic
     if target_type == "work":
         work_id = parse_int_id(target_id)
         work = await session.get(Work, work_id) if work_id else None
-        if not work_visible_to(ctx, work):
+        if not await work_visible(session, ctx, work):
             raise not_found()
         return _snapshot(
             work.title,
@@ -714,14 +714,16 @@ async def _recompute_visibility(session, work: Work) -> None:
     work.visibility = modes.work_visibility(rating_of(work), restricting)
 
 
-async def set_work_rating(session, work: Work, rating: str, by: str) -> None:
-    """改作品分级：is_nsfw / is_abyss、分级组 tag、visibility 一起改。
+async def set_work_rating(session, work: Work, rating: str, viewer) -> None:
+    """站务改作品分级：分级字段走作品领域的统一入口 works.set_classification
+    （有 Fluxer 帖子时排 V2 的分类移动任务），再换分级组 tag、重算 visibility。"""
+    from site_v1.services.works import set_classification
 
-    注意：这里不排 V2 的 Fluxer 移动任务（需要论坛配置），作品领域统一的改分级入口
-    出来后应换成那个（见 README「举报审核」）。
-    """
+    by = viewer.user_id
+    await set_classification(
+        session, work, rating, actor=viewer, mode=modes.R18, is_admin=True
+    )
     now = utc_now()
-    work.is_nsfw, work.is_abyss = modes.rating_flags(rating)
     rating_tag = (
         await session.execute(
             select(SiteTag).where(
@@ -851,7 +853,7 @@ async def _resolve_image(session, item, req, viewer) -> None:
         att.reject_reason = None
         # 图片比作品分级高：作品随之上调（01 号文档 5.1）
         if work is not None and modes.rating_rank(rating) > modes.rating_rank(work_rating):
-            await set_work_rating(session, work, rating, by)
+            await set_work_rating(session, work, rating, viewer)
             if work.author_id:
                 session.add(
                     _adjustment(
@@ -925,7 +927,7 @@ async def _resolve_report(session, item, req, viewer) -> None:
         parts = []
         before = rating_of(work)
         if req["rating"] and req["rating"] != before:
-            await set_work_rating(session, work, req["rating"], by)
+            await set_work_rating(session, work, req["rating"], viewer)
             work.rating_lock = {"by": by, "at": iso_utc(utc_now()), "reason": req["reason"]}
             parts.append(f"分级 {RATING_NAME[before]} → {RATING_NAME[req['rating']]}")
         added, removed = await _adjust_tags(

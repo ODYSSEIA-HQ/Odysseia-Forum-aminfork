@@ -16,6 +16,7 @@
 #   DB_USER（odysseia）、DB_PASSWORD（changeme）、DB_HOST（localhost）、DB_PORT（5432）
 #   REDIS_URL（redis://:xunmeng123456%21@localhost:6379/0）
 #   PORT（8791）
+#   LOG（$TMPDIR/site_v1_contract_uvicorn_$PORT.log）  uvicorn 日志
 #   KNOWN_GAPS（docs/site_v1/known-gaps.json）  本路线的已知不一致清单；设为空串表示不用
 set -euo pipefail
 
@@ -68,7 +69,7 @@ echo "==> 种子"
 uv run python scripts/seed_site_v1.py
 
 echo "==> 启动 uvicorn :$PORT（FLUXER_FAKE=1）"
-LOG="${TMPDIR:-/tmp}/site_v1_contract_uvicorn.log"
+LOG="${LOG:-${TMPDIR:-/tmp}/site_v1_contract_uvicorn_${PORT}.log}"
 uv run uvicorn api.main:app --host 127.0.0.1 --port "$PORT" --log-level warning >"$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() {

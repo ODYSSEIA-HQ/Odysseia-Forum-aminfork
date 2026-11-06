@@ -109,3 +109,59 @@ def test_iso_utc_and_camelize():
         "contentMode": "r18",
         "nestedList": [{"showR18G": True}],
     }
+
+
+@pytest.mark.asyncio
+async def test_set_classification_uses_v2_move_task_when_fluxer_threads(monkeypatch):
+    """改分级的统一入口：真实环境、作品有 Fluxer 帖子时走 V2 WorkService.update（排分类移动任务），
+    审核改分级（moderation.set_work_rating）也调这里。"""
+    from types import SimpleNamespace
+
+    from site_v1.context import Prefs, RestrictedAccess, Viewer
+    from site_v1.services import works
+
+    calls = []
+
+    class FakeWorkService:
+        def __init__(self, session):
+            pass
+
+        async def update(self, work, changes, principal, forums):
+            calls.append((changes, principal["is_admin"]))
+
+    async def has_threads(session, work_id):
+        return True
+
+    import work.work_service as v2
+
+    monkeypatch.setattr(v2, "WorkService", FakeWorkService)
+    monkeypatch.setattr(works, "has_fluxer_threads", has_threads)
+    monkeypatch.setattr(works, "get_config", lambda: SimpleNamespace(fluxer_fake=False))
+    viewer = Viewer(
+        user_id="9",
+        username="staff",
+        display_name=None,
+        avatar_url=None,
+        discord_user_id=None,
+        email=None,
+        created_at=datetime.now(timezone.utc),
+        newcomer_until=None,
+        quiz_passed=True,
+        permissions=frozenset(),
+        prefs=Prefs(),
+        access=RestrictedAccess(),
+    )
+    work_row = SimpleNamespace(id=1, is_nsfw=False, is_abyss=False, classification_revision=0)
+    await works.set_classification(
+        None, work_row, "r18g", actor=viewer, mode="r18", is_admin=True
+    )
+    assert calls == [({"is_nsfw": True, "is_abyss": True}, True)]
+    # 没有操作者（或 fake 模式）时直接改字段
+    await works.set_classification(
+        None, work_row, "r18", actor=None, mode="r18", is_admin=True
+    )
+    assert (work_row.is_nsfw, work_row.is_abyss, work_row.classification_revision) == (
+        True,
+        False,
+        1,
+    )
