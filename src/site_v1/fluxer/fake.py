@@ -65,6 +65,11 @@ class FakeFluxer:
     def __init__(self, session_factory=None, redis=None):
         self._session_factory = session_factory
         self._redis = redis
+        # 聊天外层的种子数据（测试用）：没有种子时未读为空、私信一律不存在
+        self.unread_seed: dict[str, UnreadSummary] = {}
+        """user_id → 未读汇总。"""
+        self.dm_seed: dict[str, dict] = {}
+        """私信频道 ID → {members: [user_id], member_count?}。"""
 
     @property
     def sessions(self):
@@ -257,12 +262,24 @@ class FakeFluxer:
         return identity
 
     async def unread_summary(self, token: str, user_id: str) -> UnreadSummary:
-        return UnreadSummary()
+        return self.unread_seed.get(user_id) or UnreadSummary()
 
     async def chat_target_info(
         self, token: str | None, kind: str, target_id: str
     ) -> dict | None:
-        # 假频道：成员数固定，ID 由目标派生，保证同一目标稳定
+        if kind == "dm":
+            # 私信要是会话成员：按令牌解析出的身份比对种子里的成员
+            channel = self.dm_seed.get(target_id)
+            identity = await self.resolve_session(token) if token else None
+            if not channel or identity is None or identity.user_id not in channel["members"]:
+                return None
+            peer = next((m for m in channel["members"] if m != identity.user_id), None)
+            return {
+                "channel_id": target_id,
+                "member_count": channel.get("member_count", len(channel["members"])),
+                "peer_user_id": peer,
+            }
+        # 作品交流区：假频道，成员数固定，ID 由目标派生，保证同一目标稳定
         return {
             "channel_id": f"fake-{kind}-{target_id}",
             "member_count": 1,

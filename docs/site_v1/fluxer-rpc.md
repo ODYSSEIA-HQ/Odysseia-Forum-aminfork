@@ -71,7 +71,7 @@
 
 ## 4. 未读汇总 `rpc.content.v1.read_states.summary_service`
 
-`GET /chat/unread-summary` 用（聊天外层，3.5）。
+`GET /chat/unread-summary` 用（聊天外层，3.5）。实现：`FluxerPort.unread_summary`，Forum 侧映射在 `site_v1/services/chat.py`。
 
 请求：`{ "token": "flx_...", "user_id": "..." }`
 
@@ -79,20 +79,32 @@
 
 ```json
 {
-  "works": [{ "thread_id": "原生主帖 ID", "unread": 3, "mentions": 1 }],
-  "dms":   [{ "channel_id": "私信频道 ID", "unread": 1, "mentions": 0 }]
+  "works": [{ "thread_id": "原生主帖 ID", "unread": 3, "mentions": 1, "last_message_at": "2026-11-01T10:00:00Z" }],
+  "dms":   [{ "channel_id": "私信频道 ID", "unread": 1, "mentions": 0, "last_message_at": 1761991200000 }]
 }
 ```
 
-Forum 再按有效模式剔除受限作品（全年龄模式下不计数）。
+- `works` 只列这个账号进过（有已读记录）的作品交流区，和假后端一致；没进过的交流区不算未读。私信列全部会话。
+- `unread` 不算自己发的、已删除的消息；`mentions` = @我 + 回复我的消息。
+- `last_message_at`：频道最后一条消息时间，ISO 8601 UTC 或毫秒时间戳；没有消息为 `null`。
+- Forum 把 `thread_id` 映射到作品（`work.source_thread_id`，或 `thread` 表 platform=fluxer、role=main 的投影），再按有效模式剔除受限、下架、删除的作品（全年龄模式下不返回、不计数）。认不出的 `thread_id` 直接丢掉。
+
+错误：任何失败 → 503。
 
 ## 5. 频道信息 `rpc.content.v1.channel.info_service`
 
-`GET /chat/targets/{kind}/{id}` 用。
+`GET /chat/targets/{kind}/{id}` 用。实现：`FluxerPort.chat_target_info`。
 
-请求：`{ "token": "flx_..." | null, "kind": "work" | "dm", "target_id": "原生主帖 ID 或私信频道 ID" }`
+请求：`{ "token": "flx_..." | null, "kind": "work" | "dm", "target_id": "原生主帖 ID 或私信频道 ID" }`（`kind=work` 时未登录也会调，token 为 null）
 
-成功：`{ "channel_id": "...", "member_count": 12 }`；不存在返回错误码 `NOT_FOUND`（Forum 映射 404）。
+成功：
+
+- `kind=work`：`{ "channel_id": "...", "member_count": 12 }`。`member_count` = 在这个交流区发过言或订阅了的人数（Fluxer 怎么定义都行，前端只显示）。
+- `kind=dm`：`{ "channel_id": "...", "member_count": 2, "peer_user_id": "对方用户 ID" }`。**只有令牌对应的账号是会话成员时才返回**，否则按 `NOT_FOUND`。
+
+错误码：`NOT_FOUND` → 作品：`canOpen=false`（作品存在、原生帖还不可用）；私信：404。其他 → 503。
+
+Forum 侧：作品可见性（有效模式、status、下架）先在本地判断，看不到的直接 404，不会调 Fluxer；原生主帖还没建好时也不调，`canOpen=false`、`memberCount=0`。作品内禁言（`work_user_mute`）和全站禁言（`user_moderation_record.kind=mute`）由 Forum 自己算，不需要 Fluxer 返回。
 
 ## 6. 以后要的（不在第一期 40 个接口里，先记下）
 

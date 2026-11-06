@@ -97,10 +97,12 @@ class UnreadSummary:
     """GET /chat/unread-summary 的原始数据（作品、私信按目标汇总）。"""
 
     works: list[dict] = field(default_factory=list)
-    """[{thread_id(原生主帖), unread, mentions}]，由调用方映射到作品并按有效模式过滤。"""
+    """[{thread_id(原生主帖), unread, mentions, last_message_at}]，由调用方映射到作品并按有效模式过滤。"""
 
     dms: list[dict] = field(default_factory=list)
-    """[{channel_id(私信频道), unread, mentions}]。"""
+    """[{channel_id(私信频道), unread, mentions, last_message_at}]。
+
+    last_message_at：ISO 8601 UTC 或毫秒时间戳，没有消息为 null。"""
 
 
 @runtime_checkable
@@ -152,5 +154,9 @@ class FluxerPort(Protocol):
     async def chat_target_info(
         self, token: str | None, kind: str, target_id: str
     ) -> dict | None:
-        """聊天目标信息：{channel_id, member_count}；不存在返回 None。kind=work 时 target_id 是原生主帖 ID。"""
+        """聊天目标信息；不存在（含：私信且令牌对应的账号不是成员）返回 None。
+
+        kind=work：target_id 是原生主帖 ID，返回 {channel_id, member_count}。
+        kind=dm：target_id 是私信频道 ID，返回 {channel_id, member_count, peer_user_id}。
+        """
         ...

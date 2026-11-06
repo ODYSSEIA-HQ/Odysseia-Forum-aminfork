@@ -26,7 +26,8 @@ src/site_v1/
   dto.py             camelCase、ID、ISO UTC、User/Me/附件 DTO、load_users 批量取作者
   membership.py      Discord 正式成员身份组检查（真实环境）
   fluxer/            FluxerPort（port.py）、RealFluxer（real.py）、FakeFluxer（fake.py）
-  services/          accounts.py（账号行、资格条件）、social.py（关注/屏蔽）、user_works.py（占位）
+  services/          accounts.py（账号行、资格条件）、social.py（关注/屏蔽）、user_works.py（占位）、
+                     chat.py（聊天外层）、moderation.py（举报、审核队列）、moderation_common.py（作品可见性、禁言、审核员附件）
   routers/           site auth me users works versions uploads tags chat reports moderation
   test_hooks.py      /__test__（SITE_TEST_HOOKS=1 才挂）
 src/models/          site_account.py site_tag.py work_version.py attachment.py site_moderation.py；work.py 加了协议字段
@@ -108,8 +109,8 @@ uv run pytest tests/site_v1
 | `revoke_session` | `rpc.auth.v1.session.revoke_current` + 会话失效事件（同 V2 退出） | 删令牌 |
 | `discord_exchange` | `rpc.auth.v1.external.exchange` + user/discord_identity 投影（同 V2 回调） | 不支持（回调跳 `/login?error=discord_unavailable`） |
 | `update_profile` | 新 RPC `rpc.identity.v1.profile.update_service` | 改本地 user |
-| `unread_summary` | 新 RPC `rpc.content.v1.read_states.summary_service` | 空 |
-| `chat_target_info` | 新 RPC `rpc.content.v1.channel.info_service` | 固定假频道 |
+| `unread_summary` | 新 RPC `rpc.content.v1.read_states.summary_service` | 空（测试可往 `unread_seed[user_id]` 塞） |
+| `chat_target_info` | 新 RPC `rpc.content.v1.channel.info_service` | 作品：固定假频道（成员数 1）；私信：只认 `dm_seed` 里且查看者是成员的会话，否则不存在 |
 
 错误：`FluxerUnavailable` → 503；`InvalidCredentials` → 422 `fields.password`；`AccountExists` → 422 `fields.username|email`；`MfaRequired`、`AccountUnavailable` → 403。新 RPC 的请求、响应、错误码见 [fluxer-rpc.md](./fluxer-rpc.md)。
 
@@ -189,6 +190,36 @@ tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source
 7. **种子和契约测试**：已发布作品、版本文件、主榜补在 `scripts/seed_site_v1.py` 的 `seed_works()`；做完一个领域就把 `docs/site_v1/known-gaps.json` 里对应用例删掉（意外通过会报红）。
 8. **fake 模式和异步任务**：`FLUXER_FAKE=1` 时不启动 `WorkTaskWorker` 和事件消费者；发布作品如果要排 V2 的 `create_main` 任务，fake 模式下直接跳过或同步视为成功，作品可见性不依赖它。
 
+## 聊天外层、举报审核（3.5、3.10）
+
+代码：`routers/chat.py reports.py moderation.py`，逻辑在 `services/chat.py`、`services/moderation.py`、`services/moderation_common.py`。没有新迁移，只用 `site_v1_schema` 建好的表。规则对齐假后端（`contract-tests/mock-server/vendor/src/mock/handlers/{chat,moderation}.ts`、`shared/lib/moderation.ts`）。
+
+**作品可见**（`moderation_common.work_visible_to`，聊天和举报共用）：`status=published`、`deleted_at` 为空、`moderation_state` 不是 hidden/removed，且 `ctx.can_view(rating, visibility)`。看不到一律 404。作品领域如果有统一的判断函数，可以替换它。
+
+**聊天外层**
+- 作品交流区 = Fluxer 原生主帖：`source_platform=fluxer` 看 `work.source_thread_id`，Discord 来源看 `thread` 表 platform=fluxer、role=main 的投影。主帖没建好 → `canOpen=false`、`memberCount=0`。`FLUXER_FAKE=1` 时没有主帖的作品用假频道 `work-{id}`，视为能打开（作品领域在 fake 模式不排 create_main）。
+- 扩展字段（协议 ChatTargetInfo 之外，ajv 允许）：`canPost`（已登录、能打开、没被作品内禁言 `work_user_mute`、没被全站禁言）、`mutedUntil`（禁言截止；永久的作品内禁言为 null 且 `canPost=false`）。
+- 未读汇总：Fluxer 按原生主帖和私信频道给，Forum 映射成作品并剔除看不到的。RPC 形状见 fluxer-rpc.md 第 4、5 节。
+
+**举报**（`POST /reports`）
+- 理由按对象类型限定（同假后端），`other` 要写 note，note ≤ 500，不能举报自己。
+- 看不到的对象 404：作品按上面的规则；`upload` 要 ready 且分级和所属作品可见（上传者本人总能举报自己的）；`tag` 在全年龄模式下不能是限制可见的；`user` 要存在且没合并；`collection`/`event`/`event_entry` 本路线还没有，一律 404。`message`/`post`/`dc_archive_post` 原文在 Fluxer/DC 存档，Forum 读不到，**只记 ID 不校验**（快照标题是「消息 xxx」）。
+- 去重：同一对象的待处理举报聚合到一个 report 队列项；同一账号对同一待处理对象再举报 409（先查，`uq_report_pending_reporter_target` 兜底）。队列项处理后举报一起变 resolved，可以再举报（进新队列项）。
+
+**审核队列**
+- 权限：`image` 要 `moderation.images` 且本人 R18 资格 granted；`report` 要 `moderation.reports` 或 `moderation.content`（`site.admin` 视为全部）。权限来自 `site_account.permissions`（种子里 demo 有全部）。
+- 排序：待处理举报按不同举报人数降序、再按入队时间；待处理图片按入队时间；已处理按处理时间倒序。offset 游标。
+- 图片项来自 `attachment`：读 `type=image&state=pending` 时，把 `kind=image`、`review_state=pending_review`、未删除、用途是 cover/gallery/chat/discussion、还没有待处理项的附件补成队列项（`source=model`，`auto_rating`/`model_scores`/`purpose` 从附件取）。上传领域也可以直接调 `services.moderation.enqueue_image(session, att, source=..., appeal_note=...)`（申诉、举报来源要这样传）。附件被删的图片项不再显示。
+- 处理（`resolve`，已处理 409，行锁防并发）：
+  - 图片 `approve`（分级 = 请求的 rating，否则作品当前分级）/ `set_rating` / `block`（附件 rejected+blocked，从作品封面、图库里拿掉，给作者记一次违规调整）。图片分级高于作品时作品随之上调（记调整，不计违规）。作品没有别的待审图片时 `moderation_state` 从 pending_review 回到 ok。
+  - 举报 `dismiss` / `adjust`（只对作品：改分级会写 `rating_lock`；增删 tag 只能是目录里非分级、非资源类型的 tag）/ `remove`（作品：`status=removed`、`moderation_state=removed`，并复用 V2 `WorkModerationService.soft_delete`——站务没绑 Discord 时按同样步骤做、`OperationLog.actor_id` 留空；tag：软删 tag 并从所有作品摘掉；upload：同图片拦截；消息/帖子：只记录）/ `penalize`。`penalty` 可附在 adjust/remove 上，禁言写 `user_moderation_record(kind=mute, until)`，警告 `kind=warning`。
+  - 调整记录 `user_moderation_record(kind=adjustment)`，`strike=true` 的计入 `authorStrikes90d`。
+- 改作品分级（`services.moderation.set_work_rating`）：改 `is_nsfw/is_abyss`、换分级组 tag、重算 `visibility`。**没有排 V2 的 Fluxer 移动任务**（要论坛配置），作品/tag 领域有统一的改分级入口后应换掉。
+
+**和其它领域的约定**
+- 上传领域：附件对审核员的地址由 `site_v1.services.uploads.attachment_url(att, *, reviewer=True) -> str | None` 提供（`moderation_common.attachment_url` 会 import 它；没有时 `url`/`thumbUrl` 为 null，协议允许但前端看不到图）。分级拿不准时把附件 `review_state` 置 `pending_review`（作品 `moderation_state` 置 pending_review），队列会自动收进来。
+- 作品领域：fake 模式不建原生主帖也没关系；下架的作品 `status=removed` 且 `deleted_at` 有值，列表和详情要过滤。
+
 ## 契约测试现状
 
-`scripts/run_contract_tests.sh`：00-spec、01-common、02-session、09-dm、99-rate-limit 全绿（01 里依赖 `/works` 的 COM-01、12–15，09 的 `POST /conversations`，99 的限频按 known-gaps 记为预期失败）。03–08 在 `beforeAll` 就失败（要 `GET /tags/catalog`、`POST /works`），对应领域做好后才会真正跑起来。
+`scripts/run_contract_tests.sh`：00-spec、01-common、02-session、09-dm、99-rate-limit 全绿（01 里依赖 `/works` 的 COM-01、12–15，09 的 `POST /conversations`，99 的限频按 known-gaps 记为预期失败）。03–08 在 `beforeAll` 就失败（要 `GET /tags/catalog`、`POST /works`），对应领域做好后才会真正跑起来。07、08 和 R18-16/17 的接口已实现，known-gaps 里已删掉（作品、tag 合进来后应当直接通过；本地用 curl + ajv 按 openapi 校验过响应形状）。
