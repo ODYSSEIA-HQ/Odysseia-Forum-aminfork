@@ -379,6 +379,8 @@ async def test_admin_create_validate_and_organizers(env, people):
     body = err(await staff.put(f"/admin/events/{ev['id']}/organizers", {"userIds": [people["plain"]]}), 422, "validation_failed")
     res = await staff.put(f"/admin/events/{ev['id']}/organizers", {"userIds": [people["org"]]})
     assert res.json()["organizers"][0]["id"] == people["org"]
+    # 0.5.0：返回整个 Event
+    assert res.json()["id"] == ev["id"] and res.json()["slug"] == "mix-1" and "eligibility" in res.json()
     assert (await staff.post(f"/admin/events/{ev['id']}/publish")).json()["state"] == "open"
     err(await staff.post(f"/admin/events/{ev['id']}/publish"), 409, "conflict")
     assert (await staff.post(f"/admin/events/{ev['id']}/cancel", {"reason": "测试"})).json()["state"] == "cancelled"

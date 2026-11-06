@@ -39,6 +39,12 @@ async def get_user(id: str, ctx: Ctx):
         await _existing_user(session, id)
         profile = (await load_users(session, [id]))[id]
         profile["pinnedWorks"] = await me_extra.pinned_works_of(session, ctx, id)
+        # 勋章墙（装饰身份组，含活动获奖发的）：和 GET /me/decorations 同一份数据
+        wall = await me_extra.my_decorations(session, id)
+        profile["decorationRoles"] = wall["decorationRoles"]
+        profile["showcase"] = wall["showcase"]
+        profile["showcaseHidden"] = wall["showcaseHidden"]
+        profile["decorations"] = wall["decorations"]
         viewer = ctx.viewer
         if viewer is not None and viewer.user_id != id:
             target_prefs = await session.get(SiteUserPrefs, id)

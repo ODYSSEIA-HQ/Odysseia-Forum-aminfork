@@ -4,7 +4,7 @@ contract-tests/mock-server/vendor/src/mock/handlers/moderation.ts 和 shared/lib
 举报：
 - 理由按对象类型限定；选 other 时 note 必填；note 最多 500 字；不能举报自己（用户）。
 - 看不到的对象按不存在处理（404）：作品按有效模式，附件按分级和所属作品，tag 在全年龄
-  模式下不能是限制可见的。collection / event / event_entry 是第二期对象，暂时一律 404。
+  模式下不能是限制可见的；书单按公开/本人，活动按活动可见性，参赛作品还要作品可见。
   message / post / dc_archive_post 在 Fluxer（或 DC 存档）里，Forum 读不到原文，只记 ID。
 - 同一对象的举报聚合到一个待处理的 report 队列项；同一账号对同一待处理对象再举报 409
   （report 表的部分唯一索引兜底）。队列项处理后，里面的举报一起变成 resolved，之后可以再举报。
@@ -184,9 +184,40 @@ async def target_snapshot(session, ctx, target_type: str, target_id: str) -> dic
             "官方 tag" if tag.official else "自由 tag",
             None if tag.official else tag.created_by,
         )
-    if target_type in ("collection", "event", "event_entry"):
-        # 书单、活动、参赛作品是第二期，本路线还没有这些对象
-        raise not_found()
+    if target_type == "collection":
+        from site_v1.routers.collections import _visible_collection
+
+        row = await _visible_collection(session, ctx, target_id)
+        return _snapshot(
+            row.title, (row.description or "")[:120] or None, row.fluxer_owner_id
+        )
+    if target_type == "event":
+        from site_v1.services import events as ev
+
+        e = await ev.find_event(session, target_id)
+        if not ev.event_visible(e, ctx):
+            raise not_found()
+        return _snapshot(e.title, (e.summary or "")[:120] or None)
+    if target_type == "event_entry":
+        from models.site_event import SiteEventEntry
+        from site_v1.services import events as ev
+
+        entry_id = parse_int_id(target_id)
+        en = await session.get(SiteEventEntry, entry_id) if entry_id else None
+        e = await ev.find_event(session, en.event_id) if en is not None else None
+        work = await session.get(Work, en.work_id) if en is not None else None
+        if (
+            en is None
+            or not ev.event_visible(e, ctx)
+            or not await work_visible(session, ctx, work)
+        ):
+            raise not_found()
+        return _snapshot(
+            f"{e.title}：{work.title}",
+            (en.note or "")[:120] or None,
+            en.submitted_by,
+            str(work.id),
+        )
     # message / post / dc_archive_post：原文在 Fluxer（或 DC 存档），Forum 读不到，只记 ID
     return _snapshot(f"{TARGET_LABEL[target_type]} {target_id}")
 

@@ -283,15 +283,18 @@ async def _set_required_question(session, tag: SiteTag, for_types) -> None:
         not isinstance(t, str) for t in for_types
     ):
         raise invalid({"requiredQuestionFor": "要是资源类型名列表"})
-    types = set(
-        (
-            await session.execute(
-                select(SiteTag.name).where(
-                    SiteTag.group_id == "type", SiteTag.deleted_at.is_(None)
-                )
+    type_rows = (
+        await session.execute(
+            select(SiteTag.id, SiteTag.name).where(
+                SiteTag.group_id == "type", SiteTag.deleted_at.is_(None)
             )
-        ).scalars()
-    )
+        )
+    ).all()
+    types = {name for _, name in type_rows}
+    # 协议只写了 string：资源类型名（前端、假后端的写法）之外，也认资源类型 tag 的 ID 和「type:名字」
+    by_ref = {str(i): name for i, name in type_rows}
+    by_ref.update({f"type:{name}": name for _, name in type_rows})
+    for_types = [t if t in types else by_ref.get(t.strip(), t) for t in for_types]
     bad = [t for t in for_types if t not in types]
     if bad:
         raise invalid({"requiredQuestionFor": f"没有这些资源类型：{'、'.join(bad)}"})
@@ -474,6 +477,18 @@ async def _add_alias(session, tag_id: int, name: str, actor: str) -> None:
     )
 
 
+def _tag_and_result(detail: dict, affected: int = 0) -> dict:
+    """POST /admin/tags 和 POST /admin/tags/{id}/synonyms 的响应：协议和前端对不上，两种形状都给。
+
+    - 协议（openapi.yaml）：建 tag 返回 TagDetail，同义词返回 {tag, affectedWorks}；
+    - 前端（src/features/tag-admin/api.ts、假后端 tagAdmin.ts）：建 tag 读 {tag, affectedWorks}，
+      同义词读 TagDetail。
+    所以返回 TagDetail 的全部字段，再加上 tag（同一个 TagDetail）和 affectedWorks：
+    按任一种形状读都对，两边都不用改。等协议和前端统一后去掉多余的一半。
+    """
+    return {**detail, "tag": detail, "affectedWorks": affected}
+
+
 @router.post("/admin/tags", status_code=201, summary="建官方 tag")
 async def create_tag(ctx: Ctx, body: dict = Body(...)):
     viewer = _require_tag_manager(ctx)
@@ -510,7 +525,7 @@ async def create_tag(ctx: Ctx, body: dict = Body(...)):
         await td.bump_catalog_version(session)
         detail = await _detail(session, ctx, tag)
         await session.commit()
-    return {"tag": detail, "affectedWorks": 0}
+    return _tag_and_result(detail, 0)
 
 
 @router.patch("/admin/tags/{id}", summary="改名、简介、restricts、必答类型")
@@ -600,7 +615,7 @@ async def set_synonyms(id: str, ctx: Ctx, body: dict = Body(...)):
             await _add_alias(session, tag.id, n, viewer.user_id)
         detail = await _detail(session, ctx, tag)
         await session.commit()
-    return detail
+    return _tag_and_result(detail, 0)
 
 
 @router.post("/admin/tags/{id}/merge", summary="把这个 tag 并进另一个，原名变成同义词")

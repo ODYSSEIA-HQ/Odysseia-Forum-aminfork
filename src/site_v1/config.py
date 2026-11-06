@@ -120,5 +120,8 @@ def get_config() -> SiteConfig:
 
 def reload_config() -> SiteConfig:
     """清掉缓存重新读环境变量（测试用）。"""
+    from site_v1.rate_limit import get_rate_limit_config
+
     get_config.cache_clear()
+    get_rate_limit_config.cache_clear()
     return get_config()

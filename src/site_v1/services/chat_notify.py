@@ -48,7 +48,8 @@ async def deliver_notification(session, recipient_id: str, notification: dict) -
             recipient_id,
         )
         return
-    # create_notification 是同步的（只 session.add）；以后改成协程也兼容
+    # create_notification 是同步函数（只 session.add）；以前这里直接 await 它，
+    # 每次都抛 TypeError 被上层吞掉记一条异常日志。两种写法都兼容
     result = create_notification(session, recipient_id, notification)
     if inspect.isawaitable(result):
         await result

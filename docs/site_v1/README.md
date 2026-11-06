@@ -108,6 +108,19 @@ uv run pytest tests/site_v1
 | `CENTRIFUGO_*` | 空 | 实时推送，见「实时推送（Centrifugo）」 |
 | `REDIS_URL` | `redis://localhost:6379/0` | 只在独立用 uvicorn 启动时用（api_main.py 已经初始化 Redis 时不读） |
 
+限频（协议 1.6，`site_v1/rate_limit.py`；Redis 固定窗口，键 `site:rl:{桶}:{账号或 IP}`，超限 429 `rate_limited` + `Retry-After`（当前窗口剩余秒数）+ `details.scope`=`account`/`ip`）：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SITE_RL_ENABLED` | `1` | `0` 关掉（pytest 默认关，见 tests/conftest.py） |
+| `SITE_RL_ACCOUNT_WRITE_LIMIT` / `_WINDOW` | `240` / `60` | 已登录账号的写请求（POST/PUT/PATCH/DELETE）每窗口上限。契约测试里 demo 一分钟最多约 140 次写，RL-01 要在 300 次以内触发 |
+| `SITE_RL_IP_WRITE_LIMIT` / `_WINDOW` | `60` / `60` | 未登录的写请求（登录、注册……）按 IP。契约测试全程未登录写约 30 次，RL-02 连续登录失败第 61 次被限 |
+| `SITE_RL_IP_LIMIT` / `_WINDOW` | `600` / `60` | 未登录的全部请求按 IP |
+| `SITE_RL_TRUST_CF` | `0` | `1`：IP 取 `CF-Connecting-IP`（只在确实经过 Cloudflare 时开） |
+| `SITE_RL_TRUSTED_PROXIES` | 空 | 受信代理的 IP/网段（逗号分隔）。直连地址是受信代理时，取 `X-Forwarded-For` 从右往左第一个不受信的地址；从不取第一个值 |
+
+已登录账号的读请求不限；旧 `RateLimitMiddleware` 只管 `/v1`、`/v2`，不变。Redis 出错时放行（会话那一步已经会 503）。测试钩子 `POST /__test__/rate-limit/reset` 清计数。
+
 上传、存储、分级（`site_v1/files_config.py`）：
 
 | 环境变量 | 默认 | 说明 |
@@ -133,6 +146,7 @@ uv run pytest tests/site_v1
 1. `SiteV1Middleware`（只管 `/api/v1`）：
    - Cookie → Redis `site:sess:{sha256(sid)}`（`{user_id, csrf, token, created_at}`）→ `FluxerPort.resolve_session(token)` → `load_viewer()`（每个请求从库里现读账号、偏好、资格，**不缓存**）→ 有效模式；
    - Fluxer/Redis/数据库不可用 → 503 `temporarily_unavailable` + `Retry-After`（不会变成 401）；Fluxer 说令牌无效 → 会话降为匿名（csrf 保留）。
+   - 限频（见上面「限频」）：已登录账号的写请求按账号、未登录的请求按 IP，超限 429。
    - 写请求校验 `X-CSRF-Token`（缺少、不对、没有会话 → 403 `forbidden`），在路由之前。
    - 响应头补 `X-Content-Mode`（按请求结束时的有效模式，登录、切模式后跟着变）、`Cache-Control: no-store`、待写的 `Set-Cookie`。
    - 路由里没接住的异常 → 503。
@@ -221,14 +235,14 @@ uv run pytest tests/site_v1
 - 目标 → Fluxer 频道：作品 = 原生主帖（`native_thread_id`）；私信会话 ID 就是 Fluxer 私信频道 ID；公共频道 = 频道对象的 `fluxer_channel_id`（频道领域做，可空；这里在已注册的表里找带 `id,name,rating,fluxer_channel_id` 列的表，或由频道领域调 `set_public_channel_source` 注册）。`FLUXER_FAKE=1` 时没有的用 `work-{id}` / `channel-{id}`；真实环境没有 → 404 / `canOpen=false`。
 - 假 Fluxer：消息 `site_chat_message`（软删除留占位）、私信频道 `site_chat_dm_channel`。Forum 自己的叠加：`site_chat_message_meta`（本站附件、删除记录）、`site_chat_read_state`（已读位置，只往后走；没进过的交流区和公共频道不算未读，私信算）。
 - 规则：看不到的作品 / 分级不可见的公共频道 404；附件按查看者有效模式给占位（私信里 Fluxer 原生附件分级未知按 R18）；public 作品交流区不能发 R18 图、公共频道不能发高于频道分级的图（422 `rating_conflict`）；作品内禁言 / 全站禁言 403 `muted`（`details.until`，永久为 null）；私信每条消息都按对方 `dmPrivacy` 和屏蔽检查（403）；删言：本人 `by_author`，作品作者 / 卡贴管理员（`can_manage_work`）`by_manager`，`moderation.content`、公共频道里 `channels.manage` 的站务 `by_staff`；`nonce` 10 分钟内去重（Redis）。
-- @ 提醒：消息里的 `<@userId>` 经 `chat_notify.deliver_notification(session, recipient_id, notification)` 写提醒（协议 Notification 形状，`category=mention`、`context.{workId|conversationId|channelId, messageId}`）；提醒领域实现 `site_v1.services.notifications.create_notification` 后自动接上，之前只记日志。
+- @ 提醒：消息里的 `<@userId>` 经 `chat_notify.deliver_notification(session, recipient_id, notification)` 写提醒（协议 Notification 形状，`category=mention`、`context.{workId|conversationId|channelId, messageId}`），由 `site_v1.services.notifications.create_notification` 写入（同步函数，只 add 不 commit；以前这里 await 它会抛 TypeError 被吞掉，已修）。
 - 实时推送和轮询拿编辑、删除（`updatedAfter`）见「实时推送（Centrifugo）」。
 - 读性能：每个频道最新 50 条缓存在 Redis `site:chat:latest:{channel}`，写操作清缓存，另有 `SITE_CHAT_CACHE_TTL`（默认 15 秒）兜住从 Fluxer 客户端直接发的消息；前端 8 秒轮询（`after=最后一条`）直接从缓存给。真实环境的 `reactions.me` 用本站记下的点击（Redis `site:chat:rx:*`），不用缓存里取消息那个人的。
 - 实时：已接 Centrifugo，见「实时推送（Centrifugo）」（聊天消息只推经本站接口发、改、删的；直接从 Fluxer 客户端发的消息要等 Forum 订阅 Fluxer 网关事件 `events.content.v1.message.*` 后再转发，还没做）。
 
 **举报**（`POST /reports`）
 - 理由按对象类型限定（同假后端），`other` 要写 note，note ≤ 500，不能举报自己。
-- 看不到的对象 404：作品按上面的规则；`upload` 要 ready 且分级和所属作品可见（上传者本人总能举报自己的）；`tag` 在全年龄模式下不能是限制可见的；`user` 要存在且没合并；`collection`/`event`/`event_entry` 本路线还没有，一律 404。`message`/`post`/`dc_archive_post` 原文在 Fluxer/DC 存档，Forum 读不到，**只记 ID 不校验**（快照标题是「消息 xxx」）。
+- 看不到的对象 404：作品按上面的规则；`upload` 要 ready 且分级和所属作品可见（上传者本人总能举报自己的）；`tag` 在全年龄模式下不能是限制可见的；`user` 要存在且没合并；`collection` 要公开（或本人、站务）；`event` 按活动可见性（R18 活动、草稿同活动页）；`event_entry` 还要作品可见。`message`/`post`/`dc_archive_post` 原文在 Fluxer/DC 存档，Forum 读不到，**只记 ID 不校验**（快照标题是「消息 xxx」）。
 - 去重：同一对象的待处理举报聚合到一个 report 队列项；同一账号对同一待处理对象再举报 409（先查，`uq_report_pending_reporter_target` 兜底）。队列项处理后举报一起变 resolved，可以再举报（进新队列项）。
 
 **审核队列**
@@ -366,7 +380,8 @@ v5（扁平字段）：
 - **提醒**：V2 `notification`（公告、旧作品更新 → `work_update`；作者新作 → `followed_author_new_work`；`tag_review` 不出）和新表 `site_notification`（好友申请、规则更新……）合并分页，ID 分别是 `v<id>`、`n<id>`；已读和 V1/V2 共用 `read_at`。其他块写提醒用 `services.notifications.create_notification(session, recipient_id, notification)`（协议 Notification 形状，只 add 不 commit）。来源作品不在 `listable_conditions` 里的不返回、不计数、不在「全部已读」里改。`category` 接受逗号分隔多个。
 - **站务公告、规则中心**：`site_announcement`（只存一份，`audience=r18` 只给有效模式 r18）、`site_announcement_ack`（按版本号比对）、`site_rule_doc`。发布公告的后台接口（`/admin/announcements`）不在本块。
 - **书单**：复用 V2 `booklist / booklist_item / user_collection`，加删条目走 V2 `WorkService.collect`；默认收藏书单和赛事书单不算书单；`itemId` 是作品 ID。协议多出来的 tag、上传封面、`defaultSort=updated` 在 `site_collection_meta`。
-- **我的**：`/me/preferences`（带版本号，409 带 `details.current`）、`/me/tag-habits`、`/me/pinned-works`（`GET /users/{id}` 带 `pinnedWorks`）、`/me/decorations`（装饰身份组 `site_decoration_role`，拥有关系 `site_user_decoration_grant`；协议 User.decorations 还没接上）、`/me/plugin-tokens`（只存 sha256 和末 4 位；`/plugin/v1/*` 没做）。
+- **我的**：`/me/preferences`（带版本号，409 带 `details.current`）、`/me/tag-habits`、`/me/pinned-works`（`GET /users/{id}` 带 `pinnedWorks`）、`/me/decorations`（装饰身份组 `site_decoration_role`，拥有关系 `site_user_decoration_grant`；`GET /users/{id}` 带同一份 `decorationRoles / showcase / showcaseHidden / decorations`；列表里的 User.decorations 还是空的）、`/me/plugin-tokens`（只存 sha256 和末 4 位；`/plugin/v1/*` 没做）。
+- **活动和勋章**：`POST /events/{id}/results/publish` 时，挂了 `decorRoleId` 的奖项把装饰身份组发给获奖作者（`me_extra.grant_decoration`，来源「活动：{活动} {奖项}」；操作人要有 `roles.grant_decor`，同假后端；身份组不存在时按「活动·奖项」建一个最简单的）。作品 DTO 带 `events`（`WorkEventRef`：只列 accepted 条目、查看者看得到的活动和分组，公布后带奖项）。活动资格里的 tag 库里存数字 ID，对外写成「组:名字」（如 `type:角色卡`，前端活动页按 `split(":")` 显示名字）；`/admin/events` 两种写法都收。首页网格推广支持活动（还没结束、查看者看得到的），搜索联想带活动。
 - **好友**：`site_friend`（a<b 一行）、`site_friend_request`；`GET /users/{id}` 的 `viewer.friend / friendRequest / dm` 按好友关系算。
 - 种子 `seed_me_block`（只在 `FLUXER_FAKE=1`）：规则中心 4 篇、站内公告 6 条、3 个装饰身份组发给 demo、lin→demo 好友申请、第一个预置作品的规则/公告/钉选。
 
@@ -394,6 +409,17 @@ v5（扁平字段）：
 | `user_moderation_record` | 警告、全站禁言（mute）、作品调整记录 | 审核 |
 
 tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source`/`category` 约束、自定义标签治理和 DC 同步逻辑，新 tag 混进去会出现在旧接口的标签列表和治理里。旧自定义标签迁成自由 tag（协议 7.3）是后续的数据任务。新表都没有挂 thread/booklist 投影触发器；`work` 新列都有数据库默认值，`project_thread_work` 触发器按列名插入时由默认值补齐。
+
+## POST /admin/tags 和同义词：协议和前端的响应形状对不上
+
+请求体两边一样（`{name, group, description?, restricts?, requiredQuestionFor?}`）；响应不一样：
+
+| 接口 | 协议（openapi.yaml） | 前端（`src/features/tag-admin/api.ts`、假后端） |
+| --- | --- | --- |
+| `POST /admin/tags` | 201 `TagDetail` | `AdminTagResult` `{tag, affectedWorks}` |
+| `POST /admin/tags/{id}/synonyms` | `{tag, affectedWorks}` | `TagDetail` |
+
+后端两个接口都返回「`TagDetail` 全部字段 + `tag`（同一个 TagDetail）+ `affectedWorks`」，按哪种形状读都对。`requiredQuestionFor` 除了资源类型名，也收资源类型 tag 的 ID 和 `type:名字`。等协议和前端统一后去掉多余的一半。
 
 ## 加新接口的约定
 
@@ -439,7 +465,7 @@ tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source
 
 ## 契约测试和 pytest 现状
 
-`scripts/run_contract_tests.sh`（`CT_DB`、`PORT`、`REDIS_URL`、`LOG` 都可用环境变量覆盖）：重建库、迁移、种子、起服务、跑 vitest。00–09、99 全部文件通过：113 通过（其中 6 个按 known-gaps 记为预期失败）、1 跳过（RL-02 默认不跑）。
+`scripts/run_contract_tests.sh`（`CT_DB`、`PORT`、`REDIS_URL`、`LOG` 都可用环境变量覆盖）：重建库、迁移、种子、起服务、跑 vitest。00–09、99 全部文件通过：113 通过、1 跳过（RL-02 默认不跑；`CONTRACT_RATE_LIMIT_IP=1` 时 114 全过）。
 
 `known-gaps.json` 只剩确实做不了的：
 
@@ -449,8 +475,6 @@ tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source
 | WRK-20 | 作品钉选 `/works/{id}/pins` 是第二期 |
 
 | DM-01～03 | 用例要 `POST /conversations` 发起私信（第二期，且要 Fluxer 私信 RPC）；`GET /users/{id}` 的 `viewer.dm` 已按隐私设置给出 |
-| RL-01 | `/api/v1` 还没有按账号限频（1.6）；旧 `RateLimitMiddleware` 只管 `/v1`、`/v2` |
-| RL-02 | 按 IP 限频同上；契约测试默认不跑 |
 
 CHT-04、MOD-05、R18-05、R18-17 是「不存在 / 看不到 → 404」的用例，现在路由都在，是处理函数按可见性返回的 404。
 

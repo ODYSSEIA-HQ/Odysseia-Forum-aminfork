@@ -9,6 +9,7 @@ from models.site_me import (
     SiteUserDecorationPref,
 )
 from models.work import Work
+from shared.time_utils import utc_now
 from site_v1.dto import iso_utc
 from site_v1.services import social
 from site_v1.services.works import listable_conditions, serialize_works
@@ -134,3 +135,37 @@ async def my_decorations(session, user_id: str) -> dict:
             "title": by_id[slots["title"]].name if slots["title"] in by_id else None,
         },
     }
+
+
+async def grant_decoration(
+    session, user_id: str, role_id: str, source: str, fallback_name: str
+) -> bool:
+    """发一个装饰身份组（勋章）给用户，GET /me/decorations、GET /users/{id} 里就能看到。
+
+    - 身份组不存在时按 fallback_name 建一个最简单的（同假后端 grantDecoration）；
+    - 已经有了不重复发，返回 False；只 flush，不 commit。
+    """
+    role = await session.get(SiteDecorationRole, role_id)
+    if role is None:
+        session.add(
+            SiteDecorationRole(
+                id=role_id,
+                name=fallback_name[:60] or role_id,
+                description=None,
+                icon=None,
+                color="#f59e0b",
+                rarity="rare",
+                slots=[],
+                sort=0,
+            )
+        )
+        await session.flush()
+    if await session.get(SiteUserDecorationGrant, (user_id, role_id)) is not None:
+        return False
+    session.add(
+        SiteUserDecorationGrant(
+            user_id=user_id, role_id=role_id, granted_at=utc_now(), source=source[:200]
+        )
+    )
+    await session.flush()
+    return True

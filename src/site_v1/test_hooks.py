@@ -2,6 +2,7 @@
 
 - POST /__test__/users/{username}/restricted-access  {"state": "granted"|"revoked"|"none"}
   直接改账号的 R18 资格（模拟站务撤销/恢复）。有效模式每个请求现算，所以同一会话的下一个请求立即生效。
+- POST /__test__/rate-limit/reset  清掉 /api/v1 的限频计数。
 """
 
 from fastapi import APIRouter, Body
@@ -53,3 +54,12 @@ async def set_restricted_access(username: str, body: dict = Body(...)):
             row.revoked_by = None
         await session.commit()
     return Response(status_code=204)
+
+
+@router.post("/rate-limit/reset")
+async def reset_rate_limit():
+    """清掉 /api/v1 的全部限频计数（site:rl:*），手动调试或跑完 RL-02 后用。"""
+    from site_v1 import rate_limit
+    from site_v1.deps import get_redis
+
+    return {"deleted": await rate_limit.reset(get_redis())}
