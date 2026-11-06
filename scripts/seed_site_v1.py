@@ -578,10 +578,61 @@ async def seed_works(session_factory, accounts: dict[str, str]) -> None:
         print(f"作品 {work_id} 版本 {version_id}，文件 {file_id}（{file_name}）")
 
 
+# 公共聊天区的默认频道（同 web 假后端 chatSeed.ts）；fluxer_channel_id 留空，由聊天一块或运维回填
+PUBLIC_CHANNELS = [
+    (
+        "ai-talk",
+        "AI 杂谈",
+        "聊模型、聊提示词、聊 AI 圈的新鲜事。",
+        "1. 讨论模型和工具请尽量附上版本、参数。\n2. 不发 API Key、账号等隐私信息。\n3. 不引战，不拉踩其他平台。",
+    ),
+    (
+        "general",
+        "一般交流区",
+        "什么都可以聊，新人报到、日常闲聊、站内问题都欢迎。",
+        "1. 友善交流，不人身攻击。\n2. 求助先看[规则中心](/rules)和作品说明。\n3. 广告、刷屏会被删除。",
+    ),
+    (
+        "gossip",
+        "开始吃瓜吧",
+        "圈内八卦、热点讨论，吃瓜请理性。",
+        "1. 没证实的消息请标明「未证实」。\n2. 不挂人、不开盒、不发聊天截图里的他人隐私。\n3. 站务有权删除带节奏的消息。",
+    ),
+]
+
+
+async def seed_public_channels(session_factory) -> None:
+    """公共聊天区默认频道（只在一个频道都没有时建，站务改过的不覆盖）。"""
+    from sqlalchemy import func, select
+
+    from models.site_nav import SitePublicChannel
+
+    async with session_factory() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(SitePublicChannel))
+        ).scalar_one()
+        if count:
+            return
+        for order, (cid, name, description, rules) in enumerate(PUBLIC_CHANNELS):
+            session.add(
+                SitePublicChannel(
+                    id=cid,
+                    name=name,
+                    description=description,
+                    rating="general",
+                    rules=rules,
+                    sort_order=order,
+                )
+            )
+        await session.commit()
+    print(f"公共聊天区频道 {len(PUBLIC_CHANNELS)} 个")
+
+
 async def main() -> None:
     accounts = await seed_accounts(AsyncSessionFactory)
     await seed_tag_catalog(AsyncSessionFactory)
     await seed_works(AsyncSessionFactory, accounts)
+    await seed_public_channels(AsyncSessionFactory)
     from shared.database import async_engine
 
     await async_engine.dispose()

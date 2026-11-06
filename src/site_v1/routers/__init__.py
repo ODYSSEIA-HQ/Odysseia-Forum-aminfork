@@ -4,11 +4,14 @@ from fastapi import APIRouter
 
 from site_v1.routers import (
     auth,
+    channels,
     chat,
+    home,
     me,
     moderation,
     reports,
     site,
+    tag_pages,
     tags,
     uploads,
     users,
@@ -25,7 +28,10 @@ for module in (
     works,
     versions,
     uploads,
+    home,  # /boards/overview 要在 tags 的 /boards/{id} 之前
     tags,
+    tag_pages,  # /tags/{id} 要在 tags 的 /tags/catalog、/tags/suggest 之后
+    channels,
     chat,
     reports,
     moderation,

@@ -637,6 +637,16 @@ async def resolve_tag_request(session, catalog: rules.Catalog, body: dict, viewe
     official = catalog.official_by_name(raw)
     if official is not None:
         return official.id
+    # 同义词归到主 tag；被禁用的名字不能再建（tag 治理，services/tag_directory）
+    from site_v1.services import tag_directory
+
+    alias = await tag_directory.alias_target(session, raw)
+    if alias is not None:
+        info = rules.tag_info_of(alias)
+        catalog.remember(info)
+        return info.id
+    if await tag_directory.disabled_name(session, raw) is not None:
+        raise invalid({"name": f"「{raw}」已被禁用"})
     error = rules.validate_free_tag_name(raw)
     if error:
         raise invalid({"name": error}, error)
