@@ -39,6 +39,9 @@ src/site_v1/
     attachments.py       上传、附件对象（Attachment DTO、签名地址）、分级
     versions.py          版本、最新版本、下载计数、种子用的「版本 + 真实文件」
     chat.py              聊天外层
+    chat_messages.py     聊天面板消息代转（作品交流区、私信、公共聊天区）、会话列表
+    chat_channels.py     公共聊天区频道的读取约定（fluxer_channel_id）
+    chat_notify.py       聊天 @ 提醒的写入点
     moderation.py        举报、审核队列、处理
     moderation_common.py 禁言、原生主帖定位、审核员看到的附件、作品摘要
   routers/           site auth me users works versions uploads tags chat reports moderation；
@@ -98,6 +101,8 @@ uv run pytest tests/site_v1
 | `SITE_FRONTEND_BASE` | 空 | Discord 回调跳回的站点根（同源时留空，跳 `/login`） |
 | `SITE_DISCORD_CLIENT_ID` / `_SECRET` / `_REDIRECT_URI` | 空（回退 config.json `auth`；回调地址默认 `/api/v1/auth/discord/callback`） | Discord OAuth；回调地址要在 Discord 后台登记 |
 | `SITE_IMAGE_MAX_BYTES` / `SITE_FILE_MAX_BYTES` / `SITE_ALLOWED_MIMES` / `SITE_MAX_TAGS` | 10 MB / 50 MB / 常见类型 / 15 | `/site.uploadLimits`、tag 上限 |
+| `FLUXER_API_URL` / `FLUXER_BOT_TOKEN` / `FLUXER_API_TIMEOUT` | 空 / 空 / `10` | 聊天消息代转用的 Fluxer 原生接口（fluxer-rpc.md 第 7 节） |
+| `SITE_CHAT_CACHE_TTL` | `15` | 每个聊天频道最新 50 条缓存的秒数（写操作会清） |
 | `REDIS_URL` | `redis://localhost:6379/0` | 只在独立用 uvicorn 启动时用（api_main.py 已经初始化 Redis 时不读） |
 
 上传、存储、分级（`site_v1/files_config.py`）：
@@ -145,6 +150,7 @@ uv run pytest tests/site_v1
 | `update_profile` | 新 RPC `rpc.identity.v1.profile.update_service` | 改本地 user |
 | `unread_summary` | 新 RPC `rpc.content.v1.read_states.summary_service` | 空（测试可往 `unread_seed[user_id]` 塞） |
 | `chat_target_info` | 新 RPC `rpc.content.v1.channel.info_service` | 作品：固定假频道（成员数 1）；私信：只认 `dm_seed` 里且查看者是成员的会话，否则不存在 |
+| `chat_messages` `chat_message` `chat_send` `chat_edit` `chat_delete` `chat_react` `chat_ack` `chat_typing` `chat_dm_channels` `chat_open_dm` | Fluxer 原生 HTTP 接口（`FLUXER_API_URL`，用户令牌；删别人的消息用 `FLUXER_BOT_TOKEN`），见 fluxer-rpc.md 第 7 节 | `site_chat_message` / `site_chat_dm_channel` |
 
 错误：`FluxerUnavailable` → 503；`InvalidCredentials` → 422 `fields.password`；`AccountExists` → 422 `fields.username|email`；`MfaRequired`、`AccountUnavailable` → 403。新 RPC 的请求、响应、错误码见 [fluxer-rpc.md](./fluxer-rpc.md)。
 
@@ -203,6 +209,18 @@ uv run pytest tests/site_v1
 - 作品交流区 = Fluxer 原生主帖：`source_platform=fluxer` 看 `work.source_thread_id`，Discord 来源看 `thread` 表 platform=fluxer、role=main 的投影。主帖没建好 → `canOpen=false`、`memberCount=0`。`FLUXER_FAKE=1` 时没有主帖的作品用假频道 `work-{id}`，视为能打开（fake 模式不排 create_main）。
 - 扩展字段（协议 ChatTargetInfo 之外，ajv 允许）：`canPost`（已登录、能打开、没被作品内禁言 `work_user_mute`、没被全站禁言）、`mutedUntil`（禁言截止；永久的作品内禁言为 null 且 `canPost=false`）。
 - 未读汇总：Fluxer 按原生主帖和私信频道给，Forum 映射成作品并剔除看不到的。RPC 形状见 fluxer-rpc.md 第 4、5 节。
+
+**聊天面板（代转 Fluxer 消息）**
+
+代码：`routers/chat_messages.py`、`services/chat_messages.py`（代转层）、`services/chat_channels.py`（公共频道读取约定）、`services/chat_notify.py`（@ 提醒调用点）、`fluxer/native_http.py`（真实实现）。迁移 `site_v1_chat_tables`。
+
+- 接口（三种目标同一组，前端 `src/features/chat-nodebb/api.ts`）：作品交流区 `/works/{id}/chat`、私信 `/conversations/{id}`、公共聊天区 `/channels/{id}/chat` 下的 `GET/POST messages`（`before`/`after`/`around`/`limit`，响应 `{items(正序), hasMoreBefore, hasMoreAfter}`）、`PATCH/DELETE messages/{mid}`、`PUT/DELETE messages/{mid}/reactions/{emoji}`、`GET state`、`POST read {messageId}`、`POST typing`（204）。另有 `GET/POST /conversations`、`POST /works/{id}/mutes`、`DELETE /works/{id}/mutes/{userId}`。消息形状同前端 `src/shared/protocol/chatMessage.ts`（`channelId` 是 `{kind}:{id}`，`nonce` 只还给发送者）。
+- 目标 → Fluxer 频道：作品 = 原生主帖（`native_thread_id`）；私信会话 ID 就是 Fluxer 私信频道 ID；公共频道 = 频道对象的 `fluxer_channel_id`（频道领域做，可空；这里在已注册的表里找带 `id,name,rating,fluxer_channel_id` 列的表，或由频道领域调 `set_public_channel_source` 注册）。`FLUXER_FAKE=1` 时没有的用 `work-{id}` / `channel-{id}`；真实环境没有 → 404 / `canOpen=false`。
+- 假 Fluxer：消息 `site_chat_message`（软删除留占位）、私信频道 `site_chat_dm_channel`。Forum 自己的叠加：`site_chat_message_meta`（本站附件、删除记录）、`site_chat_read_state`（已读位置，只往后走；没进过的交流区和公共频道不算未读，私信算）。
+- 规则：看不到的作品 / 分级不可见的公共频道 404；附件按查看者有效模式给占位（私信里 Fluxer 原生附件分级未知按 R18）；public 作品交流区不能发 R18 图、公共频道不能发高于频道分级的图（422 `rating_conflict`）；作品内禁言 / 全站禁言 403 `muted`（`details.until`，永久为 null）；私信每条消息都按对方 `dmPrivacy` 和屏蔽检查（403）；删言：本人 `by_author`，作品作者 / 卡贴管理员（`can_manage_work`）`by_manager`，`moderation.content`、公共频道里 `channels.manage` 的站务 `by_staff`；`nonce` 10 分钟内去重（Redis）。
+- @ 提醒：消息里的 `<@userId>` 经 `chat_notify.deliver_notification(session, recipient_id, notification)` 写提醒（协议 Notification 形状，`category=mention`、`context.{workId|conversationId|channelId, messageId}`）；提醒领域实现 `site_v1.services.notifications.create_notification` 后自动接上，之前只记日志。
+- 读性能：每个频道最新 50 条缓存在 Redis `site:chat:latest:{channel}`，写操作清缓存，另有 `SITE_CHAT_CACHE_TTL`（默认 15 秒）兜住从 Fluxer 客户端直接发的消息；前端 8 秒轮询（`after=最后一条`）直接从缓存给。真实环境的 `reactions.me` 用本站记下的点击（Redis `site:chat:rx:*`），不用缓存里取消息那个人的。
+- 实时（没做，建议）：Forum 订阅 Fluxer 网关事件（NATS `events.content.v1.message.*`），按频道 → 目标映射后发到 Centrifugo 频道 `chat:{kind}:{id}`（前端 `ChatChannelEvent`：`message.created/updated`、`subscription.closed`），按每个订阅者的有效模式序列化（R18 图占位），切到全年龄模式 / 作品转受限时由 Forum 调 Centrifugo `unsubscribe` 并推 `subscription.closed`；订阅令牌由 Forum 签发（`/realtime/token` 带频道权限），未读走外层 `unread.updated`。有了实时后可以把缓存 TTL 调长、写时更新缓存而不是删除。
 
 **举报**（`POST /reports`）
 - 理由按对象类型限定（同假后端），`other` 要写 note，note ≤ 500，不能举报自己。
@@ -296,7 +314,6 @@ tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source
 | --- | --- |
 | WRK-19 | `POST /works/{id}/ack` 是第二期，`needsAck` 恒为 false |
 | WRK-20 | 作品钉选 `/works/{id}/pins` 是第二期 |
-| DM-01～03 | 用例要 `POST /conversations` 发起私信（第二期，且要 Fluxer 私信 RPC）；`GET /users/{id}` 的 `viewer.dm` 已按隐私设置给出 |
 | RL-01 | `/api/v1` 还没有按账号限频（1.6）；旧 `RateLimitMiddleware` 只管 `/v1`、`/v2` |
 | RL-02 | 按 IP 限频同上；契约测试默认不跑 |
 

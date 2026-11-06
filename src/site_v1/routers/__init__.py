@@ -7,6 +7,7 @@ from site_v1.routers import (
     channels,
     chat,
     home,
+    chat_messages,
     me,
     moderation,
     reports,
@@ -34,6 +35,7 @@ for module in (
     tag_pages,  # /tags/{id} 要在 tags 的 /tags/catalog、/tags/suggest 之后
     channels,
     chat,
+    chat_messages,
     reports,
     moderation,
     events,

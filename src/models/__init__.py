@@ -74,12 +74,22 @@ from models.site_fun import (  # noqa: F401
     SiteFunStockTrade,
     SiteFunWallet,
 )
+from models.site_chat import (
+    SiteChatDmChannel,
+    SiteChatMessage,
+    SiteChatMessageMeta,
+    SiteChatReadState,
+)
 
 __all__ = [
     "SiteBannerMeta",
     "SitePublicChannel",
     "SiteTagAlias",
     "SiteTagDisabled",
+    "SiteChatDmChannel",
+    "SiteChatMessage",
+    "SiteChatMessageMeta",
+    "SiteChatReadState",
     "Attachment",
     "ModerationQueueItem",
     "Report",

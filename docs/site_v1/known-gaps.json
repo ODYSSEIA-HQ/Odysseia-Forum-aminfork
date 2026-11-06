@@ -1,9 +1,6 @@
 {
   "WRK-19": "POST /works/{id}/ack（第二期）没做；needsAck 先恒为 false",
   "WRK-20": "作品钉选 /works/{id}/pins（第二期）没做",
-  "DM-01": "GET /users/{id} 的 viewer.dm 已按隐私设置给出；用例还要 POST /conversations（私信，第二期）",
-  "DM-02": "GET /users/{id} 的 viewer.dm 已按隐私设置给出；用例还要 POST /conversations（私信，第二期）",
-  "DM-03": "GET /users/{id} 的 viewer.dm 已按隐私设置给出；用例还要 POST /conversations（私信，第二期）",
   "RL-01": "/api/v1 还没有按账号限频（1.6）；旧 RateLimitMiddleware 只管 /v1、/v2",
   "RL-02": "/api/v1 还没有按 IP 限频（1.6）；默认不跑"
 }
