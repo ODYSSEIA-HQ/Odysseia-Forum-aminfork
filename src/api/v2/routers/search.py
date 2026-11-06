@@ -105,3 +105,30 @@ async def _discovery_result(operation, timeout):
         return await asyncio.wait_for(operation, timeout=timeout)
     except TimeoutError as exc:
         raise HTTPException(504, "查询超时，请稍后重试") from exc
+
+
+@router.get("/discovery/random")
+async def random_works(
+    limit: int = Query(10, ge=1, le=50),
+    channel_ids: list[int] | None = Query(None),
+    exclude_channel_ids: list[int] | None = Query(None),
+    include_tags: list[str] | None = Query(None),
+    exclude_tags: list[str] | None = Query(None),
+    tag_logic: str = Query("and", pattern="^(and|or)$"),
+    principal=Depends(current_member),
+):
+    """保留原抽卡配方；从全部可见候选作品随机抽取，不按热度截断。"""
+    from work.work_random_service import WorkRandomService
+
+    return await _discovery_result(
+        WorkRandomService(get_session_factory()).draw(
+            principal,
+            limit,
+            channel_ids,
+            exclude_channel_ids,
+            include_tags,
+            exclude_tags,
+            tag_logic,
+        ),
+        30,
+    )

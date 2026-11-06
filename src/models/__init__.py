@@ -1,4 +1,5 @@
 from models.user import User
+from models.forum_nsfw_sync_state import ForumNsfwSyncState
 from models.discord_identity import DiscordIdentity
 from models.discord_tag_source import DiscordTagSource
 from models.discord_tag_sync_state import DiscordTagSyncState
@@ -74,6 +75,7 @@ __all__ = [
     "ThreadTagLink",
     "ThreadUpdate",
     "User",
+    "ForumNsfwSyncState",
     "UserCollection",
     "UserSearchPreferences",
     "UserUpdatePreference",

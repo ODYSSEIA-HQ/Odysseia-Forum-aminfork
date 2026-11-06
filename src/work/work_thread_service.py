@@ -1,5 +1,9 @@
 """原生讨论区领域服务。"""
 
+import hashlib
+import re
+import uuid
+
 from dto.work.work_command_qo import WorkCommandQo
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -16,6 +20,62 @@ class WorkThreadService:
         """复用由路由注入的会话工厂，跨表操作在服务层协调。"""
         self.sessions = sessions
 
+    @staticmethod
+    def valid_native_id(value):
+        """校验原生社区或频道编号是否处于有符号长整数范围。"""
+        # 拒绝布尔值、非规范字符串和超出数据库范围的编号。
+        return (
+            isinstance(value, (str, int))
+            and not isinstance(value, bool)
+            and str(value).isascii()
+            and str(value).isdigit()
+            and 0 < int(value) <= 9223372036854775807
+        )
+
+    @staticmethod
+    def main_unavailable(main):
+        """判断原生主帖是否未就绪、不可用或禁止创建子帖。"""
+        # 统一主帖状态判断，避免不同子帖入口放宽限制。
+        return (
+            main is None
+            or main.deleted_at
+            or main.initializing
+            or main.archived
+            or main.archive_owner_ids
+            or main.lock_owner_ids
+            or main.platform_locked
+        )
+
+    @staticmethod
+    def project(row, principal):
+        """仅投影已授权帖子，所有平台及数据库标识保留字符串。"""
+        return {
+            "id": str(row.id),
+            "platform": row.platform,
+            "thread_id": str(row.thread_id),
+            "guild_id": str(row.guild_id),
+            "channel_id": str(row.channel_id),
+            "role": row.role,
+            "title": row.title,
+            "body": row.body,
+            "archived": row.archived,
+            "locked": bool(row.lock_owner_ids)
+            or row.platform_locked
+            or row.initializing,
+            "initializing": row.initializing,
+            "own_locked": principal["id"] in row.lock_owner_ids,
+            "own_archived": principal["id"] in row.archive_owner_ids,
+            "can_restore": row.deletion_reason != "source_deleted",
+            "deletion_reason": row.deletion_reason,
+            "deleted_at": row.deleted_at,
+            "author_id": row.fluxer_author_id,
+            "created_at": row.created_at,
+            "last_active_at": row.last_active_at,
+            "reaction_count": row.reaction_count,
+            "reply_count": row.reply_count,
+            "collection_count": row.collection_count,
+        }
+
     async def threads(
         self, work_id: int, include_deleted: bool, command: WorkCommandQo
     ):
@@ -27,37 +87,27 @@ class WorkThreadService:
             if not (include_deleted and principal["is_admin"]):
                 query = query.where(Thread.deleted_at.is_(None))
             rows = (await session.execute(query.order_by(Thread.id))).scalars().all()
-            return {
-                "items": [
-                    {
-                        "id": str(row.id),
-                        "platform": row.platform,
-                        "thread_id": str(row.thread_id),
-                        "guild_id": str(row.guild_id),
-                        "channel_id": str(row.channel_id),
-                        "role": row.role,
-                        "title": row.title,
-                        "body": row.body,
-                        "archived": row.archived,
-                        "locked": bool(row.lock_owner_ids)
-                        or row.platform_locked
-                        or row.initializing,
-                        "initializing": row.initializing,
-                        "own_locked": principal["id"] in row.lock_owner_ids,
-                        "own_archived": principal["id"] in row.archive_owner_ids,
-                        "can_restore": row.deletion_reason != "source_deleted",
-                        "deletion_reason": row.deletion_reason,
-                        "deleted_at": row.deleted_at,
-                        "author_id": row.fluxer_author_id,
-                    }
-                    for row in rows
-                ]
-            }
+            return {"items": [self.project(row, principal) for row in rows]}
 
     async def create_child(self, work_id: int, command: WorkCommandQo):
         """子帖只能由 Forum 创建，主帖锁归档时拒绝新建。"""
         principal = command.actor
         body = dict(command.values)
+        if set(body) - {"title", "body", "client_request_id"}:
+            raise HTTPException(422, "无效子帖字段")
+        request_id = body.get("client_request_id")
+        if request_id is not None and (
+            not isinstance(request_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", request_id)
+        ):
+            raise HTTPException(422, "无效创建请求编号")
+        dedupe_key = "child:" + (
+            hashlib.sha256(
+                (str(work_id) + ":" + principal["id"] + ":" + request_id).encode()
+            ).hexdigest()
+            if request_id
+            else uuid.uuid4().hex
+        )
         if not principal["can_speak"]:
             raise HTTPException(403, "当前禁言禁止创建子帖")
         if (
@@ -78,6 +128,23 @@ class WorkThreadService:
                 {"id": work_id},
             )
             work = await WorkService(session).visible(work_id, principal)
+            if request_id:
+                existing = (
+                    (
+                        await session.execute(
+                            select(WorkTask).where(WorkTask.dedupe_key == dedupe_key)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if existing:
+                    if (
+                        existing.payload.get("title") != body["title"]
+                        or existing.payload.get("body") != body["body"]
+                    ):
+                        raise HTTPException(409, "同一创建请求编号不能用于不同内容")
+                    return {"task_id": str(existing.id), "status": existing.status}
             from work.work_moderation_service import WorkModerationService
 
             await WorkModerationService(session).require_speech(work, principal)
@@ -92,18 +159,12 @@ class WorkThreadService:
                 .scalars()
                 .first()
             )
-            if (
-                main is None
-                or main.archived
-                or main.archive_owner_ids
-                or main.lock_owner_ids
-                or main.platform_locked
-            ):
+            if self.main_unavailable(main):
                 raise HTTPException(409, "主帖已锁定或归档")
             task = WorkTask(
                 work_id=work_id,
                 kind="create_child",
-                dedupe_key="child:" + __import__("uuid").uuid4().hex,
+                dedupe_key=dedupe_key,
                 payload={
                     "actor_id": principal["id"],
                     "title": body["title"],
@@ -120,7 +181,9 @@ class WorkThreadService:
             )
             if main.platform == "fluxer":
                 task.payload = {**task.payload, "parent_thread_id": str(main.thread_id)}
-            if not task.payload["guild_id"] or not task.payload["channel_id"]:
+            if not self.valid_native_id(
+                task.payload["guild_id"]
+            ) or not self.valid_native_id(task.payload["channel_id"]):
                 raise HTTPException(503, "Fluxer 子帖论坛尚未配置")
             session.add(task)
             await session.flush()
@@ -258,7 +321,9 @@ class WorkThreadService:
         principal = command.actor
         async with self.sessions() as session:
             work = await WorkService(session).visible(work_id, principal)
-            row = await session.get(Thread, thread_id, with_for_update=True, populate_existing=True)
+            row = await session.get(
+                Thread, thread_id, with_for_update=True, populate_existing=True
+            )
             if row is None or row.work_id != work_id:
                 raise HTTPException(404, "帖子不存在")
             if row.fluxer_author_id != principal["id"] and (not principal["is_admin"]):
@@ -295,7 +360,9 @@ class WorkThreadService:
             raise HTTPException(403, "需要管理权限")
         async with self.sessions() as session:
             await WorkService(session).visible(work_id, principal)
-            row = await session.get(Thread, thread_id, with_for_update=True, populate_existing=True)
+            row = await session.get(
+                Thread, thread_id, with_for_update=True, populate_existing=True
+            )
             if (
                 row is None
                 or row.work_id != work_id

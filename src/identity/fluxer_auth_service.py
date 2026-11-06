@@ -73,6 +73,11 @@ class FluxerAuthService:
                 await self.connection.subscribe(
                     "rpc.forum.v1.service_info", cb=self.service_info
                 )
+                await self.connection.subscribe(
+                    "rpc.forum.v1.nsfw.apply",
+                    queue="forum-nsfw-sync",
+                    cb=self.apply_nsfw,
+                )
                 await self.connection.flush(timeout=3)
                 await self.redis.incr(self.PREFIX + ":generation")
                 for event in list(self.pending_bindings.values()):
@@ -155,7 +160,9 @@ class FluxerAuthService:
                 affected = {user_id}
                 merged = event.get("merged_user_id")
                 if merged is not None:
-                    if not isinstance(merged, str) or not re.fullmatch(r"[1-9][0-9]{0,18}", merged):
+                    if not isinstance(merged, str) or not re.fullmatch(
+                        r"[1-9][0-9]{0,18}", merged
+                    ):
                         raise ValueError("invalid merged identity")
                     affected.add(merged)
                 declared = event.get("affected_user_ids")
@@ -163,12 +170,20 @@ class FluxerAuthService:
                     # 旧事件缺少完整影响范围，先隔离全部旧缓存及在途结果。
                     generation_barrier = True
                 elif (
-                    type(declared) is not list or not 1 <= len(declared) <= 2
-                    or any(type(value) is not str or not re.fullmatch(r"[1-9][0-9]{0,18}", value) for value in declared)
-                    or len(set(declared)) != len(declared) or set(declared) != affected
+                    type(declared) is not list
+                    or not 1 <= len(declared) <= 2
+                    or any(
+                        type(value) is not str
+                        or not re.fullmatch(r"[1-9][0-9]{0,18}", value)
+                        for value in declared
+                    )
+                    or len(set(declared)) != len(declared)
+                    or set(declared) != affected
                 ):
                     raise ValueError("invalid affected identities")
-                keys = [self.PREFIX + ":user_epoch:" + value for value in sorted(affected)]
+                keys = [
+                    self.PREFIX + ":user_epoch:" + value for value in sorted(affected)
+                ]
                 pending = self.pending_bindings.get(discord_id)
                 if not pending or pending["version"] <= event["version"]:
                     self.pending_bindings[discord_id] = event
@@ -229,6 +244,40 @@ class FluxerAuthService:
             await BindingProjectionService(session).apply(event)
             await session.commit()
 
+    async def apply_nsfw(self, message):
+        """仅由服务角色 ACL 授权的请求应用开关；不记录载荷或返回内部异常。"""
+        try:
+            if not self.ready:
+                raise HTTPException(503, "Not ready")
+            from api.v2.config import get_work_config
+            from identity.forum_nsfw_sync_receiver import ForumNsfwSyncReceiver
+            from shared.database import AsyncSessionFactory
+
+            async with asyncio.timeout(10):
+                data = await ForumNsfwSyncReceiver(
+                    AsyncSessionFactory,
+                    get_work_config().get("work_forums", {}).get("guild_id"),
+                ).apply(json.loads(message.data))
+            reply = {"ok": True, "data": data}
+        except Exception as exc:
+            status = exc.status_code if isinstance(exc, HTTPException) else 503
+            code = {403: "RESOURCE_NOT_ALLOWED", 422: "INVALID_REQUEST"}.get(
+                status, "UNAVAILABLE"
+            )
+            reply = {
+                "ok": False,
+                "error": {
+                    "code": code,
+                    "message": "Forum preference synchronization unconfirmed",
+                    "retryable": status not in (403, 422),
+                },
+            }
+        try:
+            await message.respond(json.dumps(reply).encode())
+        except Exception:
+            # 回包丢失不反向回滚；持久意图将以同版本安全重试。
+            return
+
     async def service_info(self, message):
         """只对版本化请求返回当前服务状态。"""
         try:
@@ -268,7 +317,13 @@ class FluxerAuthService:
                 json.dumps(
                     {"version": 1, "request_id": uuid.uuid4().hex, **fields}
                 ).encode(),
-                timeout=25 if subject == "rpc.auth.v1.external.exchange" else 5,
+                timeout=(
+                    25
+                    if subject == "rpc.auth.v1.external.exchange"
+                    else 20
+                    if subject == "rpc.preferences.v1.update_service"
+                    else 5
+                ),
             )
             reply = json.loads(message.data)
             if reply.get("ok") is True and isinstance(reply.get("data"), dict):
@@ -430,12 +485,17 @@ class FluxerAuthService:
                 epoch,
             )
             if cached and not force_authority:
-                if not isinstance(cached, (list, tuple)) or len(cached) != 2 or type(cached[1]) is not int:
+                if (
+                    not isinstance(cached, (list, tuple))
+                    or len(cached) != 2
+                    or type(cached[1]) is not int
+                ):
                     raise HTTPException(503, "准入缓存期限无效")
                 snapshot = json.loads(cached[0])
                 read_elapsed = time.monotonic() - cache_read_started
                 if (
-                    self.ready and 0 <= read_elapsed < cached[1] / 1000
+                    self.ready
+                    and 0 <= read_elapsed < cached[1] / 1000
                     and snapshot["epoch"] == epoch
                     and type(snapshot["eligible"]) is bool
                 ):
@@ -457,8 +517,13 @@ class FluxerAuthService:
                 self.misses.release()
             if (
                 not isinstance(result, dict)
-                or set(result) != {
-                    "discord_user_id", "user_id", "identity_version", "current", "eligible"
+                or set(result)
+                != {
+                    "discord_user_id",
+                    "user_id",
+                    "identity_version",
+                    "current",
+                    "eligible",
                 }
                 or result["discord_user_id"] != discord_id
                 or type(result["current"]) is not bool
@@ -473,13 +538,17 @@ class FluxerAuthService:
                 )
                 or (
                     result["identity_version"] is not None
-                    and (type(result["identity_version"]) is not int or result["identity_version"] < 1)
+                    and (
+                        type(result["identity_version"]) is not int
+                        or result["identity_version"] < 1
+                    )
                 )
             ):
                 raise HTTPException(503, "权威准入回复无效")
             eligible = result["eligible"]
             if result["current"] and (
-                result["user_id"] != user_id or result["identity_version"] != binding_version
+                result["user_id"] != user_id
+                or result["identity_version"] != binding_version
             ):
                 raise HTTPException(503, "权威绑定投影正在同步，请稍后重试")
             # 普通读取最多三十秒且不续期；失效事件在写回前后均形成屏障。
