@@ -26,8 +26,13 @@ src/site_v1/
   dto.py             camelCase、ID、ISO UTC、User/Me/附件 DTO、load_users 批量取作者
   membership.py      Discord 正式成员身份组检查（真实环境）
   fluxer/            FluxerPort（port.py）、RealFluxer（real.py）、FakeFluxer（fake.py）
-  services/          accounts.py（账号行、资格条件）、social.py（关注/屏蔽）、user_works.py（占位）
-  routers/           site auth me users works versions uploads tags chat reports moderation
+  services/          accounts.py（账号行、资格条件）、social.py（关注/屏蔽）、user_works.py（占位）、
+                     attachments.py（上传、附件对象、分级）、versions.py（版本、下载、种子）、work_access.py（作品可见/可管理）
+  storage/           存储适配器：port.py（StoragePort）、local.py（本地文件 + 签名端点）、s3.py（S3 兼容 / R2）
+  classifier.py      图片分级适配器（stub / http / manual）和图片宽高解析
+  files_config.py    存储、分级的配置项
+  routers/           site auth me users works versions uploads tags chat reports moderation；
+                     storage.py（/api/storage 本地存储签名端点，不在协议里）
   test_hooks.py      /__test__（SITE_TEST_HOOKS=1 才挂）
 src/models/          site_account.py site_tag.py work_version.py attachment.py site_moderation.py；work.py 加了协议字段
 scripts/seed_site_v1.py         契约测试账号、tag 目录
@@ -85,6 +90,26 @@ uv run pytest tests/site_v1
 | `SITE_IMAGE_MAX_BYTES` / `SITE_FILE_MAX_BYTES` / `SITE_ALLOWED_MIMES` / `SITE_MAX_TAGS` | 10 MB / 50 MB / 常见类型 / 15 | `/site.uploadLimits`、tag 上限 |
 | `REDIS_URL` | `redis://localhost:6379/0` | 只在独立用 uvicorn 启动时用（api_main.py 已经初始化 Redis 时不读） |
 
+上传、存储、分级（`site_v1/files_config.py`）：
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SITE_STORAGE_BACKEND` | 配了 `SITE_S3_BUCKET` 是 `s3`，否则 `local` | `local`：本地文件，直传和读取走本服务的签名端点 `/api/storage/...`；`s3`：S3 兼容存储（生产 Cloudflare R2），预签名 PUT/GET |
+| `SITE_STORAGE_LOCAL_DIR` | 仓库根 `data/site_uploads` | 本地存储目录（种子脚本和服务要用同一个） |
+| `SITE_STORAGE_SIGNING_KEY` | 每个进程随机 | 本地存储签名密钥；多进程部署、重启后旧地址要继续有效时必须配置 |
+| `SITE_PUBLIC_BASE` | 空 | 本服务对外根地址，本地存储拼绝对地址用；空时直传地址按请求 Host 拼，读取地址写相对路径 |
+| `SITE_UPLOAD_TICKET_TTL` | `3600` | 直传地址有效期（秒） |
+| `SITE_SIGNED_URL_TTL` | `600` | R18/R18G 图片、下载的签名地址有效期（协议：10 分钟） |
+| `SITE_PUBLIC_URL_TTL` | `86400` | 全年龄图片的签名地址有效期（没配公开桶地址时） |
+| `SITE_S3_ENDPOINT` | 空 | R2：`https://<account>.r2.cloudflarestorage.com` |
+| `SITE_S3_REGION` | `auto` | |
+| `SITE_S3_BUCKET` / `SITE_S3_ACCESS_KEY_ID` / `SITE_S3_SECRET_ACCESS_KEY` | 空 | 桶和凭证。桶的 CORS 要允许前端域名 PUT/GET 和 `Content-Type` 头 |
+| `SITE_S3_PUBLIC_BASE` | 空 | 全年龄图片的公开地址前缀（R2 自定义域名）；空时全年龄图也用签名地址 |
+| `SITE_CLASSIFIER` | 配了 `SITE_CLASSIFIER_URL` 是 `http`；否则 `FLUXER_FAKE` 或 `SITE_TEST_HOOKS` 时 `stub`，再否则 `manual` | `stub`：文件名带 `blocked`/`r18g`/`r18`/`suspect` 判对应结果，其余全年龄；`http`：外部分级服务；`manual`：一律「拿不准」，按 R18 处理并待人工审核 |
+| `SITE_CLASSIFIER_URL` / `SITE_CLASSIFIER_TOKEN` / `SITE_CLASSIFIER_TIMEOUT` | 空 / 空 / `15` | 外部分级服务（请求和响应格式见 `classifier.HttpClassifier`）；出错按「拿不准」处理 |
+| `SITE_CLASSIFIER_R18_THRESHOLD` / `_R18G_THRESHOLD` / `_CONFIDENCE` | `0.5` / `0.5` / `0.7` | 分数映射：超过阈值判 r18/r18g；最高分低于 CONFIDENCE 判 suspect |
+| `SITE_CLASSIFY_INLINE_WAIT` | `3` | `complete` 最多等分级几秒，等不到返回 `processing`（前端轮询 `GET /uploads/{id}`） |
+
 ## 请求流程
 
 1. `SiteV1Middleware`（只管 `/api/v1`）：
@@ -123,6 +148,24 @@ uv run pytest tests/site_v1
 - **R18 资格**：条件见 `services/accounts.access_conditions`；`POST /me/restricted-access/confirm` 条件都满足时授予，`revoked` 不恢复；`PATCH /me/prefs` 设 r18 时检查，不满足 403 `restricted_access_required`，`details.unmet` 是条件 ID（撤销时含 `revoked`）。
 - **注册模式**：`/site.features` 里是布尔值（协议要求 `features` 的值都是 boolean）：`registration`（能否站内注册）、`registrationDiscordOnly`；另外顶层加了 `registrationMode: "open" | "discord_only"`。
 - **关注用户**复用 `author_follow`（和 V2 同一份事实，按 `fluxer_user_id` / `fluxer_author_id` 定位；没有 Discord 绑定的账号 Discord ID 列留空）。**屏蔽**在 `site_user_block`，屏蔽时顺带取消关注。
+
+## 上传、版本、下载
+
+- **不走 Fluxer 附件**（Fluxer 会剥 PNG tEXt，角色卡会坏）：`POST /uploads` 建 `attachment` 行（`state=uploading`，uploadId = 附件 ID），签发直传地址；浏览器原样 PUT；`complete` 检查对象到了、大小一致（否则 409），置 `processing`，排分级任务。
+- **本地存储**：直传地址 `PUT /api/storage/upload/{token}`、读取地址 `GET /api/storage/files/{token}`（HMAC 签名，带过期时间；不在 `/api/v1` 下，不要会话和 CSRF）。用 R2 时这两个端点 404，地址是 R2 预签名地址。
+- **分级**（`services/attachments.classify_attachment`）：图片过分级器、记宽高；非图片按作品当前分级。已发布作品的封面/图库/版本文件分级高于作品分级 → `rejected` + `rating_conflict`；草稿不拦（发布时由作品领域检查）；头像只能全年龄。违禁 → `rejected` + `blocked`。拿不准（suspect）→ `ready`，`rating` 取保守值（至少 r18），`review_state=pending_review`。
+- **附件对象**（`services/attachments.attachment_dto(att, ctx)`）：有效模式看不到 → `url=null`、`placeholder=true`；全年龄图给公开或长效签名地址；R18 图给按账号签发的 10 分钟签名地址。
+- **版本**：`GET /works/{id}/versions`（keyset 分页，新的在前）、`POST`（作者或 `works.manage_any`；草稿也能发；不传 `fileIds`/`dependencies`/`license` 时沿用上一版）。`fileIds` 必须是本作品 `purpose=version_file`、`ready` 的附件。版本文件的 `url` 是下载接口地址。
+- **下载**：要登录；作品看不到、版本/文件不匹配都 404；`work_statistics.download_count +1`，302 到 10 分钟签名地址。
+
+给作品领域：
+- `services/versions.latest_versions(session, work_ids, ctx)` → `{work_id: Version dto}`（Work.latestVersion）；
+- `services/attachments.load_attachments(session, ids)` + `attachment_dto(att, ctx)`（cover、gallery）；
+- `services/attachments.usable_work_attachments(session, ids, work_id=, purposes=("cover",))` 校验 coverId/galleryIds（不合格返回 None，报 422）；
+- `services/work_access.can_manage_work / load_visible_work / load_manageable_work`（以后有卡贴管理员表改 `can_manage_work`）；
+- 种子：`scripts/seed_site_v1.py` 的 `seed_work_version(session_factory, work_id, owner_id, name="v1.0", filename=..., data=None, mime=...)` → `(version_id, attachment_id)`，幂等。
+
+给审核领域：待审图片 = `attachment WHERE review_state='pending_review' AND deleted_at IS NULL`（`auto_rating`、`model_scores`、`purpose`、`work_id`、`owner_id` 都在附件行上）；处理时调 `services/attachments.apply_review(att, rating=..., blocked=...)`（不提交事务），它把 `review_state` 置 `reviewed`、`state` 置 `ready` 或 `rejected/blocked`。
 
 ## 迁移里的新表和字段
 
@@ -190,5 +233,8 @@ tag 目录单独建表，没有复用 V1/V2 的 `tag` 表：那张表有 `source
 8. **fake 模式和异步任务**：`FLUXER_FAKE=1` 时不启动 `WorkTaskWorker` 和事件消费者；发布作品如果要排 V2 的 `create_main` 任务，fake 模式下直接跳过或同步视为成功，作品可见性不依赖它。
 
 ## 契约测试现状
+
+上传：06 的 UPL-01～04、06 在 `beforeAll` 建草稿（`POST /works`）通过后就能跑；UPL-05 还要 `PATCH /works` 设封面。版本、下载（WRK-13～16）还要作品详情/列表给 `latestVersion`、种子作品带版本文件。
+
 
 `scripts/run_contract_tests.sh`：00-spec、01-common、02-session、09-dm、99-rate-limit 全绿（01 里依赖 `/works` 的 COM-01、12–15，09 的 `POST /conversations`，99 的限频按 known-gaps 记为预期失败）。03–08 在 `beforeAll` 就失败（要 `GET /tags/catalog`、`POST /works`），对应领域做好后才会真正跑起来。

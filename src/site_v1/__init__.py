@@ -18,6 +18,10 @@ def install(app) -> None:
     install_exception_handlers(app)
     app.add_middleware(SiteV1Middleware)
     app.include_router(router)
+    # 本地存储的签名上传/读取端点（/api/storage，不在协议里；用 S3/R2 时一律 404）
+    from site_v1.routers.storage import router as storage_router
+
+    app.include_router(storage_router)
     if get_config().test_hooks:
         from site_v1.test_hooks import router as hooks
 
