@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy import select, func, or_, delete, text
 from urllib.parse import urlsplit
 from models.work import Work
+from models.thread import Thread
 from models.user import User
 from models.booklist_publish import BooklistPublish
 from core.tag_query import load_custom_tags, require_current_tag_ids, tag_filters
@@ -115,6 +116,7 @@ class WorkBooklistService:
         body = dict(command.values)
         body = self.validate_fields(body)
         async with self.sessions() as session:
+            await self.collection_lock(session, principal)
             row = await self.access(session, booklist_id, principal, manage=True)
             for key, value in body.items():
                 setattr(row, key, value)
@@ -143,6 +145,9 @@ class WorkBooklistService:
                 {"key": "default-booklist:" + principal["id"]},
             )
             row = await self.access(session, booklist_id, principal, manage=True)
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:id)"), {"id": work_id}
+            )
             service = WorkService(session)
             if command.operation == "remove":
                 # 只检查当前用户的条目归属，不泄漏任意隐藏作品编号。
@@ -618,6 +623,7 @@ class WorkBooklistService:
     async def delete_booklist(self, booklist_id, command):
         """校验管理权限后删除普通书单及其关联。"""
         async with self.sessions() as session:
+            await self.collection_lock(session, command.actor)
             row = await self.access(session, booklist_id, command.actor, manage=True)
             if row.is_default:
                 raise HTTPException(409, "不能删除默认书单")
@@ -677,42 +683,80 @@ class WorkBooklistService:
             await self.collection_lock(session, command.actor)
             row = await self.access(session, booklist_id, command.actor, manage=True)
             service = WorkService(session)
-            works = [
-                await service.visible(work_id, command.actor) for work_id in validated
-            ]
-            added = []
-            for work in works:
-                existed = (
+            # Retain references so visible() uses the identity map rather than
+            # one SELECT per work. It may dirty is_abyss: suppress autoflush
+            # until all trigger locks and all batch reads are complete.
+            with session.no_autoflush:
+                loaded = (
+                    (await session.execute(select(Work).where(Work.id.in_(validated))))
+                    .scalars()
+                    .all()
+                )
+                if len(loaded) != len(validated):
+                    raise HTTPException(404, "作品不存在")
+                works = [
+                    await service.visible(work_id, command.actor)
+                    for work_id in validated
+                ]
+                for work_id in sorted(validated):
                     await session.execute(
-                        select(BooklistItem.id).where(
-                            BooklistItem.booklist_id == row.id,
-                            BooklistItem.work_id == work.id,
+                        text("SELECT pg_advisory_xact_lock(:id)"), {"id": work_id}
+                    )
+                existing = set(
+                    (
+                        await session.execute(
+                            select(BooklistItem.work_id).where(
+                                BooklistItem.booklist_id == row.id,
+                                BooklistItem.work_id.in_(validated),
+                            )
                         )
                     )
-                ).scalar_one_or_none()
-                await service.collect(work, command.actor, True, row.id)
-                item = (
-                    await session.execute(
-                        select(BooklistItem).where(
-                            BooklistItem.booklist_id == row.id,
-                            BooklistItem.work_id == work.id,
-                        )
-                    )
-                ).scalar_one()
-                if existed is None:
-                    added.append(str(work.id))
-                    if "display_order" not in validated[work.id]:
-                        maximum = (
+                    .scalars()
+                    .all()
+                )
+                new_works = [work for work in works if work.id not in existing]
+                added = []
+                if new_works:
+                    maximum = max(
+                        (
                             await session.execute(
                                 select(func.max(BooklistItem.display_order)).where(
                                     BooklistItem.booklist_id == row.id
                                 )
                             )
-                        ).scalar_one() or 0
-                        item.display_order = maximum + 1
-                if existed is None:
-                    for key, value in validated[work.id].items():
-                        setattr(item, key, value)
+                        ).scalar_one()
+                        or 0,
+                        0,
+                    )
+                    mains = dict(
+                        (
+                            await session.execute(
+                                select(Thread.work_id, Thread.thread_id).where(
+                                    Thread.work_id.in_([work.id for work in new_works]),
+                                    Thread.role == "main",
+                                    Thread.platform == "discord",
+                                )
+                            )
+                        ).all()
+                    )
+                    # Keep caller order, including mixed explicit/automatic
+                    # positions. Existing entries' metadata is never changed.
+                    for work in new_works:
+                        values = dict(validated[work.id])
+                        order = values.setdefault("display_order", maximum + 1)
+                        maximum = max(maximum, order)
+                        session.add(
+                            BooklistItem(
+                                booklist_id=row.id,
+                                work_id=work.id,
+                                thread_id=mains.get(work.id),
+                                fluxer_owner_id=command.actor["id"],
+                                owner_id=int(command.actor["discord_user_id"]),
+                                **values,
+                            )
+                        )
+                        added.append(str(work.id))
+                    row.item_count += len(added)
             row.updated_at = utc_now()
             await session.commit()
             return {"added_work_ids": added, "added_count": len(added)}
@@ -761,7 +805,11 @@ class WorkBooklistService:
                 for bid in sorted(canonical_scope)
             }
             service = WorkService(session)
-            work = await service.visible(work_id, command.actor)
+            with session.no_autoflush:
+                work = await service.visible(work_id, command.actor)
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(:id)"), {"id": work_id}
+                )
             present = set(
                 (
                     await session.execute(

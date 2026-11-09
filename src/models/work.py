@@ -1,7 +1,7 @@
 """跨平台作品的统一内容投影。"""
 
 from datetime import datetime
-from sqlalchemy import BigInteger, Column, JSON, Index, event, inspect, func
+from sqlalchemy import BigInteger, Column, JSON, Index, event, inspect, func, text
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from shared.text_utils import build_search_vector_text
 from sqlmodel import SQLModel, Field
@@ -13,6 +13,18 @@ class Work(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_work_search_vector", "search_vector", postgresql_using="gin"),
+        Index(
+            "ix_work_visible_created_id",
+            text("created_at DESC NULLS LAST"),
+            text("id DESC"),
+            postgresql_where=text("deleted_at IS NULL AND source_visible IS TRUE"),
+        ),
+        Index(
+            "ix_work_author_created_id",
+            "author_id",
+            text("created_at DESC NULLS LAST"),
+            text("id DESC"),
+        ),
     )
 
     search_vector: str | None = Field(

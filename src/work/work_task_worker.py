@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
-from sqlalchemy import select, or_, and_, update, func, text
+from sqlalchemy import select, or_, and_, update, func, text, literal_column, String
 from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import insert
 from models.work_task import WorkTask
@@ -16,6 +16,61 @@ from shared.time_utils import utc_now
 from identity.auth_runtime import get_auth_service
 
 logger = logging.getLogger(__name__)
+
+
+# Only code-owned SQL constants may be inlined here. Runtime values remain bound.
+# These predicates/expressions must match the active-queue partial indexes.
+_PENDING = literal_column("'pending'", type_=String)
+_RUNNING = literal_column("'running'", type_=String)
+_THREAD_ID = literal_column("'thread_id'", type_=String)
+
+
+def _claim_statement(now):
+    """Keep fixed predicates indexable even with PostgreSQL generic plans."""
+    earlier = aliased(WorkTask)
+    blocked_move = (
+        select(earlier.id)
+        .where(
+            earlier.work_id == WorkTask.work_id,
+            earlier.kind == "move",
+            earlier.id < WorkTask.id,
+            earlier.status.in_((_PENDING, _RUNNING)),
+        )
+        .exists()
+    )
+    # 同帖较早编辑仍可能重试时，不允许较新编辑先执行再被旧值覆盖。
+    blocked_edit = (
+        select(earlier.id)
+        .where(
+            earlier.work_id == WorkTask.work_id,
+            earlier.kind == "edit_thread",
+            earlier.id < WorkTask.id,
+            earlier.payload.op("->>")(_THREAD_ID).cast(String)
+            == WorkTask.payload.op("->>")(_THREAD_ID).cast(String),
+            earlier.status.in_((_PENDING, _RUNNING)),
+        )
+        .exists()
+    )
+    return (
+        select(WorkTask)
+        .where(
+            or_(
+                and_(
+                    WorkTask.status == _PENDING,
+                    WorkTask.available_at <= now,
+                ),
+                and_(
+                    WorkTask.status == _RUNNING,
+                    WorkTask.lease_until <= now,
+                ),
+            )
+        )
+        .where(or_(WorkTask.kind != "move", ~blocked_move))
+        .where(or_(WorkTask.kind != "edit_thread", ~blocked_edit))
+        .order_by(WorkTask.id)
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
 
 
 class WorkTaskWorker:
@@ -62,56 +117,7 @@ class WorkTaskWorker:
         request_identity_mode.set("fluxer")
         now = utc_now()
         async with self.sessions() as session:
-            earlier = aliased(WorkTask)
-            blocked_move = (
-                select(earlier.id)
-                .where(
-                    earlier.work_id == WorkTask.work_id,
-                    earlier.kind == "move",
-                    earlier.id < WorkTask.id,
-                    earlier.status.in_(["pending", "running"]),
-                )
-                .exists()
-            )
-            # 同帖较早编辑仍可能重试时，不允许较新编辑先执行再被旧值覆盖。
-            blocked_edit = (
-                select(earlier.id)
-                .where(
-                    earlier.work_id == WorkTask.work_id,
-                    earlier.kind == "edit_thread",
-                    earlier.id < WorkTask.id,
-                    earlier.payload["thread_id"].as_string()
-                    == WorkTask.payload["thread_id"].as_string(),
-                    earlier.status.in_(["pending", "running"]),
-                )
-                .exists()
-            )
-            task = (
-                (
-                    await session.execute(
-                        select(WorkTask)
-                        .where(
-                            or_(
-                                and_(
-                                    WorkTask.status == "pending",
-                                    WorkTask.available_at <= now,
-                                ),
-                                and_(
-                                    WorkTask.status == "running",
-                                    WorkTask.lease_until <= now,
-                                ),
-                            )
-                        )
-                        .where(or_(WorkTask.kind != "move", ~blocked_move))
-                        .where(or_(WorkTask.kind != "edit_thread", ~blocked_edit))
-                        .order_by(WorkTask.id)
-                        .with_for_update(skip_locked=True)
-                        .limit(1)
-                    )
-                )
-                .scalars()
-                .first()
-            )
+            task = (await session.execute(_claim_statement(now))).scalars().first()
             if task is None:
                 from work.work_moderation_service import WorkModerationService
 

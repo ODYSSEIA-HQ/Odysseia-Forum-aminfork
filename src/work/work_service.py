@@ -184,36 +184,46 @@ class WorkService:
 
     async def collect(self, work, principal, collected, booklist_id=None):
         """收藏沿用默认书单，统一锁避免旧新入口重复创建默认书单。"""
-        await self.session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
-            {"key": "default-booklist:" + principal["id"]},
-        )
-        if booklist_id is not None:
-            from core.booklist_repository import BooklistRepository
-
-            resolved = await BooklistRepository(self.session).get_booklist(booklist_id)
-            if resolved is None:
-                raise HTTPException(404, "书单不存在")
-            booklist_id = resolved.id
-        query = select(Booklist).where(Booklist.fluxer_owner_id == principal["id"])
-        if booklist_id is None:
-            query = query.where(Booklist.is_default.is_(True))
-        else:
-            query = query.where(Booklist.id == booklist_id)
-        booklist = (
-            (await self.session.execute(query.with_for_update())).scalars().first()
-        )
-        if booklist is None:
-            if booklist_id is not None:
-                raise HTTPException(404, "书单不存在")
-            booklist = Booklist(
-                title="默认收藏",
-                is_default=True,
-                is_public=False,
-                fluxer_owner_id=principal["id"],
-                owner_id=int(principal["discord_user_id"]),
+        # Preserve user -> booklist -> work order, including visibility changes
+        # already pending on Work, before any ORM query can autoflush them.
+        with self.session.no_autoflush:
+            await self.session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
+                {"key": "default-booklist:" + principal["id"]},
             )
-            self.session.add(booklist)
+            if booklist_id is not None:
+                from core.booklist_repository import BooklistRepository
+
+                resolved = await BooklistRepository(self.session).get_booklist(
+                    booklist_id
+                )
+                if resolved is None:
+                    raise HTTPException(404, "书单不存在")
+                booklist_id = resolved.id
+            query = select(Booklist).where(Booklist.fluxer_owner_id == principal["id"])
+            if booklist_id is None:
+                query = query.where(Booklist.is_default.is_(True))
+            else:
+                query = query.where(Booklist.id == booklist_id)
+            booklist = (
+                (await self.session.execute(query.with_for_update())).scalars().first()
+            )
+            new_booklist = booklist is None
+            if new_booklist:
+                if booklist_id is not None:
+                    raise HTTPException(404, "书单不存在")
+                booklist = Booklist(
+                    title="默认收藏",
+                    is_default=True,
+                    is_public=False,
+                    fluxer_owner_id=principal["id"],
+                    owner_id=int(principal["discord_user_id"]),
+                )
+                self.session.add(booklist)
+            await self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:id)"), {"id": work.id}
+            )
+        if new_booklist:
             await self.session.flush()
         item = (
             (

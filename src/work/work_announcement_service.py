@@ -2,7 +2,7 @@
 
 from dto.work.work_command_qo import WorkCommandQo
 from fastapi import HTTPException
-from sqlalchemy import select, func, literal, or_, and_
+from sqlalchemy import select, func, literal, or_
 from sqlalchemy.dialects.postgresql import insert
 from shared.time_utils import utc_now
 from models.work_announcement import WorkAnnouncement
@@ -97,7 +97,7 @@ class WorkAnnouncementService:
                 .scalar_subquery()
             )
 
-            recipients = select(
+            eligible_followers = select(
                 ThreadFollow.user_id,
                 ThreadFollow.fluxer_user_id,
                 literal("work_announcement"),
@@ -107,17 +107,6 @@ class WorkAnnouncementService:
                 literal("forum"),
                 discord_thread,
             ).where(
-                or_(
-                    ThreadFollow.work_id == work_id,
-                    and_(
-                        ThreadFollow.work_id.is_(None),
-                        ThreadFollow.thread_id.in_(
-                            select(Thread.thread_id).where(
-                                Thread.work_id == work_id, Thread.platform == "discord"
-                            )
-                        ),
-                    ),
-                ),
                 ThreadFollow.active_flag.is_(True),
                 ThreadFollow.followed_at <= row.created_at,
                 or_(
@@ -128,6 +117,22 @@ class WorkAnnouncementService:
                     ThreadFollow.user_id.is_(None),
                     ThreadFollow.user_id != int(principal["discord_user_id"]),
                 ),
+            )
+            # The branches are disjoint: native follows have this work_id,
+            # while legacy follows have no work_id. Splitting the OR lets each
+            # branch use its work/thread-leading index without scanning all
+            # legacy follows. Keep IN (not a join) to preserve multiplicity.
+            recipients = eligible_followers.where(
+                ThreadFollow.work_id == work_id
+            ).union_all(
+                eligible_followers.where(
+                    ThreadFollow.work_id.is_(None),
+                    ThreadFollow.thread_id.in_(
+                        select(Thread.thread_id).where(
+                            Thread.work_id == work_id, Thread.platform == "discord"
+                        )
+                    ),
+                )
             )
             await session.execute(
                 insert(Notification)

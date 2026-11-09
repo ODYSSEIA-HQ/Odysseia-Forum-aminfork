@@ -1,7 +1,7 @@
 """作品操作可靠任务。"""
 
 from datetime import datetime
-from sqlalchemy import BigInteger, Column, JSON
+from sqlalchemy import BigInteger, Column, JSON, Index, text
 from sqlmodel import SQLModel, Field
 from shared.time_utils import utc_now
 
@@ -10,6 +10,28 @@ class WorkTask(SQLModel, table=True):
     """持久化任务状态，Redis 只作为可丢失的调度提示。"""
 
     __tablename__ = "work_task"
+    __table_args__ = (
+        Index(
+            "ix_work_task_active_id",
+            "id",
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+        Index(
+            "ix_work_task_active_work_kind_id",
+            "work_id",
+            "kind",
+            "id",
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+        Index(
+            "ix_work_task_active_thread_id",
+            "work_id",
+            "kind",
+            text("((payload ->> 'thread_id')::varchar)"),
+            "id",
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+    )
     id: int | None = Field(
         default=None, sa_column=Column(BigInteger, primary_key=True, autoincrement=True)
     )
