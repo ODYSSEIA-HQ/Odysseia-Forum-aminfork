@@ -15,7 +15,7 @@ from core.booklist_sort_constants import DEFAULT_SORT_METHOD, DEFAULT_SORT_ORDER
 from core.tag_query import tag_filters, tag_name_filters, require_current_tag_ids
 from dto.search.fts_result_dto import FTSResultDTO
 from dto.open_graph import BooklistShareQueryDTO
-from models import Booklist, BooklistItem, BooklistPublish, UserCollection
+from models import Booklist, BooklistItem, BooklistPublish, UserCollection, Thread
 from shared.enum import CollectionType
 from shared.fts_utils import build_fts_conditions
 from shared.time_utils import utc_now
@@ -28,6 +28,68 @@ class BooklistRepository:
 
     def __init__(self, session: AsyncSession):
         self.session = session
+
+    async def _lock_collection_batch(
+        self, booklist_ids, thread_ids=None, *, include_threads=False, owner_key=None
+    ):
+        """Prelock collection trigger keys before legacy multi-work writes.
+
+        Keep the V2 user -> booklist -> sorted work order. Do not resolve aliases
+        here: callers retain their existing choice of the actual write target.
+        """
+        if isinstance(booklist_ids, int):
+            booklist_ids = [booklist_ids]
+        with self.session.no_autoflush:
+            owners = (
+                await self.session.execute(
+                    select(Booklist.fluxer_owner_id, Booklist.owner_id).where(
+                        Booklist.id.in_(booklist_ids)
+                    )
+                )
+            ).all()
+            keys = {
+                owner[0] if owner[0] is not None else str(owner[1]) for owner in owners
+            }
+            if owner_key is not None:
+                keys.add(owner_key)
+            for key in sorted(keys):
+                await self.session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
+                    {"key": "default-booklist:" + key},
+                )
+            # Acquire every target booklist before any work lock. Calling the
+            # single-book variant in a loop would introduce work -> next book.
+            await self.session.execute(
+                select(Booklist.id)
+                .where(Booklist.id.in_(booklist_ids))
+                .order_by(Booklist.id)
+                .with_for_update()
+            )
+            query = select(BooklistItem.work_id).where(
+                BooklistItem.booklist_id.in_(booklist_ids),
+                BooklistItem.work_id.is_not(None),
+            )
+            if thread_ids is not None:
+                query = query.where(BooklistItem.thread_id.in_(thread_ids))
+            ids = set((await self.session.execute(query)).scalars().all())
+            if include_threads:
+                ids.update(
+                    (
+                        await self.session.execute(
+                            select(Thread.work_id).where(
+                                Thread.platform == "discord",
+                                Thread.thread_id.in_(thread_ids),
+                                Thread.work_id.is_not(None),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            for work_id in sorted(ids):
+                await self.session.execute(
+                    text("SELECT pg_advisory_xact_lock(:id)"), {"id": work_id}
+                )
 
     async def get_or_create_default_booklist(self, owner_id: int) -> Booklist:
         """获取用户的默认书单，如果不存在则自动创建"""
@@ -278,6 +340,7 @@ class BooklistRepository:
         """
         删除书单及其所有关联项
         """
+        await self._lock_collection_batch(booklist_id)
         # 删除所有关联项
         statement_items = delete(BooklistItem).where(
             BooklistItem.booklist_id == booklist_id  # type: ignore
@@ -470,6 +533,7 @@ class BooklistRepository:
         if not thread_ids:
             return []
 
+        await self._lock_collection_batch(booklist_id, thread_ids, include_threads=True)
         # 检查已存在的帖子
         existing_stmt = select(BooklistItem.thread_id).where(
             BooklistItem.booklist_id == booklist_id,
@@ -562,6 +626,7 @@ class BooklistRepository:
         if not thread_ids:
             return 0
 
+        await self._lock_collection_batch(booklist_id, thread_ids)
         statement = delete(BooklistItem).where(
             and_(
                 BooklistItem.booklist_id == booklist_id,  # type: ignore
@@ -597,11 +662,15 @@ class BooklistRepository:
         跳过已存在的项（on_conflict_do_nothing 保证幂等），
         返回实际新增了帖子的书单 ID 列表。
         """
-        owner_id = await resolve_business_id(self.session, owner_id)
-        legacy_discord_id = await discord_id_for_business_id(self.session, owner_id)
+        with self.session.no_autoflush:
+            owner_id = await resolve_business_id(self.session, owner_id)
+            legacy_discord_id = await discord_id_for_business_id(self.session, owner_id)
         if not booklist_ids:
             return []
 
+        await self._lock_collection_batch(
+            booklist_ids, [thread_id], include_threads=True, owner_key=str(owner_id)
+        )
         # 获取各书单当前 max(display_order)
         max_stmt = (
             select(
@@ -660,6 +729,7 @@ class BooklistRepository:
         if not booklist_ids:
             return []
 
+        await self._lock_collection_batch(booklist_ids, [thread_id])
         # 批量删除并返回被删除的行所属的书单 ID
         from collections import Counter
 

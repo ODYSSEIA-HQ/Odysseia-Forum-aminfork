@@ -17,7 +17,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "site_v1_schema"
-down_revision = "forum_nsfw_sync_state"
+down_revision = "work_hot_path_indexes"
 branch_labels = None
 depends_on = None
 
