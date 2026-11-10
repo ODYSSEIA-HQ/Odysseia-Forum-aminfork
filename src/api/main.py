@@ -386,6 +386,11 @@ async def debug_pools():
 app.include_router(work_v2_router)
 app.include_router(auth.router, prefix="/v2")
 
+# 协议 /api/v1 层（给 odysseia-hq/web 前端），V1/V2 不受影响；见 docs/site_v1/README.md
+from site_v1 import install as install_site_v1  # noqa: E402
+
+install_site_v1(app)
+
 
 @app.middleware("http")
 async def version_identity_context(request, call_next):
@@ -412,7 +417,9 @@ async def start_work_tasks():
     """显式启用 V2 时才启动持久任务消费者。"""
     import os
 
-    if os.environ.get("FORUM_V2_ENABLED", "").lower() == "true":
+    # FLUXER_FAKE=1（本地、契约测试）没有 NATS：不启动依赖 Fluxer 的任务消费者
+    fake = os.environ.get("FLUXER_FAKE", "").lower() in {"1", "true", "yes"}
+    if os.environ.get("FORUM_V2_ENABLED", "").lower() == "true" and not fake:
         from work.work_task_worker import WorkTaskWorker
 
         app.state.work_tasks = WorkTaskWorker()

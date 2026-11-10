@@ -1,7 +1,7 @@
 """作品作者公告。"""
 
 from datetime import datetime
-from sqlalchemy import BigInteger, Column, JSON
+from sqlalchemy import BigInteger, Column, JSON, Index, text
 from sqlmodel import SQLModel, Field
 from shared.time_utils import utc_now
 
@@ -10,6 +10,14 @@ class WorkAnnouncement(SQLModel, table=True):
     """每次发布独立通知，编辑不会生成新通知。"""
 
     __tablename__ = "work_announcement"
+    __table_args__ = (
+        Index(
+            "ix_work_announcement_work_created_id",
+            "work_id",
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
+    )
     id: int | None = Field(
         default=None, sa_column=Column(BigInteger, primary_key=True, autoincrement=True)
     )

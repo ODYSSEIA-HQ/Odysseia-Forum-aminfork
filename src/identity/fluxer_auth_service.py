@@ -344,6 +344,14 @@ class FluxerAuthService:
                 subject.startswith("rpc.content.")
                 or subject.startswith("rpc.preferences.")
                 or subject == "rpc.identity.v1.rebind_service"
+                # /api/v1 层（site_v1）要的新 RPC：需要按错误码区分密码错、用户名占用等
+                or subject.startswith(
+                    (
+                        "rpc.auth.v1.password.",
+                        "rpc.auth.v1.account.",
+                        "rpc.identity.v1.profile.",
+                    )
+                )
             ):
                 code = str(error.get("code", "RPC_UNAVAILABLE"))
                 if not re.fullmatch(r"[A-Z0-9_]{1,80}", code):

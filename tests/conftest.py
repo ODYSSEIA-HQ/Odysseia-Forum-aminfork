@@ -5,6 +5,7 @@
 每个测试独立建表、独立清理。
 """
 
+import pytest
 import pytest_asyncio
 from typing import AsyncGenerator
 
@@ -81,3 +82,19 @@ async def db_session_factory(
                 await conn.execute(table.delete())
 
     await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _site_v1_rate_limit_off(monkeypatch):
+    """默认关掉 /api/v1 限频（site_v1/rate_limit.py）。
+
+    测试都从同一个地址连发请求，计数又留在 Redis 里跨用例累积，开着会互相影响；
+    限频本身的用例（tests/site_v1/test_site_v1_rate_limit.py）自己打开并设小阈值。
+    """
+    from site_v1.config import reload_config
+
+    monkeypatch.setenv("SITE_RL_ENABLED", "0")
+    reload_config()
+    yield
+    monkeypatch.delenv("SITE_RL_ENABLED", raising=False)
+    reload_config()

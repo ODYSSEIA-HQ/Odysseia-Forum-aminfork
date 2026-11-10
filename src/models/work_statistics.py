@@ -34,3 +34,8 @@ class WorkStatistics(SQLModel, table=True):
 
     reply_count: int = Field(default=0, sa_column=Column(BigInteger, nullable=False))
     """平台回复汇总。"""
+
+    download_count: int = Field(
+        default=0, sa_column=Column(BigInteger, nullable=False, server_default="0")
+    )
+    """协议 /api/v1 的版本文件下载次数（Work.stats.downloads）。"""

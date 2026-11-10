@@ -1,0 +1,9 @@
+[
+  {
+    "AllowedOrigins": ["https://forum.example.com", "http://localhost:5173"],
+    "AllowedMethods": ["GET", "HEAD", "PUT"],
+    "AllowedHeaders": ["Content-Type"],
+    "ExposeHeaders": ["ETag", "Content-Length", "Content-Type", "Content-Disposition"],
+    "MaxAgeSeconds": 3600
+  }
+]

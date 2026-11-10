@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, Index, UniqueConstraint
+from sqlalchemy import BigInteger, Index, UniqueConstraint, text
 from sqlmodel import Column, Field, SQLModel
 
 from shared.time_utils import utc_now
@@ -12,6 +12,12 @@ class ThreadFollow(SQLModel, table=True):
 
     __tablename__ = "thread_follow"  # type: ignore
     __table_args__ = (
+        Index(
+            "ix_thread_follow_active_work_time",
+            "work_id",
+            "followed_at",
+            postgresql_where=text("active_flag IS TRUE"),
+        ),
         UniqueConstraint("user_id", "thread_id", name="uk_thread_follow_user_thread"),
         UniqueConstraint(
             "fluxer_user_id", "work_id", name="uq_thread_follow_user_work"

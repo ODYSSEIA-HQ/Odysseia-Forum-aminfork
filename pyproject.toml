@@ -33,6 +33,7 @@ dependencies = [
 dev = [
     "aiosqlite==0.22.1",
     "fakeredis[lua]>=2.34.0",
+    "jsonschema>=4.26.0",
     "pytest",
     "pytest-asyncio",
     "ruff",
