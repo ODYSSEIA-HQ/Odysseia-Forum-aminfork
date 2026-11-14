@@ -113,7 +113,12 @@ async def unread_summary(session, ctx) -> list[dict]:
 
 async def _channel_info(ctx, kind: str, target_id: str) -> dict | None:
     try:
-        return await get_fluxer().chat_target_info(ctx.fluxer_token, kind, target_id)
+        return await get_fluxer().chat_target_info(
+            ctx.fluxer_token,
+            kind,
+            target_id,
+            viewer_id=ctx.viewer.user_id if ctx.viewer else None,
+        )
     except FluxerUnavailable as exc:
         raise unavailable("聊天服务暂时不可用") from exc
 

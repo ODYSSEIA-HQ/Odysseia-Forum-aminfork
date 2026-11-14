@@ -102,6 +102,7 @@ async def load_viewer(session_factory, user_id: str) -> Viewer | None:
         if account is None or prefs is None or access is None:
             await ensure_account_rows(session, user_id)
             await session.commit()
+            await session.refresh(user)  # 提交后过期，异步会话不能懒加载
             account = await session.get(SiteAccount, user_id)
             prefs = await session.get(SiteUserPrefs, user_id)
             access = await session.get(SiteRestrictedAccess, user_id)

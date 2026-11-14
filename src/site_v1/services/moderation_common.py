@@ -103,8 +103,15 @@ async def works_by_native_thread(session, thread_ids: list[str]) -> dict[str, Wo
 
 
 async def site_muted_until(session, user_id: str) -> datetime | None:
-    """全站禁言（user_moderation_record.kind=mute）的截止时间；没有禁言返回 None。"""
+    """全站禁言（user_moderation_record.kind=mute）的截止时间；没有禁言返回 None。
+
+    身份头模式下本人的全站禁言以网关 Principal.mutedUntil 为准（和本地记录取较晚的）。
+    """
+    from site_v1 import principal as principals
+
     now = utc_now()
+    p = principals.for_user(user_id)
+    gateway_until = p.muted_until if p is not None and p.muted_until and p.muted_until > now else None
     rows = (
         await session.execute(
             select(UserModerationRecord.until).where(
@@ -114,7 +121,10 @@ async def site_muted_until(session, user_id: str) -> datetime | None:
             )
         )
     ).scalars()
-    return max(rows, default=None)
+    local = max(rows, default=None)
+    if gateway_until is None:
+        return local
+    return gateway_until if local is None or gateway_until > local else local
 
 
 async def work_mute(session, work_id: int, user_id: str) -> tuple[bool, datetime | None]:

@@ -206,12 +206,18 @@ class FluxerPort(Protocol):
         ...
 
     async def chat_target_info(
-        self, token: str | None, kind: str, target_id: str
+        self,
+        token: str | None,
+        kind: str,
+        target_id: str,
+        *,
+        viewer_id: str | None = None,
     ) -> dict | None:
         """聊天目标信息；不存在（含：私信且令牌对应的账号不是成员）返回 None。
 
         kind=work：target_id 是原生主帖 ID，返回 {channel_id, member_count}。
         kind=dm：target_id 是私信频道 ID，返回 {channel_id, member_count, peer_user_id}。
+        viewer_id：当前账号（身份头模式下没有 Fluxer 令牌时按它判断私信成员）。
         """
         ...
 

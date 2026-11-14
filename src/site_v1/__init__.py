@@ -15,6 +15,8 @@ def install(app) -> None:
     from site_v1.middleware import SiteV1Middleware
     from site_v1.routers import router
 
+    # 配置不对（例如 principal 模式没配密钥）在这里直接抛错，拒绝启动
+    get_config()
     install_exception_handlers(app)
     # 实时推送：事务提交后按 ORM 变化发布外层事件（没配 Centrifugo 时什么也不做）
     from site_v1.realtime.hooks import install as install_realtime_hooks
@@ -26,6 +28,10 @@ def install(app) -> None:
     from site_v1.routers.storage import router as storage_router
 
     app.include_router(storage_router)
+    # GET /healthz：网关看核心状态用（网关与核心接入约定第 4 节）
+    from site_v1.routers.health import router as health_router
+
+    app.include_router(health_router)
     if get_config().test_hooks:
         from site_v1.test_hooks import router as hooks
 

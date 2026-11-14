@@ -9,8 +9,8 @@
 - viewer.to_v2_principal()：调用 V2 work/* 服务时用的 principal dict。
 """
 
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 
 from site_v1 import mode as modes
 from site_v1.errors import unauthenticated
@@ -103,6 +103,8 @@ class SiteContext:
     effective_mode: str = modes.GENERAL
     pending_cookies: list[str] = field(default_factory=list)
     """要追加到响应上的 Set-Cookie（中间件写出）。"""
+    principal: object | None = None
+    """身份头模式下网关签的 Principal（site_v1.principal.Principal）；会话模式为 None。"""
 
     @property
     def authenticated(self) -> bool:
@@ -122,6 +124,12 @@ class SiteContext:
         return self.viewer
 
     def refresh_mode(self) -> str:
+        if self.principal is not None:
+            # 身份头模式：有效模式以 Principal.mode 为准，不再按本地偏好和资格算
+            self.effective_mode = (
+                self.principal.effective_mode if self.viewer is not None else modes.GENERAL
+            )
+            return self.effective_mode
         v = self.viewer
         self.effective_mode = modes.effective_mode(
             v is not None,
@@ -135,3 +143,39 @@ class SiteContext:
 
     def can_view(self, rating: str, visibility: str) -> bool:
         return modes.can_view(self.effective_mode, self.show_r18g, rating, visibility)
+
+
+def apply_principal(viewer: Viewer, principal) -> Viewer:
+    """身份头模式：本人的权限、新人、R18G、屏蔽/关注 tag、有效模式以网关的 Principal 为准。
+
+    本地 prefs 里只有网关不管的项（blur、私信隐私、置顶榜单）继续生效。
+    """
+    from shared.time_utils import utc_now
+
+    mode = principal.effective_mode
+    prefs = replace(
+        viewer.prefs,
+        content_mode=mode,
+        show_r18g=bool(principal.show_r18g) and mode == modes.R18,
+        blocked_tags=list(principal.blocked_tag_ids),
+        followed_tags=list(principal.followed_tag_ids)
+        if principal.followed_tag_ids is not None
+        else viewer.prefs.followed_tags,
+    )
+    access = replace(
+        viewer.access,
+        state="granted" if mode == modes.R18 else viewer.access.state,
+    )
+    newcomer_until = viewer.newcomer_until
+    if principal.newcomer:
+        if newcomer_until is None or newcomer_until <= utc_now():
+            newcomer_until = utc_now() + timedelta(days=1)
+    else:
+        newcomer_until = None
+    return replace(
+        viewer,
+        permissions=frozenset(MEMBER_PERMISSIONS) | principal.permissions,
+        prefs=prefs,
+        access=access,
+        newcomer_until=newcomer_until,
+    )

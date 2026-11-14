@@ -45,6 +45,22 @@ async def viewer_ctx(user_id: str) -> SiteContext | None:
     viewer = await load_viewer(get_session_factory(), user_id)
     if viewer is None:
         return None
+    from site_v1.config import get_config
+
+    if get_config().principal_mode:
+        # 身份头模式：没有收件人的 Principal，用他最近一次请求的 mode（记不到按 general）
+        from dataclasses import replace
+
+        from site_v1 import principal as principals
+        from site_v1.deps import get_redis
+
+        mode, show_r18g = await principals.last_seen(get_redis(), user_id)
+        viewer = replace(
+            viewer, prefs=replace(viewer.prefs, content_mode=mode, show_r18g=show_r18g)
+        )
+        ctx = SiteContext(viewer=viewer)
+        ctx.effective_mode = mode
+        return ctx
     ctx = SiteContext(viewer=viewer)
     ctx.refresh_mode()
     return ctx
