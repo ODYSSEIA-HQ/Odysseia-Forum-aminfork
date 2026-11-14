@@ -321,7 +321,12 @@ class RealFluxer(NativeChat):
         )
 
     async def chat_target_info(
-        self, token: str | None, kind: str, target_id: str
+        self,
+        token: str | None,
+        kind: str,
+        target_id: str,
+        *,
+        viewer_id: str | None = None,
     ) -> dict | None:
         try:
             data = await self.auth.rpc(

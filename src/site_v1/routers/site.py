@@ -30,13 +30,15 @@ async def tag_catalog_version() -> str:
 async def get_site():
     config = get_config()
     return {
-        "features": {
-            "discordLogin": True,
-            "r18Mode": True,
-            # 注册模式：open 时可以站内注册；discord_only 时只能走 Discord 授权（10-31）
-            "registration": config.registration_open,
-            "registrationDiscordOnly": not config.registration_open,
-        },
+        # 协议 0.5：可选能力清单是字符串数组（0.4.1 的 {名字: 布尔} 废弃）。
+        # 旧开关名：discordLogin、r18Mode、registration（能站内注册）、registrationDiscordOnly；
+        # 可选能力：presence（在线状态）
+        "features": [
+            "discordLogin",
+            "r18Mode",
+            "registration" if config.registration_open else "registrationDiscordOnly",
+            "presence",
+        ],
         "registrationMode": config.registration_mode,
         "termsVersion": config.terms_version,
         "uploadLimits": {

@@ -67,6 +67,17 @@ class SiteConfig:
     allowed_mimes: list[str] = field(default_factory=list)
     max_tags: int = 15
 
+    auth_mode: str = "session"
+    """session：自己的会话 Cookie；principal：只认网关签的 X-Ody-Principal（网关与核心接入约定）。"""
+    principal_secret: str = ""
+    gateway_internal_url: str = ""
+    """网关内部接口根地址（POST /internal/users/batch 拉用户资料）。"""
+    gateway_internal_token: str = ""
+
+    @property
+    def principal_mode(self) -> bool:
+        return self.auth_mode == "principal"
+
     @property
     def registration_open(self) -> bool:
         return self.registration_mode == "open"
@@ -80,6 +91,14 @@ def get_config() -> SiteConfig:
     if mode not in {"open", "discord_only"}:
         raise RuntimeError("SITE_REGISTRATION_MODE 只能是 open 或 discord_only")
     require_role = _bool("SITE_REQUIRE_DISCORD_ROLE", not fake)
+    auth_mode = os.environ.get("SITE_V1_AUTH_MODE", "session").strip() or "session"
+    if auth_mode not in {"session", "principal"}:
+        raise RuntimeError("SITE_V1_AUTH_MODE 只能是 session 或 principal")
+    principal_secret = os.environ.get("SITE_V1_PRINCIPAL_SECRET", "")
+    if auth_mode == "principal" and not principal_secret.strip():
+        raise RuntimeError(
+            "SITE_V1_AUTH_MODE=principal 时必须配置 SITE_V1_PRINCIPAL_SECRET（网关签身份头的密钥）"
+        )
     return SiteConfig(
         fluxer_fake=fake,
         cookie_name=os.environ.get("SITE_COOKIE_NAME", "odysseia_sid"),
@@ -115,6 +134,10 @@ def get_config() -> SiteConfig:
             ],
         ),
         max_tags=_int("SITE_MAX_TAGS", 15),
+        auth_mode=auth_mode,
+        principal_secret=principal_secret,
+        gateway_internal_url=os.environ.get("SITE_V1_GATEWAY_INTERNAL_URL", "").rstrip("/"),
+        gateway_internal_token=os.environ.get("SITE_V1_GATEWAY_INTERNAL_TOKEN", ""),
     )
 
 

@@ -176,7 +176,11 @@ async def resolve(session, ctx, kind: str, raw_id: str) -> Chan:
             raise unauthenticated()
         if not raw_id or len(raw_id) > 64:
             raise not_found()
-        info = await call(get_fluxer().chat_target_info(ctx.fluxer_token, "dm", raw_id))
+        info = await call(
+            get_fluxer().chat_target_info(
+                ctx.fluxer_token, "dm", raw_id, viewer_id=ctx.viewer.user_id
+            )
+        )
         if not info:
             raise not_found()
         peer = str(info.get("peer_user_id") or "") or None
@@ -1080,7 +1084,10 @@ async def typing(session, ctx, kind, raw_id) -> None:
         )
     except Exception:
         pass
-    chat_realtime.push_typing(ctx, chan)
+    from site_v1.services import presence
+
+    if await presence.note_typing(chan, viewer.user_id):
+        chat_realtime.push_typing(ctx, chan)
 
 
 # ---------------- 会话列表（3.8） ----------------
@@ -1166,6 +1173,13 @@ async def create_conversation(session, ctx, body) -> tuple[int, dict]:
         peer_row = (
             await session.execute(select(User).where(User.username == key).limit(1))
         ).scalar_one_or_none()
+    if peer_row is None and get_config().principal_mode and len(key) <= 64:
+        # 身份头模式：对方可能还没来过本核心，按网关的用户 ID 懒建本地行
+        from site_v1 import gateway_users
+        from site_v1.deps import get_session_factory
+
+        await gateway_users.ensure_users(get_session_factory(), [key])
+        peer_row = await session.get(User, key)
     if peer_row is None or peer_row.merged_into_id:
         raise invalid({"userId": "找不到这个用户"})
     if peer_row.id == viewer.user_id:

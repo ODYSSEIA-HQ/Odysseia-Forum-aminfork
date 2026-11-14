@@ -373,16 +373,24 @@ class FakeFluxer:
         return [row.user_low, row.user_high]
 
     async def chat_target_info(
-        self, token: str | None, kind: str, target_id: str
+        self,
+        token: str | None,
+        kind: str,
+        target_id: str,
+        *,
+        viewer_id: str | None = None,
     ) -> dict | None:
         if kind == "dm":
             # 私信要是会话成员：按令牌解析出的身份比对成员
-            identity = await self.resolve_session(token) if token else None
+            me = viewer_id
+            if me is None and token:
+                identity = await self.resolve_session(token)
+                me = identity.user_id if identity is not None else None
             async with self.sessions() as session:
                 members = await self._dm_members(session, target_id)
-            if not members or identity is None or identity.user_id not in members:
+            if not members or me is None or me not in members:
                 return None
-            peer = next((m for m in members if m != identity.user_id), None)
+            peer = next((m for m in members if m != me), None)
             seeded = self.dm_seed.get(target_id) or {}
             return {
                 "channel_id": target_id,

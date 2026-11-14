@@ -107,6 +107,9 @@ uv run pytest tests/site_v1
 | `SITE_CHAT_CACHE_TTL` | `15` | 每个聊天频道最新 50 条缓存的秒数（写操作会清） |
 | `CENTRIFUGO_*` | 空 | 实时推送，见「实时推送（Centrifugo）」 |
 | `REDIS_URL` | `redis://localhost:6379/0` | 只在独立用 uvicorn 启动时用（api_main.py 已经初始化 Redis 时不读） |
+| `SITE_V1_AUTH_MODE` | `session` | `session`：自己的会话 Cookie（上面的流程）；`principal`：作为「核心」接在网关后面，只认网关签的 `X-Ody-Principal`，见「身份头模式」 |
+| `SITE_V1_PRINCIPAL_SECRET` | 空 | 网关签身份头的密钥（网关那边叫 `CORE_WEIYU_PRINCIPAL_SECRET`）。`principal` 模式下为空拒绝启动 |
+| `SITE_V1_GATEWAY_INTERNAL_URL` / `SITE_V1_GATEWAY_INTERNAL_TOKEN` | 空 | 网关内部接口根地址和令牌（`POST /internal/users/batch`，请求头 `x-ody-internal-token`），第一次见到某个用户时拉资料 |
 
 限频（协议 1.6，`site_v1/rate_limit.py`；Redis 固定窗口，键 `site:rl:{桶}:{账号或 IP}`，超限 429 `rate_limited` + `Retry-After`（当前窗口剩余秒数）+ `details.scope`=`account`/`ip`）：
 
@@ -152,6 +155,23 @@ uv run pytest tests/site_v1
    - 路由里没接住的异常 → 503。
 2. 异常处理器（`errors.install_exception_handlers`）：`SiteError` 原样；`HTTPException`（含 V2 服务抛的）按状态码映射，5xx/504 → 503；`RequestValidationError` → 422 `validation_failed` + `details.fields`。路径不在 `/api/v1` 下的交回 FastAPI 默认处理，V1/V2 行为不变。
 3. 会话：`GET /session` 没会话时建匿名会话（只存 csrf）并下发 Cookie；登录/注册时轮换 sid 和 csrf；退出删会话、注销 Fluxer 会话、清 Cookie。**Fluxer 令牌只在 Redis**，响应里从不出现。
+
+## 身份头模式（作为核心接在网关后面）
+
+依据：`方案/DD后端接手/网关与核心接入约定.md`。`SITE_V1_AUTH_MODE=principal` 时：
+
+- **认人**：`/api/v1` 只认 `X-Ody-Principal`（`site_v1/principal.py`）：`base64url(JSON).base64url(HMAC-SHA256(secret, 前半段))`，不带填充，`hmac.compare_digest` 比较，`iat` 毫秒、前后 60 秒有效。没有有效头一律 401 `unauthenticated`（未登录的请求网关也带头，`userId=null`），不读会话 Cookie。
+- **不提供的**：`/auth/*`（登录、注册、退出、Discord 授权）和 `GET /session` 返回 404；CSRF、限频不做（网关负责）。
+- **用户行**（`site_v1/gateway_users.py`）：用户 ID 就是网关发的 ID（UUID），原样作为 `user.id`，不做映射。第一次见到时幂等建 `user` + `site_account`/`prefs`/`restricted_access`，资料从网关 `POST /internal/users/batch` 拉；网关暂时拉不到时先用占位资料（username = ID）建，之后每分钟最多重拉一次。私信对方第一次出现时也这样建，但只建网关确认存在的。
+- **以 Principal 为准的**（`context.apply_principal`）：有效模式（`mode`，未登录一律 general）、`showR18G`、`permissions`（并上成员都有的 `chat.*`）、`newcomer`、屏蔽/关注 tag；本人的屏蔽用户（`blockedUserIds`）和全站禁言（`mutedUntil`）在 `social.blocked_user_ids` / `is_blocked`、`moderation_common.site_muted_until` 里和本地记录合并。本地 `prefs.contentMode` 和 R18 资格不再影响有效模式。
+- **实时推送**：签令牌、频道授权用请求的 Principal；推给别人时（`realtime.events.viewer_ctx`）没有对方的 Principal，用对方最近一次请求的 mode（Redis `site:principal:last:{用户}`，6 小时），记不到按 general。
+- **在线状态**（协议 0.5 可选能力 `presence`，两种模式都有，`GET /site` 的 `features` 里列出）：`routers/presence.py` + `services/presence.py`，全在 Redis（心跳 60 秒、正在输入 8 秒、偏好哈希不过期）。
+- **健康检查**：`GET /healthz`（不在 `/api/v1` 下，不要身份头）查数据库和 Redis，都正常 200，否则 503。
+
+还没解决的（要网关或 Fluxer 配合）：
+
+- 真实 Fluxer 的聊天代转用的是会话里的用户令牌，身份头模式下没有。要么 Fluxer 提供「服务身份代某用户发言」的接口，要么核心改走 Bot 令牌；在那之前身份头模式只能配 `FLUXER_FAKE=1`（消息存本地表）。另外网关的用户 ID（UUID）和 Fluxer 用户 ID（雪花）不是一套，真实 Fluxer 下要有对照。
+- 「对方屏蔽了我」只看本地 `site_user_block`：Principal 只带本人的屏蔽名单，别人的屏蔽名单在账号模块，核心查不到。
 
 ## FluxerPort
 

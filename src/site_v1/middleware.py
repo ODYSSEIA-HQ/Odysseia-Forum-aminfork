@@ -8,6 +8,10 @@
 3. 写请求（POST/PUT/PATCH/DELETE）校验 X-CSRF-Token，缺少或不对 → 403 forbidden。
 4. 路由执行；响应头补 X-Content-Mode（按请求结束时的有效模式）和待写的 Set-Cookie。
 5. 路由里未处理的异常 → 503（协议：忙时必须 503）。
+
+身份头模式（SITE_V1_AUTH_MODE=principal，网关与核心接入约定）：第 1–3 步换成
+「校验 X-Ody-Principal → 本地用户行 → 有效模式取 Principal.mode」；没有有效头一律 401，
+不读会话 Cookie；会话、CSRF、限频都由网关负责，这里不再做；/auth/*、/session 返回 404。
 """
 
 import logging
@@ -18,7 +22,17 @@ from starlette.requests import Request
 from site_v1 import rate_limit
 from site_v1.config import get_config
 from site_v1.context import SiteContext
-from site_v1.errors import SiteError, forbidden, is_site_path, render_error, unavailable
+from site_v1 import principal as principals
+from site_v1.context import apply_principal
+from site_v1.errors import (
+    SiteError,
+    forbidden,
+    is_site_path,
+    not_found,
+    render_error,
+    unauthenticated,
+    unavailable,
+)
 from site_v1.session import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -66,6 +80,52 @@ async def build_context(request: Request, ctx: SiteContext) -> None:
     ctx.refresh_mode()
 
 
+def session_only_path(path: str) -> bool:
+    """身份头模式下不提供的本地会话接口（登录、注册、退出、Discord 授权、GET /session）。"""
+    path = path.rstrip("/")
+    return path in ("/api/v1/session", "/api/v1/auth") or path.startswith("/api/v1/auth/")
+
+
+async def build_principal_context(request: Request, ctx: SiteContext) -> None:
+    """身份头模式：校验 X-Ody-Principal，按 userId 懒建本地用户行，有效模式取 Principal.mode。"""
+    from site_v1 import gateway_users
+    from site_v1.deps import get_redis, get_session_factory
+    from site_v1.services.accounts import load_viewer
+
+    config = get_config()
+    principal = principals.verify(
+        request.headers.get(principals.HEADER), config.principal_secret
+    )
+    if principal is None:
+        raise unauthenticated("缺少或无效的身份头")
+    ctx.principal = principal
+    principals.set_current(principal)
+    if principal.user_id:
+        factory = get_session_factory()
+        try:
+            viewer = await load_viewer(factory, principal.user_id)
+            if viewer is None:
+                await gateway_users.ensure_users(
+                    factory, [principal.user_id], trusted=True
+                )
+                viewer = await load_viewer(factory, principal.user_id)
+            elif viewer.username == viewer.user_id:
+                await gateway_users.refresh_placeholder(
+                    factory, get_redis(), principal.user_id
+                )
+        except SiteError:
+            raise
+        except Exception as exc:
+            raise unavailable("账号资料暂时不可用") from exc
+        if viewer is not None:
+            ctx.viewer = apply_principal(viewer, principal)
+            try:
+                await principals.remember(get_redis(), principal)
+            except Exception:  # noqa: BLE001
+                logger.info("记录 Principal 有效模式失败", exc_info=True)
+    ctx.refresh_mode()
+
+
 class SiteV1Middleware:
     """纯 ASGI 中间件（不用 BaseHTTPMiddleware，避免流式响应和上下文变量问题）。"""
 
@@ -87,6 +147,15 @@ class SiteV1Middleware:
                 response.headers.append("set-cookie", cookie)
             await response(scope, receive, send)
 
+        config = get_config()
+        if config.principal_mode:
+            reset = principals.set_current(None)
+            try:
+                await self._principal_request(scope, receive, send, ctx, request, send_error)
+            finally:
+                principals.reset_current(reset)
+            return
+
         try:
             await build_context(request, ctx)
             await rate_limit.check(
@@ -107,6 +176,23 @@ class SiteV1Middleware:
             await send_error(unavailable())
             return
 
+        await self._run(scope, receive, send, ctx, send_error)
+
+    async def _principal_request(self, scope, receive, send, ctx, request, send_error):
+        try:
+            if session_only_path(scope.get("path", "")):
+                raise not_found("会话由网关管理")
+            await build_principal_context(request, ctx)
+        except SiteError as error:
+            await send_error(error)
+            return
+        except Exception:
+            logger.exception("site_v1 校验身份头失败")
+            await send_error(unavailable())
+            return
+        await self._run(scope, receive, send, ctx, send_error)
+
+    async def _run(self, scope, receive, send, ctx, send_error):
         started = False
 
         async def send_wrapper(message):

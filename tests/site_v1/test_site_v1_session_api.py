@@ -128,10 +128,10 @@ async def test_site_and_anonymous_session(env):
     assert site.status_code == 200 and site.headers["X-Content-Mode"] == "general"
     body = site.json()
     assert body["termsVersion"] == "2026-10"
-    assert (
-        body["features"]["registration"] is True and body["registrationMode"] == "open"
-    )
-    assert all(isinstance(v, bool) for v in body["features"].values())
+    # 协议 0.5：features 是字符串数组
+    assert "registration" in body["features"] and body["registrationMode"] == "open"
+    assert all(isinstance(v, str) for v in body["features"])
+    assert "presence" in body["features"]
 
     res = await c.session()
     data = res.json()
@@ -278,7 +278,8 @@ async def test_register_open_and_discord_only(env, monkeypatch):
     )
     assert err["details"]["reason"] == "registration_discord_only"
     site = (await other.get("/site")).json()
-    assert site["features"]["registrationDiscordOnly"] is True
+    assert "registrationDiscordOnly" in site["features"]
+    assert "registration" not in site["features"]
     await c.close()
     await other.close()
 

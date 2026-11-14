@@ -82,6 +82,12 @@ async def set_follow(session, follower_id: str, author_id: str, follow: bool) ->
 
 
 async def is_blocked(session, user_id: str, blocked_user_id: str) -> bool:
+    # 身份头模式：本人的屏蔽名单以网关 Principal.blockedUserIds 为准（本地表也认）
+    from site_v1 import principal as principals
+
+    p = principals.for_user(user_id)
+    if p is not None and blocked_user_id in p.blocked_user_ids:
+        return True
     return (
         await session.execute(
             select(SiteUserBlock.user_id).where(
@@ -93,8 +99,12 @@ async def is_blocked(session, user_id: str, blocked_user_id: str) -> bool:
 
 
 async def blocked_user_ids(session, user_id: str) -> set[str]:
-    """屏蔽名单（作品列表过滤用）。"""
-    return set(
+    """屏蔽名单（作品列表过滤用）。身份头模式下并上 Principal.blockedUserIds。"""
+    from site_v1 import principal as principals
+
+    p = principals.for_user(user_id)
+    extra = set(p.blocked_user_ids) if p is not None else set()
+    return extra | set(
         (
             await session.execute(
                 select(SiteUserBlock.blocked_user_id).where(
